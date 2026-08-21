@@ -3,6 +3,10 @@ target/
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
+# 本地 Maven 仓库（巨大，不应提交；clone 后 mvn 会自动重建）
+.mvn-repo/
+# CLI 运行历史文件
+.cli-history
 
 ### STS ###
 .apt_generated
