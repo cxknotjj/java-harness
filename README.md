@@ -48,7 +48,17 @@ src/main/java/com/dark/javaHarness/
 >
 > 架构 = **主进程（服务/8080）** + **CLI（独立进程，纯客户端不占端口）**。
 
-### 1. 启动主服务（监听 8080，保留日志）
+### ⚡ 一键启动（推荐）
+
+Windows 下直接**双击项目根目录的 `run.bat`**，脚本会自动：
+
+1. 编译项目
+2. 打开「主服务」窗口（监听 8080）
+3. 等主服务就绪后自动打开「CLI 聊天」窗口
+
+两个窗口同时弹出，无需手动敲 Maven 命令。脚本内部已带 `-s .mvn/settings.xml`。
+
+### 手动启动步骤
 
 ```powershell
 mvn -s .mvn/settings.xml spring-boot:run
