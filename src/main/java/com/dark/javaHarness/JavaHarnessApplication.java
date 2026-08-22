@@ -5,7 +5,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-@MapperScan("com.dark.javaHarness.core.memory")
+@MapperScan("com.dark.javaHarness.core.session")
 public class JavaHarnessApplication {
 
     public static void main(String[] args) {

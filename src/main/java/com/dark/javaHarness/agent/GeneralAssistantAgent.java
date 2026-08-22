@@ -2,7 +2,8 @@ package com.dark.javaHarness.agent;
 
 import com.dark.javaHarness.core.agent.Agent;
 import com.dark.javaHarness.core.goal.Goal;
-import com.dark.javaHarness.core.memory.ChatMemoryStore;
+import com.dark.javaHarness.core.session.SessionMemoryStore;
+import com.dark.javaHarness.tool.DemoTools;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,8 +17,12 @@ import org.springframework.stereotype.Component;
 /**
  * 通用 AI Agent：使用 Spring AI ChatClient 调用大模型来完成目标。
  *
- * 自动携带多轮会话记忆：若 Goal 带有 sessionId，则先从 MySQL 读取该会话的历史消息
- * 一并发送给模型，再把本轮 user/assistant 消息持久化回会话，实现上下文连贯。
+ * 多轮会话记忆基于 session + session_messages 两张表（一对一）：
+ * 若 Goal 带有 sessionId，先读取该会话的上下文快照（session_messages 唯一一行）
+ * 一并发送给模型；本轮 user/assistant 消息逐条追加进
+ * session_messages 同一行的 content，同时更新 session.last_question。
+ *
+ * 已注册工具调用：模型可按需调用 DemoTools 中的工具（取时间/计算/查天气）。
  */
 @Component
 public class GeneralAssistantAgent implements Agent {
@@ -27,10 +32,12 @@ public class GeneralAssistantAgent implements Agent {
     private static final String SYSTEM_PROMPT = "你是一个执行任务的 AI 助手，请直接给出简洁、可执行的完成结果。你能记住本会话之前的对话内容，回答时结合历史上下文。";
 
     private final ChatClient chatClient;
-    private final ChatMemoryStore memoryStore;
+    private final SessionMemoryStore memoryStore;
 
-    public GeneralAssistantAgent(Builder chatClientBuilder, ChatMemoryStore memoryStore) {
-        this.chatClient = chatClientBuilder.build();
+    public GeneralAssistantAgent(Builder chatClientBuilder, SessionMemoryStore memoryStore) {
+        this.chatClient = chatClientBuilder
+                .defaultTools(new DemoTools())  // 注册工具调用：模型可调用 DemoTools 的 @Tool 方法
+                .build();
         this.memoryStore = memoryStore;
     }
 
@@ -43,9 +50,7 @@ public class GeneralAssistantAgent implements Agent {
     public String execute(Goal goal) {
         log.info("AI agent '{}' 开始处理目标: {}", name(), goal.objective());
         String sessionId = goal.sessionId();
-        List<Message> history = (sessionId == null || sessionId.isBlank())
-                ? List.of()
-                : memoryStore.get(sessionId);
+        List<Message> history = memoryStore.loadContext(sessionId);
 
         String reply = chatClient.prompt()
                 .system(SYSTEM_PROMPT)
@@ -55,11 +60,11 @@ public class GeneralAssistantAgent implements Agent {
                 .content();
         log.info("AI agent '{}' 得到回复: {}", name(), reply);
 
-        // 持久化本轮会话：历史 + 本次问题 + 本次回答，供下一轮使用
+        // 持久化本轮会话：本轮 user/assistant 消息逐条追加进 session_messages 该会话唯一一行
         if (sessionId != null && !sessionId.isBlank()) {
-            memoryStore.add(sessionId, List.of(
-                    new UserMessage(goal.objective()),
-                    new AssistantMessage(reply)));
+            memoryStore.saveContext(sessionId, new UserMessage(goal.objective()));
+            memoryStore.saveContext(sessionId, new AssistantMessage(reply));
+            memoryStore.touchSession(sessionId, goal.objective());
         }
         return reply;
     }

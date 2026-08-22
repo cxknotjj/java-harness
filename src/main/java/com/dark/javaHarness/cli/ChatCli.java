@@ -26,12 +26,12 @@ public class ChatCli {
             .build();
     private final ObjectMapper mapper = new ObjectMapper();
     private final String baseUrl;
-    private final String sessionId;
+
+    /** 会话ID：首轮为空（由服务端自动建档），从首次响应中获取后复用，实现多轮记忆 */
+    private String sessionId;
 
     public ChatCli() {
         this.baseUrl = "http://localhost:8080";
-        // 固定一个进程级会话ID：本 CLI 进程内的多轮对话共享此会话，实现会话记忆
-        this.sessionId = "cli-default";
     }
 
     public static void main(String[] args) {
@@ -92,9 +92,14 @@ public class ChatCli {
             JsonNode body = mapper.readTree(resp.body());
             String status = body.path("status").asText();
             String goalId = body.path("goalId").asText();
+            // 记住服务端返回的会话ID，后续请求携带以延续多轮上下文
+            String respSessionId = body.path("sessionId").asText(null);
+            if (respSessionId != null && !respSessionId.isBlank()) {
+                this.sessionId = respSessionId;
+            }
             if ("SUCCEEDED".equals(status)) {
                 System.out.println("\n千问> " + body.path("reply").asText());
-                System.out.println("（" + goalId + "）");
+                System.out.println("（会话 " + sessionId + " / " + goalId + "）");
             } else {
                 System.out.println("\n[执行失败 " + goalId + "] " + body.path("error").asText());
             }
