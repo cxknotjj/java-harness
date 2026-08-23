@@ -1,64 +1,75 @@
-package com.dark.javaHarness.core.agent;
+package com.dark.javaHarness.service.impl;
 
-import com.dark.javaHarness.core.goal.Goal;
-import com.dark.javaHarness.core.goal.GoalManager;
+import com.dark.javaHarness.agent.Agent;
+import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.service.AgentService;
+import com.dark.javaHarness.service.GoalService;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * Agent 编排服务：接收一个请求，路由到对应 Agent，
- * 异步执行目标并回写 Goal 生命周期状态（RUNNING -> SUCCEEDED/FAILED）。
+ * Agent 编排服务实现：接收一个请求，路由到对应 Agent，
+ * 执行目标并回写 Goal 生命周期状态（RUNNING -> SUCCEEDED/FAILED）。
  */
 @Service
-public class AgentService {
+public class AgentServiceImpl implements AgentService {
 
-    private static final Logger log = LoggerFactory.getLogger(AgentService.class);
+    private static final Logger log = LoggerFactory.getLogger(AgentServiceImpl.class);
 
-    private final GoalManager goalManager;
-    private final Map<String, Agent> agents;
+    private final GoalService goalService;
+    private final ConcurrentMap<String, Agent> agents;
 
-    public AgentService(GoalManager goalManager, List<Agent> agentList) {
-        this.goalManager = goalManager;
+    public AgentServiceImpl(GoalService goalService, List<Agent> agentList) {
+        this.goalService = goalService;
         // 以 name() 为 key 建立路由表
-        Map<String, Agent> map = new java.util.concurrent.ConcurrentHashMap<>();
+        ConcurrentMap<String, Agent> map = new ConcurrentHashMap<>();
         for (Agent agent : agentList) {
             map.put(agent.name(), agent);
         }
         this.agents = map;
     }
 
-    /**
-     * 创建一个目标并异步派发给指定 Agent 执行。
-     * @return 创建的 Goal id
-     */
+    @Override
     public Goal submit(String agentName, String objective) {
         Agent agent = requireAgent(agentName);
-        Goal goal = goalManager.create(objective);
+        Goal goal = goalService.create(objective);
         CompletableFuture.runAsync(() -> run(goal, agent));
         return goal;
     }
 
-    /**
-     * 创建一个目标并同步执行（阻塞直至完成），适合聊天这类需要立即拿到结果的场景。
-     * @return 执行完毕的 Goal（含 SUCCEEDED/FAILED 状态与 summary）
-     */
+    @Override
     public Goal executeSync(String agentName, String objective) {
         return executeSync(agentName, objective, null);
     }
 
-    /**
-     * 创建一个目标并同步执行（阻塞直至完成），支持会话记忆（sessionId）。
-     * @return 执行完毕的 Goal（含 SUCCEEDED/FAILED 状态与 summary）
-     */
+    @Override
     public Goal executeSync(String agentName, String objective, String sessionId) {
         Agent agent = requireAgent(agentName);
-        Goal goal = goalManager.create(objective, sessionId);
+        Goal goal = goalService.create(objective, sessionId);
         run(goal, agent);
         return goal;
+    }
+
+    @Override
+    public Optional<Goal> getGoal(String id) {
+        return goalService.get(id);
+    }
+
+    @Override
+    public List<Goal> allGoals() {
+        return goalService.all();
+    }
+
+    @Override
+    public Set<String> agentNames() {
+        return agents.keySet();
     }
 
     private Agent requireAgent(String agentName) {
@@ -80,17 +91,5 @@ public class AgentService {
             log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), e.getMessage());
             goal.fail(e.getMessage());
         }
-    }
-
-    public java.util.Optional<Goal> getGoal(String id) {
-        return goalManager.get(id);
-    }
-
-    public List<Goal> allGoals() {
-        return goalManager.all();
-    }
-
-    public java.util.Set<String> agentNames() {
-        return agents.keySet();
     }
 }

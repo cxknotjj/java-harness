@@ -1,10 +1,9 @@
-package com.dark.javaHarness.web;
+package com.dark.javaHarness.controller;
 
-import com.dark.javaHarness.core.agent.AgentService;
-import com.dark.javaHarness.core.goal.Goal;
-import com.dark.javaHarness.core.session.SessionMemoryStore;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.dto.ChatResponse;
+import com.dark.javaHarness.service.AgentService;
+import com.dark.javaHarness.service.SessionService;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -20,11 +19,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class ChatController {
 
     private final AgentService agentService;
-    private final SessionMemoryStore sessionMemoryStore;
+    private final SessionService sessionService;
 
-    public ChatController(AgentService agentService, SessionMemoryStore sessionMemoryStore) {
+    public ChatController(AgentService agentService, SessionService sessionService) {
         this.agentService = agentService;
-        this.sessionMemoryStore = sessionMemoryStore;
+        this.sessionService = sessionService;
     }
 
     /** 聊天请求体：message 必填，sessionId 可选（为空时自动创建新会话并在响应中返回） */
@@ -37,7 +36,7 @@ public class ChatController {
      * 首次不传 sessionId，响应中返回；后续携带即可延续同一会话上下文。
      */
     @PostMapping
-    public Map<String, Object> chat(@RequestBody ChatRequest request) {
+    public ChatResponse chat(@RequestBody ChatRequest request) {
         if (request.message() == null || request.message().isBlank()) {
             throw new IllegalArgumentException("message 不能为空");
         }
@@ -46,22 +45,22 @@ public class ChatController {
         String sessionId = request.sessionId();
         boolean newSession = false;
         if (sessionId == null || sessionId.isBlank()) {
-            sessionId = sessionMemoryStore.createSession("anonymous", request.message());
+            sessionId = sessionService.createSession("anonymous", request.message());
             newSession = true;
         }
 
         // 通过 harness 编排层同步执行：goal 生命周期与 summary 均会留存
         Goal goal = agentService.executeSync("general", request.message(), sessionId);
 
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("sessionId", sessionId);
-        result.put("newSession", newSession);
-        result.put("goalId", goal.id());
-        result.put("status", goal.status().name());
-        result.put("reply", goal.summary());
+        ChatResponse.Builder b = ChatResponse.builder()
+                .sessionId(sessionId)
+                .newSession(newSession)
+                .goalId(goal.id())
+                .status(goal.status().name())
+                .reply(goal.summary());
         if (goal.status() == Goal.Status.FAILED) {
-            result.put("error", goal.summary());
+            b.error(goal.summary());
         }
-        return result;
+        return b.build();
     }
 }

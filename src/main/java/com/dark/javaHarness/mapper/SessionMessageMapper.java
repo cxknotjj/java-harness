@@ -1,6 +1,7 @@
-package com.dark.javaHarness.core.session;
+package com.dark.javaHarness.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.dark.javaHarness.entity.SessionMessage;
 import org.apache.ibatis.annotations.Mapper;
 
 /**

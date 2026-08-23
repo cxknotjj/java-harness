@@ -1,8 +1,7 @@
 package com.dark.javaHarness.agent;
 
-import com.dark.javaHarness.core.agent.Agent;
-import com.dark.javaHarness.core.goal.Goal;
-import com.dark.javaHarness.core.session.SessionMemoryStore;
+import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.tool.DemoTools;
 import java.util.List;
 import org.slf4j.Logger;
@@ -32,9 +31,9 @@ public class GeneralAssistantAgent implements Agent {
     private static final String SYSTEM_PROMPT = "你是一个执行任务的 AI 助手，请直接给出简洁、可执行的完成结果。你能记住本会话之前的对话内容，回答时结合历史上下文。";
 
     private final ChatClient chatClient;
-    private final SessionMemoryStore memoryStore;
+    private final SessionService memoryStore;
 
-    public GeneralAssistantAgent(Builder chatClientBuilder, SessionMemoryStore memoryStore) {
+    public GeneralAssistantAgent(Builder chatClientBuilder, SessionService memoryStore) {
         this.chatClient = chatClientBuilder
                 .defaultTools(new DemoTools())  // 注册工具调用：模型可调用 DemoTools 的 @Tool 方法
                 .build();

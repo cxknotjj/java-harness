@@ -1,10 +1,10 @@
-package com.dark.javaHarness.core.goal;
+package com.dark.javaHarness.domain;
 
 import java.time.LocalDateTime;
 
 /**
  * 一个待完成的目标（Goal）。
- * 由 GoalManager 维护其生命周期状态。
+ * 由 GoalService 维护其生命周期状态。
  */
 public class Goal {
 

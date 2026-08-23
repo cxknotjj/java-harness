@@ -1,4 +1,4 @@
-package com.dark.javaHarness.core.session;
+package com.dark.javaHarness.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;

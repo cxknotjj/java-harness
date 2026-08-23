@@ -1,7 +1,7 @@
-package com.dark.javaHarness.web;
+package com.dark.javaHarness.controller;
 
-import com.dark.javaHarness.core.agent.AgentService;
-import com.dark.javaHarness.core.goal.Goal;
+import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.service.AgentService;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;

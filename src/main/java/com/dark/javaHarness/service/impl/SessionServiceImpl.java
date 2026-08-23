@@ -1,7 +1,12 @@
-package com.dark.javaHarness.core.session;
+package com.dark.javaHarness.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
+import com.dark.javaHarness.entity.Session;
+import com.dark.javaHarness.entity.SessionMessage;
+import com.dark.javaHarness.mapper.SessionMapper;
+import com.dark.javaHarness.mapper.SessionMessageMapper;
+import com.dark.javaHarness.service.SessionService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,7 +24,7 @@ import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.stereotype.Service;
 
 /**
- * 会话记忆存储：基于 session + session_messages 两张表实现多轮会话记忆。
+ * 会话服务实现：基于 session + session_messages 两张表实现多轮会话记忆。
  *
  * 存储模型（上下文快照式，session_messages 与 session 一对一）：
  * - session：会话主表（名称/创建者/最近提问/软删除）
@@ -31,9 +36,9 @@ import org.springframework.stereotype.Service;
  * sessionId 使用 session 表自增主键的字符串形式，与 session_messages.session_id（varchar）对齐。
  */
 @Service
-public class SessionMemoryStore {
+public class SessionServiceImpl implements SessionService {
 
-    private static final Logger log = LoggerFactory.getLogger(SessionMemoryStore.class);
+    private static final Logger log = LoggerFactory.getLogger(SessionServiceImpl.class);
 
     /** 默认租户（未做多租户前统一使用） */
     private static final String DEFAULT_TENANT = "default";
@@ -48,7 +53,7 @@ public class SessionMemoryStore {
     private final SessionMessageMapper messageMapper;
     private final ObjectMapper objectMapper;
 
-    public SessionMemoryStore(SessionMapper sessionMapper,
+    public SessionServiceImpl(SessionMapper sessionMapper,
                               SessionMessageMapper messageMapper,
                               ObjectMapper objectMapper) {
         this.sessionMapper = sessionMapper;
@@ -56,10 +61,7 @@ public class SessionMemoryStore {
         this.objectMapper = objectMapper;
     }
 
-    /**
-     * 创建新会话，会话名取首条提问（截断）。
-     * @return sessionId（session 表自增主键的字符串形式）
-     */
+    @Override
     public String createSession(String creator, String firstQuestion) {
         Session session = new Session();
         session.setAgentId(DEFAULT_AGENT_ID);
@@ -72,11 +74,7 @@ public class SessionMemoryStore {
         return String.valueOf(session.getSessionId());
     }
 
-    /**
-     * 读取会话完整上下文：取 session_messages 中该会话的上下文行
-     * （一对一，仅一条；查询保留取最新一条以兼容历史多行数据），
-     * 解析 content 里的 JSON 数组还原为 Spring AI Message 列表。
-     */
+    @Override
     public List<Message> loadContext(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             return List.of();
@@ -103,12 +101,7 @@ public class SessionMemoryStore {
         }
     }
 
-    /**
-     * 追加保存单条会话消息：session_messages 与 session 一对一，该会话仅一行。
-     * 将本条消息追加进已有上下文 JSON 后整体覆盖写回该行；尚无记录时首次插入。
-     * content 始终保存完整上下文：
-     * [{"role":"user","content":"..."},{"role":"assistant","content":"..."},...]
-     */
+    @Override
     public void saveContext(String sessionId, Message message) {
         if (sessionId == null || sessionId.isBlank() || message == null) {
             return;
@@ -159,7 +152,7 @@ public class SessionMemoryStore {
         }
     }
 
-    /** 更新会话的最近一次提问 */
+    @Override
     public void touchSession(String sessionId, String lastQuestion) {
         Long sid = parseSessionId(sessionId);
         if (sid == null) {
@@ -171,7 +164,7 @@ public class SessionMemoryStore {
         sessionMapper.update(null, uw);
     }
 
-    /** 查询会话（软删除的不会返回） */
+    @Override
     public Session getSession(String sessionId) {
         Long sid = parseSessionId(sessionId);
         if (sid == null) {

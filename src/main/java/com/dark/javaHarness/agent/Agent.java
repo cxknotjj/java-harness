@@ -1,6 +1,6 @@
-package com.dark.javaHarness.core.agent;
+package com.dark.javaHarness.agent;
 
-import com.dark.javaHarness.core.goal.Goal;
+import com.dark.javaHarness.domain.Goal;
 
 /**
  * Agent 抽象：负责执行一个 Goal 并产出摘要。

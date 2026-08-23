@@ -15,26 +15,47 @@
 | 构建 | Maven | 项目管理与打包 |
 | 语言 | Java 17 | — |
 
-## 项目结构
+## 项目结构（三层架构）
+
+采用经典分层（Controller → Service → Mapper/Entity），按包分层组织：
 
 ```
 src/main/java/com/dark/javaHarness/
-├── JavaHarnessApplication.java   # Spring Boot 启动类
-├── agent/
+├── JavaHarnessApplication.java   # Spring Boot 启动类（@MapperScan 指向 com.dark.javaHarness.mapper）
+├── controller/                   # 表现层：REST 接口
+│   ├── ChatController.java       # REST：聊天接口（走编排层）
+│   └── HarnessController.java    # REST：agents / goals / submit
+├── service/                      # 业务层（接口）
+│   ├── AgentService.java         # Agent 编排：路由、执行目标、回写状态
+│   ├── GoalService.java          # 目标生命周期管理
+│   ├── SessionService.java       # 多轮会话记忆（session + session_messages）
+│   └── impl/                     # 业务实现
+│       ├── AgentServiceImpl.java
+│       ├── GoalServiceImpl.java
+│       └── SessionServiceImpl.java
+├── mapper/                       # 数据访问层：MyBatis-Plus Mapper
+│   ├── SessionMapper.java
+│   └── SessionMessageMapper.java
+├── entity/                       # 数据库实体
+│   ├── Session.java
+│   └── SessionMessage.java
+├── domain/                       # 领域模型（内存态，非 DB）
+│   └── Goal.java                 # 目标 + 状态（PENDING/RUNNING/SUCCEEDED/FAILED）
+├── dto/                          # 传输对象
+│   └── ChatResponse.java         # 聊天接口响应体
+├── agent/                        # Agent 抽象与实现
+│   ├── Agent.java                # Agent 接口：name() + execute(Goal)
 │   └── GeneralAssistantAgent.java # “general”Agent：基于 Spring AI ChatClient 调用千问
-├── core/
-│   ├── agent/
-│   │   ├── Agent.java            # Agent 接口：name() + execute(Goal)
-│   │   └── AgentService.java     # 编排服务：路由 Agent、执行目标、回写 Goal 状态
-│   └── goal/
-│       ├── Goal.java             # 目标实体 + 状态（PENDING/RUNNING/SUCCEEDED/FAILED）
-│       └── GoalManager.java      # 目标生命周期管理
-├── web/
-│   ├── HarnessController.java    # REST：agents / goals / submit
-│   └── ChatController.java       # REST：聊天接口（走编排层）
-└── cli/
-    └── ChatCli.java               # 命令行聊天客户端（独立进程，纯HTTP连8080）
+├── cli/
+│   └── ChatCli.java              # 命令行聊天客户端（独立进程，纯HTTP连8080）
+└── tool/
+    └── DemoTools.java            # 示例工具集（时间 / 计算 / 天气）
 ```
+
+> 三层职责：
+> - **controller** 收发表单/REST，不承载业务逻辑
+> - **service** 编排核心逻辑，接口与实现分离（`service` 接口 + `service.impl` 实现）
+> - **mapper / entity** 负责数据库读写与映射；`domain` 承载纯内存领域模型（Goal）
 
 ## 环境要求
 
