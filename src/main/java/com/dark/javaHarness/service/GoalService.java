@@ -20,4 +20,7 @@ public interface GoalService {
 
     /** 查询全部目标 */
     List<Goal> all();
+
+    /** 将 Goal 当前状态持久化（状态变更后调用） */
+    void update(Goal goal);
 }

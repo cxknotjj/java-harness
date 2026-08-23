@@ -25,11 +25,19 @@ public class Goal {
 
     /** 构造目标（带会话记忆），初始状态 PENDING */
     public Goal(String id, String objective, String sessionId) {
+        this(id, objective, sessionId, GoalStatus.PENDING, LocalDateTime.now(), null, null);
+    }
+
+    /** 从持久化数据恢复完整状态 */
+    public Goal(String id, String objective, String sessionId,
+                GoalStatus status, LocalDateTime createdAt, LocalDateTime finishedAt, String summary) {
         this.id = id;
         this.objective = objective;
         this.sessionId = sessionId;
-        this.status = GoalStatus.PENDING;
-        this.createdAt = LocalDateTime.now();
+        this.status = status;
+        this.createdAt = createdAt;
+        this.finishedAt = finishedAt;
+        this.summary = summary;
     }
 
     /** 标记目标进入执行中状态 */

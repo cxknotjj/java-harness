@@ -1,20 +1,18 @@
 -- ============================================================
 -- javaHarness - Schema 初始化脚本
--- 说明：匹配 com.dark.javaHarness.core.goal.Goal 实体。
---       若目标 agent_name 字段，请同步更新实体。
 -- ============================================================
 
+-- 目标表：持久化 Goal 的生命周期状态（由 GoalServiceImpl 读写）
 CREATE TABLE IF NOT EXISTS goal (
-    id           VARCHAR(32)  NOT NULL COMMENT '目标ID（UUID）',
+    id           VARCHAR(64)  NOT NULL COMMENT '目标ID（goal-UUID）',
     objective    TEXT         NOT NULL COMMENT '目标描述',
-    agent_name   VARCHAR(64)  NOT NULL COMMENT '负责执行的 Agent 名',
+    session_id   VARCHAR(64)  NULL COMMENT '关联会话ID，无会话记忆为空',
     status       VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/RUNNING/SUCCEEDED/FAILED',
     summary      TEXT         NULL COMMENT '执行结论/结果摘要',
     created_at   DATETIME     NOT NULL COMMENT '创建时间',
     finished_at  DATETIME     NULL COMMENT '结束时间',
     PRIMARY KEY (id),
-    KEY idx_agent_name (agent_name),
-    KEY idx_status    (status)
+    KEY idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 目标表';
 
 -- ============================================================

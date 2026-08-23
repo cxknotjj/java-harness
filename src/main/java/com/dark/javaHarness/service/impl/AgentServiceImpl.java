@@ -66,14 +66,17 @@ public class AgentServiceImpl implements AgentService {
         Agent agent = requireAgent(agentName);
         Goal goal = goalService.create(objective, sessionId);
         goal.markRunning();
+        goalService.update(goal);
         try {
             String summary = agent.executeStream(goal, onToken);
             goal.succeed(summary);
+            goalService.update(goal);
             log.info("[{}] goal '{}' STREAMED -> 长度={}", goal.id(), goal.objective(), summary == null ? 0 : summary.length());
         } catch (Exception e) {
             String reason = errorReason(e);
             log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), reason);
             goal.fail(reason);
+            goalService.update(goal);
         }
         return goal;
     }
@@ -96,15 +99,18 @@ public class AgentServiceImpl implements AgentService {
     /** 同步执行目标并更新其生命周期状态（RUNNING -> SUCCEEDED/FAILED） */
     private void run(Goal goal, Agent agent) {
         goal.markRunning();
+        goalService.update(goal);
         try {
             String summary = agent.execute(goal);
             goal.succeed(summary);
+            goalService.update(goal);
             log.info("[{}] goal '{}' SUCCEEDED -> {}", goal.id(), goal.objective(), summary);
         } catch (Exception e) {
             // 目标失败是正常业务结果（如未配置 API key 时的 401），只记一行摘要避免刷屏
             String reason = errorReason(e);
             log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), reason);
             goal.fail(reason);
+            goalService.update(goal);
         }
     }
 

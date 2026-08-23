@@ -19,7 +19,6 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 /**
  * 聊天用例服务实现：承载聊天完整业务编排。
- * - 参数校验（message 非空）
  * - 无 sessionId 时自动建档
  * - 调 general Agent 同步/流式执行（goal 生命周期与 summary 留存）
  * - 组装 ChatResponse
@@ -50,10 +49,6 @@ public class ChatServiceImpl implements ChatService {
     /** 处理一次聊天请求，按执行类型走同步或流式 Agent 执行并组装响应 */
     @Override
     public ChatResponse chat(ChatRequest request, ExecutionType type) {
-        if (request.message() == null || request.message().isBlank()) {
-            throw new IllegalArgumentException("message 不能为空");
-        }
-
         // 无 sessionId 时自动建档（session 表），会话名取首条提问
         String sessionId = request.sessionId();
         boolean newSession = false;
@@ -111,9 +106,6 @@ public class ChatServiceImpl implements ChatService {
     /** 流式聊天（SSE）：逐 token 推送，结束发 [DONE] 和 meta 事件；无 sessionId 时自动建档 */
     @Override
     public SseEmitter stream(ChatRequest request) {
-        if (request.message() == null || request.message().isBlank()) {
-            throw new IllegalArgumentException("message 不能为空");
-        }
         // 0L = 不超时，长连接直到流结束主动关闭
         SseEmitter emitter = new SseEmitter(0L);
 

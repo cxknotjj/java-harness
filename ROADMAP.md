@@ -7,13 +7,13 @@
 
 ## 一、P0 · 基础完善（建议优先）
 
-- [ ] **Goal 落库**：Goal 从内存 `ConcurrentMap` 迁移到 MySQL，重启不丢；提供目标历史查询接口
+- [x] **Goal 落库**：Goal 从内存 `ConcurrentMap` 迁移到 MySQL，重启不丢；提供目标历史查询接口
   - 验收：重启后 `/api/harness/goals` 仍能查到历史 Goal
-- [ ] **清理遗留依赖**：移除未使用的 JLine、Hutool，以及 dependencyManagement 中无用的 mysql-connector-java / pgvector 条目
-  - 验收：`mvn dependency:analyze` 不再报告未用依赖
-- [ ] **清理遗留 SQL**：删除 `schema.sql` 中已废弃的 `goal` 表定义（当前 Goal 为内存存储）
+- [x] **清理遗留依赖**：移除未使用的 JLine、Hutool，以及 dependencyManagement 中无用的 mysql-connector-java / pgvector 条目
+  - 验收：`mvn dependency:analyze` 不再报告未用依赖（剩余为 Spring Boot starter 误报）
+- [x] **清理遗留 SQL**：重写 `schema.sql` 中废弃的 `goal` 表，改为匹配落库后的 Goal 模型
   - 验收：启动日志无误导性建表
-- [ ] **统一参数校验**：引入 `spring-boot-starter-validation`，用注解校验替换手写 `message 非空` 判断
+- [x] **统一参数校验**：引入 `spring-boot-starter-validation`，用注解校验替换手写 `message 非空` 判断
   - 验收：非法请求返回统一 400 错误体
 - [x] **全局异常处理**：`@RestControllerAdvice` 统一异常响应结构
   - 验收：所有异常返回 `{code, message}` 格式

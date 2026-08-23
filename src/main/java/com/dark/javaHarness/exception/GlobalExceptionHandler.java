@@ -5,6 +5,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -39,6 +40,17 @@ public class GlobalExceptionHandler {
     @ResponseStatus(HttpStatus.BAD_REQUEST)
     public ErrorResponse handleMissingParam(MissingServletRequestParameterException e) {
         return ErrorResponse.of(HttpStatus.BAD_REQUEST.value(), "缺少参数: " + e.getParameterName());
+    }
+
+    /** 参数校验失败（@Valid） */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ErrorResponse handleValidation(MethodArgumentNotValidException e) {
+        String msg = e.getBindingResult().getFieldErrors().stream()
+                .findFirst()
+                .map(fe -> fe.getDefaultMessage() == null ? "参数校验失败" : fe.getDefaultMessage())
+                .orElse("参数校验失败");
+        return ErrorResponse.of(HttpStatus.BAD_REQUEST.value(), msg);
     }
 
     /** 404：请求的资源不存在 */

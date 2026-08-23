@@ -9,7 +9,7 @@
 - **定位**：Agent 编排框架 —— 通过 `Agent` 抽象路由到不同实现（当前为通用 AI 助手），执行目标（Goal）并维护其生命周期（PENDING → RUNNING → SUCCEEDED/FAILED）。
 - **入口**：REST API（`/api/chat`、`/api/chat/stream`、`/api/harness/*`）+ CLI 聊天客户端（`mvn exec:java`）。
 - **会话记忆**：MySQL 两张表（`session` + `session_messages`，一对一），`session_messages.content` 以 JSON 快照存储完整上下文。
-- **目标存储**：`Goal` 当前为**内存存储**（`ConcurrentMap`），未落库。
+- **目标存储**：`Goal` 持久化到 MySQL `goal` 表，重启不丢，可追溯历史。
 
 ---
 
@@ -22,15 +22,15 @@
 | 核心框架 | Spring Boot | 3.5.14 | Web 应用框架（**硬约束：与 Spring AI 1.1.4 兼容**） |
 | AI 框架 | Spring AI | 1.1.4 | `spring-ai-starter-model-openai`，以 OpenAI 兼容模式对接通义千问 DashScope（qwen3.7-plus） |
 | Web | Spring MVC | 随 Boot | REST + SSE（`SseEmitter` 流式推送）+ 全局异常处理（`@RestControllerAdvice`） |
-| ORM | MyBatis-Plus | 3.5.7 | `mybatis-plus-spring-boot3-starter`，session 两张表的 CRUD |
+| ORM | MyBatis-Plus | 3.5.7 | `mybatis-plus-spring-boot3-starter`，goal / session / session_messages 表的 CRUD |
 | 数据库 | MySQL | 9.2.0 | `mysql-connector-j`（runtime），连接池 HikariCP |
+| 参数校验 | Jakarta Validation | 随 Boot | `spring-boot-starter-validation` + `@Valid` 注解校验 |
 | HTTP 客户端 | OkHttp | 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`） |
 | 序列化 | Jackson | 随 Boot | DTO 序列化 / SSE meta 解析 |
 | 代码生成 | Lombok | - | 实体类简化 |
 | 测试 | JUnit 5 / Spring Boot Test | 随 Boot | 上下文加载测试 |
 | 日志 | SLF4J + Logback | 随 Boot | Agent 执行状态日志 |
 | 初始化 SQL | schema.sql | - | 启动时 `spring.sql.init` 建表 |
-| 其他 | JLine 3.29.0 / Hutool 5.8.32 | - | 已声明但**当前未使用**（遗留） |
 
 ### 架构分层
 
@@ -71,9 +71,8 @@ controller（纯转发 + 全局异常处理）
 
 | 建议 | 说明 |
 |------|------|
-| **Goal 落库** | 当前 Goal 为内存存储，重启即丢；建议落库（MySQL 或转 PostgreSQL）以支持任务追溯 |
 | **数据库迁移工具** | Flyway / Liquibase 替代 `schema.sql`，管理 schema 演进 |
-| PostgreSQL + pgvector | 数据库已声明管理但未使用；若做 RAG，pgvector 是现成方案 |
+| PostgreSQL + pgvector | 若做 RAG，pgvector 是现成方案 |
 | 缓存 | `spring-boot-starter-data-redis`：会话快照缓存、限流计数、热点数据 |
 
 ### 3. 服务治理与可靠性（优先级：中）
@@ -123,5 +122,5 @@ controller（纯转发 + 全局异常处理）
 ## 四、注意事项
 
 - **版本约束**：Spring Boot 必须为 3.5.14（与 Spring AI 1.1.4 兼容），升级需整体评估 Spring AI 兼容性。
-- **遗留清理**：JLine、Hutool 依赖未使用；`schema.sql` 中 `goal` 表为旧版残留（当前 Goal 内存存储）。扩展前建议先清理。
 - **模型名**：`application.yaml` 中 `model: qwen3.7-plus`，如需切换模型请同步核对 DashScope 可用模型。
+- **DB 迁移**：`goal` 表结构升级过，若在更旧库上运行需先 `DROP TABLE goal` 让 schema.sql 重建。
