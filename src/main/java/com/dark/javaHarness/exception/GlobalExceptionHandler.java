@@ -1,0 +1,58 @@
+package com.dark.javaHarness.exception;
+
+import com.dark.javaHarness.dto.ErrorResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
+
+/**
+ * 全局异常处理：把异常统一转换为 {code, message} 响应体，
+ * code 为 HTTP 状态码，message 为可读错误信息（不暴露内部细节）。
+ */
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    /** 业务/参数错误：参数非法、资源不存在等 */
+    @ExceptionHandler(IllegalArgumentException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ErrorResponse handleIllegalArgument(IllegalArgumentException e) {
+        return ErrorResponse.of(HttpStatus.BAD_REQUEST.value(), e.getMessage());
+    }
+
+    /** 请求体 JSON 解析失败 */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ErrorResponse handleUnreadable(HttpMessageNotReadableException e) {
+        return ErrorResponse.of(HttpStatus.BAD_REQUEST.value(), "请求体格式错误");
+    }
+
+    /** 缺少必填请求参数 */
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ErrorResponse handleMissingParam(MissingServletRequestParameterException e) {
+        return ErrorResponse.of(HttpStatus.BAD_REQUEST.value(), "缺少参数: " + e.getParameterName());
+    }
+
+    /** 404：请求的资源不存在 */
+    @ExceptionHandler(NoResourceFoundException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ErrorResponse handleNotFound(NoResourceFoundException e) {
+        return ErrorResponse.of(HttpStatus.NOT_FOUND.value(), "资源不存在");
+    }
+
+    /** 未捕获异常兜底 */
+    @ExceptionHandler(Exception.class)
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public ErrorResponse handleException(Exception e) {
+        log.error("未处理异常", e);
+        return ErrorResponse.of(HttpStatus.INTERNAL_SERVER_ERROR.value(), "服务器内部错误");
+    }
+}
