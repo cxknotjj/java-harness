@@ -61,6 +61,7 @@ public class SessionServiceImpl implements SessionService {
         this.objectMapper = objectMapper;
     }
 
+    /** 创建新会话（会话名取首条提问截断），返回自增主键的字符串形式 */
     @Override
     public String createSession(String creator, String firstQuestion) {
         Session session = new Session();
@@ -74,6 +75,7 @@ public class SessionServiceImpl implements SessionService {
         return String.valueOf(session.getSessionId());
     }
 
+    /** 读取会话完整上下文，还原为 Spring AI Message 列表（无会话或解析失败返回空列表） */
     @Override
     public List<Message> loadContext(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
@@ -101,6 +103,7 @@ public class SessionServiceImpl implements SessionService {
         }
     }
 
+    /** 追加保存单条会话消息到该会话唯一一行上下文（不存在则新建） */
     @Override
     public void saveContext(String sessionId, Message message) {
         if (sessionId == null || sessionId.isBlank() || message == null) {
@@ -152,6 +155,7 @@ public class SessionServiceImpl implements SessionService {
         }
     }
 
+    /** 更新会话的最近一次提问 */
     @Override
     public void touchSession(String sessionId, String lastQuestion) {
         Long sid = parseSessionId(sessionId);
@@ -164,6 +168,7 @@ public class SessionServiceImpl implements SessionService {
         sessionMapper.update(null, uw);
     }
 
+    /** 查询会话（非法或空 sessionId 返回 null） */
     @Override
     public Session getSession(String sessionId) {
         Long sid = parseSessionId(sessionId);
@@ -208,6 +213,7 @@ public class SessionServiceImpl implements SessionService {
         return "user";
     }
 
+    /** 字符串截断到指定最大长度（null 返回空串） */
     private String truncate(String s, int max) {
         if (s == null) {
             return "";

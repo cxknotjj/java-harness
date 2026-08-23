@@ -9,11 +9,15 @@ import java.util.Optional;
  */
 public interface GoalService {
 
+    /** 创建目标（无会话记忆） */
     Goal create(String objective);
 
+    /** 创建目标（带会话记忆） */
     Goal create(String objective, String sessionId);
 
+    /** 按 id 查询目标 */
     Optional<Goal> get(String id);
 
+    /** 查询全部目标 */
     List<Goal> all();
 }

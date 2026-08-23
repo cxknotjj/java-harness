@@ -1,33 +1,28 @@
 package com.dark.javaHarness.controller;
 
-import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.dto.ChatRequest;
 import com.dark.javaHarness.dto.ChatResponse;
-import com.dark.javaHarness.service.AgentService;
-import com.dark.javaHarness.service.SessionService;
+import com.dark.javaHarness.service.ChatService;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 /**
- * 千问（Qwen）聊天接口。
- * 走 harness 编排层（AgentService -> general Agent -> Spring AI ChatClient
- * -> DashScope qwen-plus），聊天记录留存于 session + session_messages 表。
+ * 千问（Qwen）聊天接口（表现层，纯转发）。
+ * 业务编排在 ChatService：AgentService -> general Agent -> Spring AI ChatClient
+ * -> DashScope qwen-plus，聊天记录留存于 session + session_messages 表。
  */
 @RestController
 @RequestMapping("/api/chat")
 public class ChatController {
 
-    private final AgentService agentService;
-    private final SessionService sessionService;
+    private final ChatService chatService;
 
-    public ChatController(AgentService agentService, SessionService sessionService) {
-        this.agentService = agentService;
-        this.sessionService = sessionService;
-    }
-
-    /** 聊天请求体：message 必填，sessionId 可选（为空时自动创建新会话并在响应中返回） */
-    public record ChatRequest(String message, String sessionId) {
+    public ChatController(ChatService chatService) {
+        this.chatService = chatService;
     }
 
     /**
@@ -37,30 +32,17 @@ public class ChatController {
      */
     @PostMapping
     public ChatResponse chat(@RequestBody ChatRequest request) {
-        if (request.message() == null || request.message().isBlank()) {
-            throw new IllegalArgumentException("message 不能为空");
-        }
+        return chatService.chat(request);
+    }
 
-        // 无 sessionId 时自动建档（session 表），会话名取首条提问
-        String sessionId = request.sessionId();
-        boolean newSession = false;
-        if (sessionId == null || sessionId.isBlank()) {
-            sessionId = sessionService.createSession("anonymous", request.message());
-            newSession = true;
-        }
-
-        // 通过 harness 编排层同步执行：goal 生命周期与 summary 均会留存
-        Goal goal = agentService.executeSync("general", request.message(), sessionId);
-
-        ChatResponse.Builder b = ChatResponse.builder()
-                .sessionId(sessionId)
-                .newSession(newSession)
-                .goalId(goal.id())
-                .status(goal.status().name())
-                .reply(goal.summary());
-        if (goal.status() == Goal.Status.FAILED) {
-            b.error(goal.summary());
-        }
-        return b.build();
+    /**
+     * 流式聊天接口（SSE，带多轮会话记忆）
+     * POST /api/chat/stream  Body: {"message": "你好", "sessionId": "1"}
+     * 响应为 text/event-stream：逐 token data: <文本>，结束 data: [DONE]，
+     * 末尾 event: meta data: {sessionId,newSession,goalId,status}。
+     */
+    @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter stream(@RequestBody ChatRequest request) {
+        return chatService.stream(request);
     }
 }

@@ -4,13 +4,13 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.tool.DemoTools;
 import java.util.List;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClient.Builder;
-import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.stereotype.Component;
 
 /**
@@ -40,11 +40,13 @@ public class GeneralAssistantAgent implements Agent {
         this.memoryStore = memoryStore;
     }
 
+    /** 返回 Agent 名称（用于注册与路由） */
     @Override
     public String name() {
         return "general";
     }
 
+    /** 同步执行目标：携带会话历史调用大模型，返回完整回复并写回会话记忆 */
     @Override
     public String execute(Goal goal) {
         log.info("AI agent '{}' 开始处理目标: {}", name(), goal.objective());
@@ -58,13 +60,37 @@ public class GeneralAssistantAgent implements Agent {
                 .call()
                 .content();
         log.info("AI agent '{}' 得到回复: {}", name(), reply);
-
-        // 持久化本轮会话：本轮 user/assistant 消息逐条追加进 session_messages 该会话唯一一行
-        if (sessionId != null && !sessionId.isBlank()) {
-            memoryStore.saveContext(sessionId, new UserMessage(goal.objective()));
-            memoryStore.saveContext(sessionId, new AssistantMessage(reply));
-            memoryStore.touchSession(sessionId, goal.objective());
-        }
+        // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
         return reply;
+    }
+
+    /**
+     * 流式执行：用 ChatClient.stream() 逐 token 回调 onToken，并返回完整文本。
+     * 注意：记忆持久化不在此处做，交给 ChatService 在流结束后统一写回
+     * （保证写入的 assistant 内容与最终完整回复一致）。
+     */
+    @Override
+    public String executeStream(Goal goal, Consumer<String> onToken) {
+        log.info("AI agent '{}' 开始流式处理目标: {}", name(), goal.objective());
+        String sessionId = goal.sessionId();
+        List<Message> history = memoryStore.loadContext(sessionId);
+
+        String full = chatClient.prompt()
+                .system(SYSTEM_PROMPT)
+                .messages(history)
+                .user(goal.objective())
+                .stream()
+                .content()
+                .doOnNext(token -> {
+                    if (onToken != null) {
+                        onToken.accept(token);
+                    }
+                })
+                .collectList()
+                .block()
+                .stream()
+                .collect(Collectors.joining());
+        log.info("AI agent '{}' 流式输出完成，长度={}", name(), full.length());
+        return full;
     }
 }

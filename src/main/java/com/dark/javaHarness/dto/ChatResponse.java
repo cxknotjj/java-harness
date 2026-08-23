@@ -11,50 +11,13 @@ public record ChatResponse(
         String reply,
         String error) {
 
-    public static Builder builder() {
-        return new Builder();
+    /** 成功响应 */
+    public static ChatResponse success(String sessionId, boolean newSession, String goalId, String reply) {
+        return new ChatResponse(sessionId, newSession, goalId, "SUCCEEDED", reply, null);
     }
 
-    public static final class Builder {
-        private String sessionId;
-        private boolean newSession;
-        private String goalId;
-        private String status;
-        private String reply;
-        private String error;
-
-        public Builder sessionId(String sessionId) {
-            this.sessionId = sessionId;
-            return this;
-        }
-
-        public Builder newSession(boolean newSession) {
-            this.newSession = newSession;
-            return this;
-        }
-
-        public Builder goalId(String goalId) {
-            this.goalId = goalId;
-            return this;
-        }
-
-        public Builder status(String status) {
-            this.status = status;
-            return this;
-        }
-
-        public Builder reply(String reply) {
-            this.reply = reply;
-            return this;
-        }
-
-        public Builder error(String error) {
-            this.error = error;
-            return this;
-        }
-
-        public ChatResponse build() {
-            return new ChatResponse(sessionId, newSession, goalId, status, reply, error);
-        }
+    /** 失败响应 */
+    public static ChatResponse failure(String sessionId, boolean newSession, String goalId, String error) {
+        return new ChatResponse(sessionId, newSession, goalId, "FAILED", null, error);
     }
 }

@@ -19,11 +19,13 @@ public class GoalServiceImpl implements GoalService {
     private final ConcurrentMap<String, Goal> store = new ConcurrentHashMap<>();
     private final AtomicLong seq = new AtomicLong(0);
 
+    /** 创建目标（无会话记忆） */
     @Override
     public Goal create(String objective) {
         return create(objective, null);
     }
 
+    /** 创建目标（带会话记忆） */
     @Override
     public Goal create(String objective, String sessionId) {
         String id = "goal-" + seq.incrementAndGet();
@@ -32,11 +34,13 @@ public class GoalServiceImpl implements GoalService {
         return goal;
     }
 
+    /** 按 id 查询目标 */
     @Override
     public Optional<Goal> get(String id) {
         return Optional.ofNullable(store.get(id));
     }
 
+    /** 查询全部目标 */
     @Override
     public List<Goal> all() {
         return List.copyOf(store.values());

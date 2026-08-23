@@ -5,11 +5,11 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.GoalService;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -36,6 +36,7 @@ public class AgentServiceImpl implements AgentService {
         this.agents = map;
     }
 
+    /** 提交目标给指定 Agent 异步执行（立即返回，后台执行） */
     @Override
     public Goal submit(String agentName, String objective) {
         Agent agent = requireAgent(agentName);
@@ -44,11 +45,13 @@ public class AgentServiceImpl implements AgentService {
         return goal;
     }
 
+    /** 同步执行（无会话记忆）：阻塞直至完成并返回完整结果 */
     @Override
     public Goal executeSync(String agentName, String objective) {
         return executeSync(agentName, objective, null);
     }
 
+    /** 同步执行（带会话记忆）：阻塞直至完成并返回完整结果 */
     @Override
     public Goal executeSync(String agentName, String objective, String sessionId) {
         Agent agent = requireAgent(agentName);
@@ -57,21 +60,31 @@ public class AgentServiceImpl implements AgentService {
         return goal;
     }
 
+    /** 流式执行（带会话记忆）：逐 token 回调 onToken，阻塞直至整个流结束 */
     @Override
-    public Optional<Goal> getGoal(String id) {
-        return goalService.get(id);
+    public Goal executeStream(String agentName, String objective, String sessionId, Consumer<String> onToken) {
+        Agent agent = requireAgent(agentName);
+        Goal goal = goalService.create(objective, sessionId);
+        goal.markRunning();
+        try {
+            String summary = agent.executeStream(goal, onToken);
+            goal.succeed(summary);
+            log.info("[{}] goal '{}' STREAMED -> 长度={}", goal.id(), goal.objective(), summary == null ? 0 : summary.length());
+        } catch (Exception e) {
+            String reason = errorReason(e);
+            log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), reason);
+            goal.fail(reason);
+        }
+        return goal;
     }
 
-    @Override
-    public List<Goal> allGoals() {
-        return goalService.all();
-    }
-
+    /** 列出已注册的 Agent 名称 */
     @Override
     public Set<String> agentNames() {
         return agents.keySet();
     }
 
+    /** 按名称查找 Agent，不存在则抛出异常 */
     private Agent requireAgent(String agentName) {
         Agent agent = agents.get(agentName);
         if (agent == null) {
@@ -80,6 +93,7 @@ public class AgentServiceImpl implements AgentService {
         return agent;
     }
 
+    /** 同步执行目标并更新其生命周期状态（RUNNING -> SUCCEEDED/FAILED） */
     private void run(Goal goal, Agent agent) {
         goal.markRunning();
         try {
@@ -88,8 +102,14 @@ public class AgentServiceImpl implements AgentService {
             log.info("[{}] goal '{}' SUCCEEDED -> {}", goal.id(), goal.objective(), summary);
         } catch (Exception e) {
             // 目标失败是正常业务结果（如未配置 API key 时的 401），只记一行摘要避免刷屏
-            log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), e.getMessage());
-            goal.fail(e.getMessage());
+            String reason = errorReason(e);
+            log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), reason);
+            goal.fail(reason);
         }
+    }
+
+    /** 取异常可读原因：getMessage 为空时回退到 toString，避免失败摘要为 null */
+    private String errorReason(Exception e) {
+        return e.getMessage() == null || e.getMessage().isBlank() ? e.toString() : e.getMessage();
     }
 }

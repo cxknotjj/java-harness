@@ -1,17 +1,12 @@
 package com.dark.javaHarness.cli;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.dark.javaHarness.cli.api.ChatApiClient;
+import com.dark.javaHarness.dto.ChatResponse;
 import java.io.IOException;
 import java.net.ConnectException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 
 /**
- * 命令行聊天客户端：独立进程运行，通过 REST 调用主服务（8080）的 /api/chat。
+ * 命令行聊天客户端：独立进程运行，通过 REST 调用主服务（8080）的 /api/chat/stream（SSE 流式）。
  *
  * 重要：CLI 是纯 HTTP 客户端，不监听任何端口，占用的是你当前的终端进程。
  * 主服务（JavaHarnessApplication）负责监听 8080、保留日志、执行 Agent 编排。
@@ -21,19 +16,19 @@ import java.time.Duration;
  */
 public class ChatCli {
 
-    private final HttpClient http = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(5))
-            .build();
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final ChatApiClient api;
     private final String baseUrl;
 
     /** 会话ID：首轮为空（由服务端自动建档），从首次响应中获取后复用，实现多轮记忆 */
     private String sessionId;
 
+    /** 默认连本机主服务 8080 */
     public ChatCli() {
         this.baseUrl = "http://localhost:8080";
+        this.api = new ChatApiClient(baseUrl);
     }
 
+    /** 程序入口：启动交互式聊天循环 */
     public static void main(String[] args) {
         new ChatCli().chatLoop();
     }
@@ -75,41 +70,29 @@ public class ChatCli {
         System.out.println("再见！");
     }
 
+    /** 发送一条消息到主服务 /api/chat/stream（SSE 流式），边收 token 边打印 */
     private void send(String message) {
         try {
-            String json = mapper.writeValueAsString(new ChatRequest(message, sessionId));
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(baseUrl + "/api/chat"))
-                    .timeout(Duration.ofMinutes(3))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(json))
-                    .build();
-            HttpResponse<String> resp = http.send(request, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
-                System.out.println("HTTP " + resp.statusCode() + ": " + resp.body());
-                return;
-            }
-            JsonNode body = mapper.readTree(resp.body());
-            String status = body.path("status").asText();
-            String goalId = body.path("goalId").asText();
+            System.out.print("\n千问> ");
+            ChatResponse resp = api.chatStream(message, sessionId, token -> {
+                System.out.print(token);
+                System.out.flush();
+            });
+            System.out.println();
             // 记住服务端返回的会话ID，后续请求携带以延续多轮上下文
-            String respSessionId = body.path("sessionId").asText(null);
-            if (respSessionId != null && !respSessionId.isBlank()) {
-                this.sessionId = respSessionId;
+            if (resp.sessionId() != null && !resp.sessionId().isBlank()) {
+                this.sessionId = resp.sessionId();
             }
-            if ("SUCCEEDED".equals(status)) {
-                System.out.println("\n千问> " + body.path("reply").asText());
-                System.out.println("（会话 " + sessionId + " / " + goalId + "）");
+            if ("SUCCEEDED".equals(resp.status())) {
+                System.out.println("（会话 " + sessionId + " / " + resp.goalId() + "）");
             } else {
-                System.out.println("\n[执行失败 " + goalId + "] " + body.path("error").asText());
+                String err = resp.error() == null ? "（无详细信息）" : resp.error();
+                System.out.println("\n[执行失败 " + resp.goalId() + "] " + err);
             }
         } catch (ConnectException e) {
             System.out.println("无法连接主服务 " + baseUrl + "，请先启动主进程: mvn -s .mvn/settings.xml spring-boot:run");
-        } catch (IOException | InterruptedException e) {
+        } catch (IOException e) {
             System.out.println("请求失败: " + e.getMessage());
         }
-    }
-
-    private record ChatRequest(String message, String sessionId) {
     }
 }

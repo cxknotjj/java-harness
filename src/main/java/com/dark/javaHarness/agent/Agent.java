@@ -1,6 +1,7 @@
 package com.dark.javaHarness.agent;
 
 import com.dark.javaHarness.domain.Goal;
+import java.util.function.Consumer;
 
 /**
  * Agent 抽象：负责执行一个 Goal 并产出摘要。
@@ -13,4 +14,16 @@ public interface Agent {
 
     /** 执行目标，返回执行结果摘要（成功后由 AgentService 写入 Goal.summary）。 */
     String execute(Goal goal);
+
+    /**
+     * 流式执行目标：逐片段（token）回调 onToken，返回完整结果摘要。
+     * 默认实现退化为同步 execute 后一次性回调；需要真正流式的实现应覆写。
+     */
+    default String executeStream(Goal goal, Consumer<String> onToken) {
+        String result = execute(goal);
+        if (onToken != null) {
+            onToken.accept(result);
+        }
+        return result;
+    }
 }

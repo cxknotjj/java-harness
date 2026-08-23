@@ -91,6 +91,13 @@
             <version>3.29.0</version>
         </dependency>
 
+        <!-- OkHttp：CLI 网络请求 -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
+        </dependency>
+
         <!-- JDBC + MySQL 驱动 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
