@@ -7,11 +7,11 @@
 | 层面 | 技术 | 说明 |
 |---|---|---|
 | 框架 | Spring Boot 3.5.14 | 应用骨架、依赖注入、REST、自动配置 |
-| AI 模型接入 | Spring AI 1.1.4（`spring-ai-starter-model-openai`） | 通过 OpenAI 兼容协议接入通义千问（DashScope），零改动即可切换任意 OpenAI 兼容的模型服务（DeepSeek 等） |
-| 大模型 | 通义千问 `qwen3.7-plus` | DashScope `compatible-mode` 端点 |
+| AI 模型接入 | Spring AI 1.1.4 + `spring-ai-starter-model-openai` | 通过 OpenAI 兼容协议接入多个服务商（DashScope / DeepSeek），`Registry` 模式按 model 路由 |
+| 大模型 | 多模型（qwen-plus/max/turbo、gpt-4o、deepseek-chat 等） | 由 `model_provider` 表 + `agent` 表共同决定 |
 | 命令行交互 | `ChatCli`（自研循环） | 交互式终端：直接输入文本对话，`/agent` 切换 Agent |
 | HTTP | OkHttp 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`） |
-| ORM | MyBatis-Plus 3.5.7 | `goal` / `session` / `session_messages` / `agent` 表的 CRUD |
+| ORM | MyBatis-Plus 3.5.7 | `goal` / `session` / `session_messages` / `agent` / `model_provider` 表的 CRUD |
 | 参数校验 | Jakarta Validation | `spring-boot-starter-validation` + `@Valid` |
 | JSON | Jackson | DTO 序列化 / SSE meta 解析（随 starter 引入） |
 | 构建 | Maven | 项目管理与打包，项目内本地仓库 `.mvn-repo` |
@@ -32,22 +32,27 @@ src/main/java/com/dark/javaHarness/
 │   ├── GoalService.java          # 目标生命周期管理
 │   ├── SessionService.java       # 多轮会话记忆（session + session_messages）
 │   ├── ChatService.java          # 聊天用例编排（同步 / 流式 / SSE）
-│   └── impl/                     # 业务实现
+│   ├── AgentConfigProvider.java  # 从 agent 表读取运行配置（路由映射）
+│   └── impl/                     # 业务实现（AgentServiceImpl 等）
+├── config/                       # 配置与装配
+│   ├── ChatAgentConfig.java      # 注册多个 GeneralAssistantAgent（general/writer/coder/deepseek）
+│   ├── ChatClientFactory.java    # 按服务商构建 OpenAI 兼容 ChatClient（Registry 模式）
+│   └── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（从 model_provider 表加载）
 ├── mapper/                       # 数据访问层：MyBatis-Plus Mapper
-│   ├── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper
+│   ├── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper / ModelProviderMapper
 ├── domain/                       # 领域模型（父包）
 │   ├── Goal.java                 # 目标 + 状态（PENDING/RUNNING/SUCCEEDED/FAILED）
 │   ├── AgentConfig.java          # Agent 运行配置（model + prompt），来自 agent 表
 │   ├── dto/                      # 传输对象（请求/响应体）
-│   │   ├── ChatRequest / ChatResponse / ErrorResponse
+│   │   ├── ChatRequest / ChatResponse / ErrorResponse / SseMeta
 │   │   └── AgentsView / GoalView / GoalsView / SubmitView
-│   └── entity/                   # 数据库实体（对应 agent / goal / session 表）
-│       ├── AgentEntity / GoalEntity / Session / SessionMessage
+│   └── entity/                   # 数据库实体（对应 agent / goal / session / model_provider 表）
+│       ├── AgentEntity / GoalEntity / SessionEntity / SessionMessageEntity / ModelProviderEntity
 ├── enums/                        # 枚举：ExecutionType、GoalStatus
 ├── exception/                    # 全局异常处理（@RestControllerAdvice）
 ├── agent/                        # Agent 抽象与实现
 │   ├── Agent.java                # Agent 接口：name() / execute() / executeStream()
-│   └── GeneralAssistantAgent.java # “general”Agent：Spring AI ChatClient 调用千问
+│   └── GeneralAssistantAgent.java # 通用 Agent：按 model 从 Registry 取客户端调用大模型
 ├── cli/
 │   ├── ChatCli.java              # 命令行聊天客户端（独立进程，纯 HTTP 连 8080）
 │   └── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE)
@@ -64,7 +69,23 @@ src/main/java/com/dark/javaHarness/
 
 - JDK 17+
 - Maven 3.8+（项目使用项目内仓库，无需全局安装额外配置）
-- （可选）通义千问 API Key：阿里云百炼平台 <https://bailian.console.aliyun.com/> 获取
+- MySQL（`harness` 库，见 `application.yaml` 与 `sql/schema.sql`）
+- （可选）API Key：DashScope（通义千问）/ DeepSeek。不配置也能启动，但调用模型会返回 `invalid_api_key`。
+
+## 多模型与多服务商（Registry 模式）
+
+项目支持**多 Agent + 多模型服务商**，接入手性完全由数据库驱动：
+
+- **Agent**（`agent` 表）：每行定义一个 Agent（`agent_name`/`model`/`prompt`），对应一个已在 [ChatAgentConfig](src/main/java/com/dark/javaHarness/config/ChatAgentConfig.java) 注册的 bean 实例（general / writer / coder / deepseek）。
+- **模型映射**（`model_provider` 表）：每行定义 `model → (provider, api_url, status)`。
+  - 新增模型/服务商 = 表里加一行（`status=1` 启用），重启即加载；无需改代码。
+  - `status=0` 禁用 → 该模型回退到默认 DashScope 客户端。
+- **路由**：请求可携带 `agentId`（agent 表主键），服务端映射为 `agentName` 后路由；未命中或为空时回退默认 `general`。
+- **链路**：`agent.model` 引用 `model_provider.model`，由 `ChatClientRegistry` 运行时按 model 取对应厂商的 ChatClient。
+
+API Key 出于安全不落库，按服务商标识从环境读取：
+- `dashscope` → `spring.ai.openai.api-key`（环境变量 `DASHSCOPE_API_KEY` / `QWEN_API`）
+- `deepseek` → `app.deepseek.api-key`（环境变量 `DEEPSEEK_API_KEY`）
 
 ## 启动方式（双进程模型）
 
@@ -147,15 +168,54 @@ curl -s -X POST http://localhost:8080/api/chat \
   -d '{"message":"你好"}'
 ```
 
+### SSE 流式协议（`POST /api/chat/stream`）
+
+响应 `Content-Type: text/event-stream`，事件流如下：
+
+```
+data: 片段1
+data: 片段2
+...
+data: [DONE]
+event: meta
+data: {"sessionId":"9","newSession":true,"goalId":"goal-1","status":"SUCCEEDED"}
+```
+
+- 每段 `data:` 为模型生成的一个文本片段（逐 token 推送）
+- 全部推完发送 `[DONE]`
+- 末尾 `event: meta` 携带 `sessionId` / `newSession` / `goalId` / `status`；失败时 `status=FAILED` 且追加 `error` 字段
+- 可用 `curl -N` 观察逐段到达
+
 ## 核心流程
 
 ```
 CLI / REST 请求（可携带 agentId）
    → AgentService（编排层）路由到对应 Agent（agentId → agentName，未命中回退 general）
      → 创建 Goal: PENDING → RUNNING
-       → GeneralAssistantAgent 读取 agent 表配置（model + prompt）调用千问
+       → GeneralAssistantAgent 读取 agent 表配置（model + prompt），
+         按 model 从 ChatClientRegistry 取对应服务商客户端调用大模型
          （Spring AI ChatClient，同步 / 逐 token 流式）
        → 回写 Goal: SUCCEEDED / FAILED（含 summary）
 ```
 
 聊天请求会作为 Goal 留存，可通过 `/api/harness/goals` 查询历史记录。
+
+## 运行测试
+
+项目包含单元测试（基于 JUnit 5 + Mockito，不依赖真实数据库 / 网络 / API Key）：
+
+```bash
+mvn -s .mvn/settings.xml test
+```
+
+覆盖范围：
+
+| 测试 | 验证点 |
+|---|---|
+| `AgentServiceImplTest` | 多 Agent 路由：`agentId` → `writer` / 未命中回退 `general` / `null` 走默认 |
+| `AgentConfigProviderTest` | 从 `agent` 表读取配置（model / prompt）：命中、缺失、空白降级 |
+| `ChatClientRegistryTest` | 多服务商：新增 `gpt-4o` 命中、禁用模型回退默认客户端 |
+| `ChatServiceImplTest` | 多轮记忆：首轮 `newSession=true` 建档、带 sessionId 复用、成功写回上下文 |
+| `ChatServiceImplStreamTest` | 流式：逐 token 回调、收集完整回复、FAILED 返回 error |
+
+> 注意：`JavaHarnessApplicationTests` 是 `@SpringBootTest`，会尝试连接本机 MySQL；在无数据库环境运行该单个类可能因连接失败而报错（其余业务测试不受影响）。
