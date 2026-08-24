@@ -58,3 +58,20 @@ CREATE TABLE IF NOT EXISTS `session` (
     PRIMARY KEY (session_id),
     KEY idx_agent_id (agent_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话表';
+
+-- ============================================================
+-- Agent 表：注册可用的 Agent，供路由与展示。
+-- session.agent_id 关联本表 agent_id。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `agent` (
+    agent_id     BIGINT       NOT NULL AUTO_INCREMENT COMMENT 'Agent 主键ID',
+    agent_name   VARCHAR(64)  NOT NULL COMMENT 'Agent 名称（注册与路由用，如 general）',
+    description  VARCHAR(500) NULL COMMENT 'Agent 描述',
+    model        VARCHAR(64)  NULL COMMENT '绑定的模型名（如 qwen3.7-plus）',
+    prompt       TEXT         NULL COMMENT '系统提示词（System Prompt）',
+    status       TINYINT      NOT NULL DEFAULT 1 COMMENT '状态：1-启用 0-禁用',
+    created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at   DATETIME     NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (agent_id),
+    UNIQUE KEY uk_agent_name (agent_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 表';

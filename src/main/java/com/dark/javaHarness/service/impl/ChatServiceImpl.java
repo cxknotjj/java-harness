@@ -59,7 +59,7 @@ public class ChatServiceImpl implements ChatService {
 
         Goal goal = switch (type) {
             case SYNC -> executeSyncBySession(sessionId, request.message());
-            case STREAM -> executeStreamBySession(sessionId, request.message());
+            case STREAM -> executeStreamBySession(sessionId, request.message(), request.agentId(), ignored -> { });
         };
 
         if (goal.status() == GoalStatus.FAILED) {
@@ -81,15 +81,18 @@ public class ChatServiceImpl implements ChatService {
      * 流式执行（丢弃 token）：仅供 chat(..., STREAM) 收集完整结果后写回会话记忆。
      */
     private Goal executeStreamBySession(String sessionId, String message) {
-        return executeStreamBySession(sessionId, message, ignored -> { });
+        return executeStreamBySession(sessionId, message, null, ignored -> { });
     }
 
     /**
      * 流式执行并写回会话记忆：onToken 逐 token 消费（如 SSE 推送），
      * 流结束后统一写回 user/assistant，保证会话记忆与最终回复一致。
+     * agentId 非空时按该 Agent 路由，否则走默认 Agent。
      */
-    private Goal executeStreamBySession(String sessionId, String message, Consumer<String> onToken) {
-        Goal goal = agentService.executeStream(GENERAL_AGENT, message, sessionId, onToken);
+    private Goal executeStreamBySession(String sessionId, String message, Long agentId, Consumer<String> onToken) {
+        Goal goal = (agentId != null)
+                ? agentService.executeStreamById(agentId, message, sessionId, onToken)
+                : agentService.executeStream(GENERAL_AGENT, message, sessionId, onToken);
         writeBackContext(sessionId, message, goal);
         return goal;
     }
@@ -123,7 +126,7 @@ public class ChatServiceImpl implements ChatService {
             StringBuilder full = new StringBuilder();
             try {
                 // 逐 token 推送，流结束后由 executeStreamBySession 统一写回会话记忆
-                Goal goal = executeStreamBySession(sid, request.message(),
+                Goal goal = executeStreamBySession(sid, request.message(), request.agentId(),
                         token -> {
                             full.append(token);
                             try {

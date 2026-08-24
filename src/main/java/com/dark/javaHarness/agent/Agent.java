@@ -16,14 +16,14 @@ public interface Agent {
     String execute(Goal goal);
 
     /**
-     * 流式执行目标：逐片段（token）回调 onToken，返回完整结果摘要。
+     * 流式执行目标：逐片段（token）回调 onToken，不返回结果。
+     * 完整结果需要由调用方（如 AgentService）在 onToken 回调中自行拼接。
      * 默认实现退化为同步 execute 后一次性回调；需要真正流式的实现应覆写。
      */
-    default String executeStream(Goal goal, Consumer<String> onToken) {
+    default void executeStream(Goal goal, Consumer<String> onToken) {
         String result = execute(goal);
         if (onToken != null) {
             onToken.accept(result);
         }
-        return result;
     }
 }
