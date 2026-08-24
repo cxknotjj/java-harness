@@ -1,7 +1,7 @@
 package com.dark.javaHarness.controller;
 
-import com.dark.javaHarness.dto.ChatRequest;
-import com.dark.javaHarness.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.ChatRequest;
+import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.service.ChatService;
 import jakarta.validation.Valid;
 import org.springframework.http.MediaType;

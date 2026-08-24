@@ -1,4 +1,4 @@
-package com.dark.javaHarness.dto;
+package com.dark.javaHarness.domain.dto;
 
 /**
  * 聊天接口响应体（POST /api/chat）。

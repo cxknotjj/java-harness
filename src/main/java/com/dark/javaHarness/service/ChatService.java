@@ -1,7 +1,7 @@
 package com.dark.javaHarness.service;
 
-import com.dark.javaHarness.dto.ChatRequest;
-import com.dark.javaHarness.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.ChatRequest;
+import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.enums.ExecutionType;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 

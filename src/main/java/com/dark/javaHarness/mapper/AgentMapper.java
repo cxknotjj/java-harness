@@ -1,7 +1,7 @@
 package com.dark.javaHarness.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.dark.javaHarness.entity.AgentEntity;
+import com.dark.javaHarness.domain.entity.AgentEntity;
 import org.apache.ibatis.annotations.Mapper;
 
 /**

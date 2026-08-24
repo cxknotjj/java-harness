@@ -21,13 +21,14 @@
 
 ## 二、P1 · 能力增强（核心扩展）
 
-- [ ] **多模型接入**：接入官方 DeepSeek / 本地 Ollama / Qwen 官方 starter，Agent 按名称路由到不同模型
+- [x] **多模型接入**：接入官方 DeepSeek / 本地 Ollama / Qwen 官方 starter，Agent 按名称路由到不同模型
   - 验收：新增 Agent 实现即可切换模型，无需改 ChatService
+  - 现状：`GeneralAssistantAgent` 已参数化，`ChatAgentConfig` 装配 general / writer / coder 多个 Agent，每个绑定一个 agent_name，模型从 agent 表读取（qwen-plus / qwen-max / qwen-turbo）；新增 Agent = 注册一个 bean + agent 表一行
 - [ ] **RAG 知识库**：引入向量库（pgvector 优先，因其已在依赖管理中）+ Spring AI `VectorStore`
   - 验收：能对本地文档做"知识库问答"
 - [ ] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，替换/扩展 `DemoTools`
   - 验收：模型可调用一个外部 MCP 工具完成真实任务
-- [ ] **多 Agent 编排**：引入 LangGraph4j 或自研规划-执行循环（Planner + Executor）
+- [ ] **多 Agent 编排**：引入 Spring AI Alibaba 或自研规划-执行循环（Planner + Executor）
   - 验收：一个复杂目标被拆分为多个子任务并由子 Agent 执行
 - [ ] **异步任务治理**：`CompletableFuture.runAsync` 改为 `@Async` + 自定义线程池，或加任务表支持失败重投
   - 验收：并发提交 10 个 Goal 稳定执行，无线程池耗尽

@@ -1,4 +1,4 @@
-package com.dark.javaHarness.entity;
+package com.dark.javaHarness.domain.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
@@ -12,7 +12,7 @@ import lombok.Data;
  */
 @Data
 @TableName("session_messages")
-public class SessionMessage {
+public class SessionMessageEntity {
 
     /** 消息唯一主键ID */
     @TableId(type = IdType.AUTO)

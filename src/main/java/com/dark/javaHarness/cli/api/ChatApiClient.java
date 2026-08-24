@@ -1,7 +1,7 @@
 package com.dark.javaHarness.cli.api;
 
-import com.dark.javaHarness.dto.ChatRequest;
-import com.dark.javaHarness.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.ChatRequest;
+import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedReader;
 import java.io.IOException;

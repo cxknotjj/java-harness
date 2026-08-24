@@ -22,7 +22,7 @@
 | 核心框架     | Spring Boot                | 3.5.14 | Web 应用框架（**硬约束：与 Spring AI 1.1.4 兼容**）                                         |
 | AI 框架    | Spring AI                  | 1.1.4  | `spring-ai-starter-model-openai`，以 OpenAI 兼容模式对接通义千问 DashScope（qwen3.7-plus）   |
 | Web      | Spring MVC                 | 随 Boot | REST + SSE（`SseEmitter` 流式推送）+ 全局异常处理（`@RestControllerAdvice`）                 |
-| ORM      | MyBatis-Plus               | 3.5.7  | `mybatis-plus-spring-boot3-starter`，goal / session / session\_messages 表的 CRUD |
+| ORM      | MyBatis-Plus               | 3.5.7  | `mybatis-plus-spring-boot3-starter`，goal / session / session\_messages / agent 表的 CRUD |
 | 数据库      | MySQL                      | 9.2.0  | `mysql-connector-j`（runtime），连接池 HikariCP                                      |
 | 参数校验     | Jakarta Validation         | 随 Boot | `spring-boot-starter-validation` + `@Valid` 注解校验                               |
 | HTTP 客户端 | OkHttp                     | 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`）                                   |
@@ -37,23 +37,29 @@
 ### 架构分层
 
 ```
-controller（纯转发 + 全局异常处理）
+controller（REST + SSE 流式 + 全局异常处理）
   └─ service（接口 + impl：AgentService / ChatService / GoalService / SessionService）
         ├─ agent（Agent 抽象 + GeneralAssistantAgent）
         ├─ tool（DemoTools：@Tool 工具调用）
-        ├─ cli（ChatCli 交互端） + cli/api（ChatApiClient）
-        ├─ domain（Goal 内存模型）
-        ├─ entity / mapper（session、session_messages）
-        ├─ enums / dto
+        ├─ cli（ChatCli 交互端） + cli/api（ChatApiClient：OkHttp + SSE）
+        ├─ domain（领域模型父包，含 dto 与 entity）
+        │     ├─ Goal / AgentConfig（领域模型）
+        │     ├─ dto（请求/响应体）
+        │     └─ entity（对应 agent / goal / session 表）
+        ├─ mapper（Agent / Goal / Session / SessionMessage）
+        ├─ enums（ExecutionType / GoalStatus）
         └─ 配置（application.yaml）
 ```
 
 ### 关键设计
 
 - **流式聊天**：`/api/chat/stream` 走 SSE，逐 token 推送，结束发 `[DONE]` + `meta`（sessionId/goalId/status/error）。
+- **逐 token 推送**：`GeneralAssistantAgent.executeStream` 以 Reactor `Flux` 订阅真正边收边发，`AgentService` 在线拼装完整摘要写回 Goal。
+- **Agent 路由**：`agent` 表按 `agentId` 登记 Agent；CLI 传 `agentId`，服务端 `executeStreamById` 先映射为 `agentName`，未命中回退 `general`。
+- **动态配置**：每次调用经 `AgentService.getAgentConfig(agent_name)` 读 agent 表的 `model / prompt`，改库即时生效，无需重启。
 - **会话写回统一**：同步 / 流式路径都在 `ChatServiceImpl` 统一写回会话记忆。
 - **工具调用**：`ChatClient.defaultTools(new DemoTools())` 注册，模型可调用时间/计算/天气等工具。
-- **统一异常响应**：`GlobalExceptionHandler` 把所有异常转成 `{code, message}` 结构（400/404/500）。
+- **统一异常响应**：`GlobalExceptionHandler` 把所有异常转成 `{code, message}` 结构（400/404/500），非法请求返回统一 400 错误体。
 
 ***
 

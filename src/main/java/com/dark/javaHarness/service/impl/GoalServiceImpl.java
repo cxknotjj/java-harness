@@ -1,7 +1,7 @@
 package com.dark.javaHarness.service.impl;
 
 import com.dark.javaHarness.domain.Goal;
-import com.dark.javaHarness.entity.GoalEntity;
+import com.dark.javaHarness.domain.entity.GoalEntity;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.mapper.GoalMapper;
 import com.dark.javaHarness.service.GoalService;

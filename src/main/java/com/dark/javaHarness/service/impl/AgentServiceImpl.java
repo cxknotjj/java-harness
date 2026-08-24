@@ -1,11 +1,9 @@
 package com.dark.javaHarness.service.impl;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.dark.javaHarness.agent.Agent;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
-import com.dark.javaHarness.entity.AgentEntity;
-import com.dark.javaHarness.mapper.AgentMapper;
+import com.dark.javaHarness.service.AgentConfigProvider;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.GoalService;
 import java.util.List;
@@ -32,12 +30,14 @@ public class AgentServiceImpl implements AgentService {
     private static final String DEFAULT_AGENT_NAME = "general";
 
     private final GoalService goalService;
-    private final AgentMapper agentMapper;
+    private final AgentConfigProvider agentConfigProvider;
     private final ConcurrentMap<String, Agent> agents;
 
-    public AgentServiceImpl(GoalService goalService, AgentMapper agentMapper, List<Agent> agentList) {
+    public AgentServiceImpl(GoalService goalService,
+                            AgentConfigProvider agentConfigProvider,
+                            List<Agent> agentList) {
         this.goalService = goalService;
-        this.agentMapper = agentMapper;
+        this.agentConfigProvider = agentConfigProvider;
         // 以 name() 为 key 建立路由表
         ConcurrentMap<String, Agent> map = new ConcurrentHashMap<>();
         for (Agent agent : agentList) {
@@ -102,6 +102,8 @@ public class AgentServiceImpl implements AgentService {
     @Override
     public Goal executeStreamById(Long agentId, String objective, String sessionId, Consumer<String> onToken) {
         String agentName = findAgentNameById(agentId).orElse(DEFAULT_AGENT_NAME);
+        log.info("[agent切换] agentId={} -> agentName='{}'{}", agentId, agentName,
+                agentId != null && DEFAULT_AGENT_NAME.equals(agentName) ? " (未命中，回退默认)" : "");
         return executeStream(agentName, objective, sessionId, onToken);
     }
 
@@ -111,43 +113,16 @@ public class AgentServiceImpl implements AgentService {
         return agents.keySet();
     }
 
-    /** 按 agentId 从 agent 表查询 agentName（CLI 传入 agentId 时用于路由映射） */
+    /** 按 agentId 从 agent 表查询 agentName（委托 AgentConfigProvider，CLI 传入 agentId 时用于路由映射） */
     @Override
     public Optional<String> findAgentNameById(Long agentId) {
-        if (agentId == null) {
-            return Optional.empty();
-        }
-        try {
-            AgentEntity row = agentMapper.selectById(agentId);
-            if (row != null) {
-                return Optional.of(row.getAgentName());
-            }
-        } catch (Exception e) {
-            log.warn("按 agentId 查询 agent 表失败 agentId={}", agentId, e);
-        }
-        return Optional.empty();
+        return agentConfigProvider.findAgentNameById(agentId);
     }
 
-    /** 从 agent 表读取指定 Agent 的运行配置（模型 + 系统提示词） */
+    /** 从 agent 表读取指定 Agent 的运行配置（模型 + 系统提示词，委托 AgentConfigProvider） */
     @Override
     public Optional<AgentConfig> getAgentConfig(String agentName) {
-        try {
-            AgentEntity row = agentMapper.selectOne(new LambdaQueryWrapper<AgentEntity>()
-                    .eq(AgentEntity::getAgentName, agentName)
-                    .last("LIMIT 1"));
-            if (row != null) {
-                return Optional.of(new AgentConfig(
-                        blankToNull(row.getModel()),
-                        blankToNull(row.getPrompt())));
-            }
-        } catch (Exception e) {
-            log.warn("读取 agent 表配置失败 agent={}", agentName, e);
-        }
-        return Optional.empty();
-    }
-
-    private String blankToNull(String s) {
-        return s == null || s.isBlank() ? null : s;
+        return agentConfigProvider.getAgentConfig(agentName);
     }
 
     /** 按名称查找 Agent，不存在则抛出异常 */

@@ -75,3 +75,42 @@ CREATE TABLE IF NOT EXISTS `agent` (
     PRIMARY KEY (agent_id),
     UNIQUE KEY uk_agent_name (agent_name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 表';
+
+-- ============================================================
+-- 种子数据：注册的多个 Agent（多模型路由示例）。
+-- 每个 agent_name 对应一个已实例化的 Agent（见 ChatAgentConfig）：
+--   general/writer/coder 走 DashScope（spring.ai.openai，模型由本表 model 决定）
+--   deepseek 走独立端点（app.deepseek，模型由配置决定，本表 model 仅作展示）
+-- INSERT IGNORE 利用唯一键保证幂等。
+-- ============================================================
+INSERT IGNORE INTO `agent` (agent_name, description, model, prompt, status) VALUES
+('general', '通用 AI 助手（默认）', 'qwen-plus', '你是一个执行任务的 AI 助手，请直接给出简洁、可执行的完成结果。能结合会话历史。', 1),
+('writer',  '写作助手：擅长润色与文案创作', 'qwen-max', '你是专业写作助手，输出注重文笔、结构与可读性。', 1),
+('coder',   '编程助手：专注代码实现与解释', 'qwen-turbo', '你是资深程序员，优先给出可直接运行的代码与必要解释。', 1),
+('deepseek','深度推理助手（独立端点 DeepSeek）', 'deepseek-chat', '你是 DeepSeek 驱动的助手，给出生动且高质量的回复。', 1);
+
+-- ============================================================
+-- 模型-服务商映射表：驱动 ChatClientRegistry 动态注册。
+-- ChatClientRegistry 启动时查询本表，按 model 字段把各模型绑定到对应服务商客户端，
+-- 使“模型映射”可配置化（改库即生效，无需改代码）。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `model_provider` (
+    id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+    model       VARCHAR(64)  NOT NULL COMMENT '模型名（agent.model 引用的值）',
+    provider    VARCHAR(32)  NOT NULL COMMENT '服务商标识：dashscope / deepseek / ...',
+    api_url     VARCHAR(255) NULL COMMENT '服务商端点 base-url（如 https://dashscope.aliyuncs.com/compatible-mode）',
+    status      TINYINT      NOT NULL DEFAULT 1 COMMENT '状态：1-启用 0-禁用',
+    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at  DATETIME     NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_model (model)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模型-服务商映射表';
+
+INSERT IGNORE INTO `model_provider` (model, provider, api_url, status) VALUES
+('qwen-plus',     'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
+('qwen-turbo',    'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
+('qwen-max',      'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
+('qwen3.7-plus',  'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
+('deepseek-chat', 'deepseek', 'https://api.deepseek.com', 1),
+('deepseek-reasoner', 'deepseek', 'https://api.deepseek.com', 1),
+('deepseek-v4-flash', 'deepseek', 'https://api.deepseek.com', 1);

@@ -1,7 +1,7 @@
 package com.dark.javaHarness.cli;
 
 import com.dark.javaHarness.cli.api.ChatApiClient;
-import com.dark.javaHarness.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.ChatResponse;
 import java.io.IOException;
 import java.net.ConnectException;
 
