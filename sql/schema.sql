@@ -114,3 +114,34 @@ INSERT IGNORE INTO `model_provider` (model, provider, api_url, status) VALUES
 ('deepseek-chat', 'deepseek', 'https://api.deepseek.com', 1),
 ('deepseek-reasoner', 'deepseek', 'https://api.deepseek.com', 1),
 ('deepseek-v4-flash', 'deepseek', 'https://api.deepseek.com', 1);
+
+-- ============================================================
+-- Graph Checkpointer 相关表：由 Spring AI Alibaba Graph 的 MysqlSaver
+-- （spring-ai-alibaba-graph-core 1.1.2.2）读写，用于持久化图状态断点，
+-- 支持断点恢复 / 多版本追溯 / 线程（thread）隔离。
+--
+-- 说明：
+-- 1. 表名与框架内置 DDL 完全一致（GRAPH_THREAD / GRAPH_CHECKPOINT），
+--    避免代码侧 MysqlSaver 与手工建表因大小写/结构不一致引发运行时错误。
+-- 2. 此处显式建立可纳入版本管理；代码侧仍可用
+--    CreateOption.CREATE_IF_NOT_EXISTS 兜底（IF NOT EXISTS 幂等，可重复执行）。
+-- 3. state_data 以 JSON 存储序列化后的状态（binaryPayload 为 Base64 的
+--    OverAllState 快照）；saved_at 由数据库默认当前时间。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS GRAPH_THREAD (
+    thread_id    VARCHAR(36) PRIMARY KEY COMMENT '线程ID（全局唯一，对应一次图运行的隔离上下文）',
+    thread_name  VARCHAR(255) NULL COMMENT '线程名称（逻辑标识，配合 is_released 组成唯一索引）',
+    is_released  BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已释放：FALSE-活跃 TRUE-已释放（查询时排除已释放线程）',
+    UNIQUE KEY idx_graph_thread_name_released (thread_name, is_released)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Graph 线程表：一次图运行的状态载体';
+
+CREATE TABLE IF NOT EXISTS GRAPH_CHECKPOINT (
+    checkpoint_id VARCHAR(36) PRIMARY KEY COMMENT '检查点ID（唯一，一次状态快照）',
+    thread_id     VARCHAR(36) NOT NULL COMMENT '所属线程ID，关联 GRAPH_THREAD.thread_id',
+    node_id       VARCHAR(255) NULL COMMENT '产生该检查点的节点ID',
+    next_node_id  VARCHAR(255) NULL COMMENT '下一待执行节点ID（断点恢复入口）',
+    state_data    JSON NOT NULL COMMENT '序列化后的节点全局状态（OverAllState 快照，binaryPayload 为 Base64）',
+    saved_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '检查点保存时间',
+    CONSTRAINT GRAPH_FK_THREAD
+        FOREIGN KEY (thread_id) REFERENCES GRAPH_THREAD (thread_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Graph 检查点表：持久化图状态断点';

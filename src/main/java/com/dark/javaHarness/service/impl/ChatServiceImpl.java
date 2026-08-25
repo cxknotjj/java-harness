@@ -94,7 +94,7 @@ public class ChatServiceImpl implements ChatService {
      */
     private Goal executeStreamBySession(String sessionId, String message, Long agentId, Consumer<String> onToken) {
         Goal goal = (agentId != null)
-                ? agentService.executeStreamById(agentId, message, sessionId, onToken)
+                ? agentService.executeStreamByAgentId(agentId, message, sessionId, onToken)
                 : agentService.executeStream(GENERAL_AGENT, message, sessionId, onToken);
         log.info("流式执行路由: agentId={} -> goalId={}, status={}", agentId, goal.id(), goal.status());
         writeBackContext(sessionId, message, goal);

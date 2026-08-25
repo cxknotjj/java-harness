@@ -98,9 +98,11 @@ public class AgentServiceImpl implements AgentService {
         return goal;
     }
 
-    /** 按 agentId 流式执行：解析出 agentName 后路由，未命中回退默认 Agent（general） */
+    /**
+     * 按 agentId 流式执行：解析出 agentName 后路由，未命中回退默认 Agent（general）。
+     */
     @Override
-    public Goal executeStreamById(Long agentId, String objective, String sessionId, Consumer<String> onToken) {
+    public Goal executeStreamByAgentId(Long agentId, String objective, String sessionId, Consumer<String> onToken) {
         String agentName = findAgentNameById(agentId).orElse(DEFAULT_AGENT_NAME);
         log.info("[agent切换] agentId={} -> agentName='{}'{}", agentId, agentName,
                 agentId != null && DEFAULT_AGENT_NAME.equals(agentName) ? " (未命中，回退默认)" : "");

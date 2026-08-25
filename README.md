@@ -52,7 +52,12 @@ src/main/java/com/dark/javaHarness/
 ├── exception/                    # 全局异常处理（@RestControllerAdvice）
 ├── agent/                        # Agent 抽象与实现
 │   ├── Agent.java                # Agent 接口：name() / execute() / executeStream()
-│   └── GeneralAssistantAgent.java # 通用 Agent：按 model 从 Registry 取客户端调用大模型
+│   ├── GeneralAssistantAgent.java # 通用 Agent：直接按 model 从 Registry 取客户端调大模型
+│   └── GraphAssistantAgent.java  # Graph 承载的 Agent：StateGraph 编排 + OverAllState + MysqlSaver 持久化
+├── graph/                        # Spring AI Alibaba Graph 相关
+│   ├── SupportEmailGraph.java    # Graph 状态编排示例（条件边/键策略）
+│   ├── SupportEmailRuntime.java  # 示例 runtime（承载与调度）
+│   └── MySqlCheckpointer.java    # MysqlSaver 单例（Checkpointer 持久化）
 ├── cli/
 │   ├── ChatCli.java              # 命令行聊天客户端（独立进程，纯 HTTP 连 8080）
 │   └── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE)
@@ -192,13 +197,27 @@ data: {"sessionId":"9","newSession":true,"goalId":"goal-1","status":"SUCCEEDED"}
 CLI / REST 请求（可携带 agentId）
    → AgentService（编排层）路由到对应 Agent（agentId → agentName，未命中回退 general）
      → 创建 Goal: PENDING → RUNNING
-       → GeneralAssistantAgent 读取 agent 表配置（model + prompt），
-         按 model 从 ChatClientRegistry 取对应服务商客户端调用大模型
-         （Spring AI ChatClient，同步 / 逐 token 流式）
+       → general Agent = GraphAssistantAgent（Spring AI Alibaba Graph 状态编排）
+         StateGraph: prepare(读 agent 表配置 model/prompt + 加载会话记忆) → chat(调 LLM)
+           每次执行经 OverAllState 传递 objective / history / reply 状态
+           （真实 ChatModel：同步 call() 或逐 token stream()，含会话记忆）
+         → 经 MysqlSaver Checkpointer 将节点状态持久化到 GRAPH_THREAD / GRAPH_CHECKPOINT
        → 回写 Goal: SUCCEEDED / FAILED（含 summary）
 ```
 
 聊天请求会作为 Goal 留存，可通过 `/api/harness/goals` 查询历史记录。
+
+### Graph 状态编排与 Checkpointer
+
+- **general 用 `GraphAssistantAgent`** 承载执行层：内部以 `StateGraph`（`prepare → chat`）编排对话，`OverAllState` 作为节点间共享状态（键策略 `REPLACE`）。
+- **状态持久化由 `MysqlSaver` 完成**：每次执行按节点写入 `GRAPH_THREAD`（线程隔离）与 `GRAPH_CHECKPOINT`（状态断点快照），`CREATE_IF_NOT_EXISTS` 幂等建表，支持按 `thread_id` 断点续跑。
+- 相关表已声明于 `sql/schema.sql`，表结构与框架内置 DDL 一致。其余 Agent（writer/coder/deepseek）仍走 `GeneralAssistantAgent` 直调路径。
+
+> **风险说明（Checkpointer 持久化）**：
+> 本项目的图状态持久化使用了 `spring-ai-alibaba-graph-core` 内置的 **`MysqlSaver`**。需要特别注意：
+> 1. **官方文档未系统覆盖 MySQL 存储**——Spring AI Alibaba 官方文档主要介绍 Mongo / Postgres / Redis / 内存 saver，`MysqlSaver` 属于「源码内置但未文档化」的实现，仅能从 jar 内类确认其存在与结构。
+> 2. **升级需回归验证**：因其未纳入官方文档与稳定承诺，未来升级 Spring AI Alibaba 版本时，`MysqlSaver` 的建表 DDL / 表结构 / Column 可能发生变动。升级后应回归验证 `GRAPH_THREAD`、`GRAPH_CHECKPOINT` 两张表及断点读写是否兼容。
+> 3. **当前选择理由**：项目本身采用 MySQL（`harness` 库 / MyBatis-Plus），使用 `MysqlSaver` 零额外基础设施。若未来 Graph 成为核心生产能力，建议评估是否迁移到官方文档化的 Postgres / Redis saver 以获取更稳定的长期维护保障。
 
 ## 运行测试
 

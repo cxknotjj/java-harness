@@ -25,7 +25,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 /**
  * SSE/流式相关行为单测：
- * - chat(..., STREAM) 走 executeStreamById，收集完成后返回完整结果
+ * - chat(..., STREAM) 走 executeStreamByAgentId，收集完成后返回完整结果
  * - 逐 token 回调计数验证流式推送
  * - 失败路径 status=FAILED 且错误摘要非空（对应 meta.error 非空）
  */
@@ -45,7 +45,7 @@ class ChatServiceImplStreamTest {
         ChatRequest req = new ChatRequest("写段代码", null, 2L);
         when(sessionService.createSession("anonymous", "写段代码")).thenReturn("50");
 
-        when(agentService.executeStreamById(any(), anyString(), anyString(), any())).thenAnswer(inv -> {
+        when(agentService.executeStreamByAgentId(any(), anyString(), anyString(), any())).thenAnswer(inv -> {
             Long agentId = inv.getArgument(0);
             Consumer<String> onToken = inv.getArgument(3);
             onToken.accept("public ");
@@ -67,7 +67,7 @@ class ChatServiceImplStreamTest {
     void chatStream_tokenCallbackIsFiredPerToken() {
         ChatRequest req = new ChatRequest("你好", "5", 2L);
         AtomicInteger count = new AtomicInteger();
-        when(agentService.executeStreamById(any(), anyString(), anyString(), any())).thenAnswer(inv -> {
+        when(agentService.executeStreamByAgentId(any(), anyString(), anyString(), any())).thenAnswer(inv -> {
             Consumer<String> onToken = inv.getArgument(3);
             onToken.accept("a");
             onToken.accept("b");
@@ -80,15 +80,15 @@ class ChatServiceImplStreamTest {
         // 手动触发 onToken 回调，验证逐个消费
         chatService.chat(req, ExecutionType.STREAM);
 
-        // executeStreamById 已被调用且回调被逐段触发（count 通过捕获的 consumer 验证）
-        verify(agentService).executeStreamById(any(), anyString(), anyString(), any());
+        // executeStreamByAgentId 已被调用且回调被逐段触发（count 通过捕获的 consumer 验证）
+        verify(agentService).executeStreamByAgentId(any(), anyString(), anyString(), any());
         assertEquals(0, count.get(), "token 由 Agent 侧触发，此处验证调用链存在");
     }
 
     @Test
     void chatStream_failure_shouldReturnFailedWithError() {
         ChatRequest req = new ChatRequest("hi", "3", 2L);
-        when(agentService.executeStreamById(any(), anyString(), anyString(), any())).thenAnswer(inv -> {
+        when(agentService.executeStreamByAgentId(any(), anyString(), anyString(), any())).thenAnswer(inv -> {
             Goal g = new Goal("goal-f", "hi", "3");
             g.fail("invalid_api_key");
             return g;

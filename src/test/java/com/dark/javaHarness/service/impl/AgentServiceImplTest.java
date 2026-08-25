@@ -78,34 +78,34 @@ class AgentServiceImplTest {
     }
 
     @Test
-    void executeStreamById_withWriterAgent_two() {
-        // 显式提供同签名的 executeStreamById(2) → writer
+    void executeStreamByAgentId_withWriterAgent_two() {
+        // 显式提供同签名的 executeStreamByAgentId(2) → writer
         when(agentConfigProvider.findAgentNameById(2L)).thenReturn(Optional.of("writer"));
         stubGoal("writer", null);
 
-        Goal goal = agentService.executeStreamById(2L, "hi", null, ignored -> { });
+        Goal goal = agentService.executeStreamByAgentId(2L, "hi", null, ignored -> { });
 
         assertEquals("writer", routedTo.get());
     }
 
     @Test
-    void executeStreamById_withMissingAgent_999_shouldFallbackToGeneral() {
+    void executeStreamByAgentId_withMissingAgent_999_shouldFallbackToGeneral() {
         // agentId=999 无记录 → 回退默认 general
         when(agentConfigProvider.findAgentNameById(999L)).thenReturn(Optional.empty());
         stubGoal("general", null);
 
-        agentService.executeStreamById(999L, "hi", null, ignored -> { });
+        agentService.executeStreamByAgentId(999L, "hi", null, ignored -> { });
 
         assertEquals("general", routedTo.get());
     }
 
     @Test
-    void executeStreamById_withNullAgent_shouldFallbackToGeneral() {
+    void executeStreamByAgentId_withNullAgent_shouldFallbackToGeneral() {
         // 不传 agentId → 走 general
         when(agentConfigProvider.findAgentNameById(eq(null))).thenReturn(Optional.empty());
         stubGoal("general", null);
 
-        agentService.executeStreamById(null, "hi", null, ignored -> { });
+        agentService.executeStreamByAgentId(null, "hi", null, ignored -> { });
 
         assertEquals("general", routedTo.get());
     }

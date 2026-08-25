@@ -30,7 +30,7 @@ public interface AgentService {
      * 按 agentId 流式执行：先解析出对应 agentName 再路由到该 Agent。
      * agentId 为空或未命中时回退到默认 Agent（general）。
      */
-    Goal executeStreamById(Long agentId, String objective, String sessionId, Consumer<String> onToken);
+    Goal executeStreamByAgentId(Long agentId, String objective, String sessionId, Consumer<String> onToken);
 
     Set<String> agentNames();
 

@@ -23,7 +23,7 @@
 
 - [x] **多模型接入**：接入官方 DeepSeek / 本地 Ollama / Qwen 官方 starter，Agent 按名称路由到不同模型
   - 验收：新增 Agent 实现即可切换模型，无需改 ChatService
-  - 现状：`GeneralAssistantAgent` 已参数化，`ChatAgentConfig` 装配 general / writer / coder 多个 Agent，每个绑定一个 agent_name，模型从 agent 表读取（qwen-plus / qwen-max / qwen-turbo）；新增 Agent = 注册一个 bean + agent 表一行
+  - 现状：`GeneralAssistantAgent` 已参数化，`ChatAgentConfig` 装配 general / writer / coder 多个 Agent，每个绑定一个 agent\_name，模型从 agent 表读取（qwen-plus / qwen-max / qwen-turbo）；新增 Agent = 注册一个 bean + agent 表一行
 - [ ] **RAG 知识库**：引入向量库（pgvector 优先，因其已在依赖管理中）+ Spring AI `VectorStore`
   - 验收：能对本地文档做"知识库问答"
 - [ ] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，替换/扩展 `DemoTools`
@@ -54,7 +54,21 @@
 - [ ] **Mockito 单测**：为 service 层补单元测试（当前仅上下文加载测试）
   - 验收：核心 service 方法均有单测覆盖
 
-## 四、P3 · 按需（看产品方向再上）
+## 四、侧重点（提升工程深度的优先项）
+
+> 避免项目被归为「API 调用 + CRUD 的套壳 Demo」。
+> 原则：优先做「收益最大 × 认可度最高」的改造，并要能讲清「为什么」。
+
+- [ ] **响应式流式改造**：`ChatServiceImpl.stream()` 由 `SseEmitter` + `CompletableFuture.runAsync`（线程模型硬接流式）改造为 **WebFlux +** **`Flux<String>`** 响应式流
+  - 验收：Controller 直接返回 `Flux<String>` / `ServerSentEvent`，体现响应式编程能力
+  - 注意：需协调 MyBatis-Plus/DB 阻塞操作（可引入 Schedulers 边界，仅流式层响应式）；保留老 `/api/chat` 同步端点
+- [ ] **会话上下文管理与 Token 裁剪**：`session_messages` 由"单行 JSON 全量覆盖"改为基于 **Token 预算** 的上下文窗口裁剪（保留 system + 最近 N 轮）
+  - 验收：长对话请求体积受控、不撑爆 Token；裁剪后仍能还原对话意图
+  - 注意：需引入 token 计数（按模型近似估算或发布端 tokenizer）
+- [ ] **并发 / 资源控制**：流式连接数限制、异步线程池隔离与参数化、模型调用超时兜底与熔断降级
+  - 验收：并发提交多个流式请求稳定，无连接/线程池耗尽
+
+## 五、P3 · 按需（看产品方向再上）
 
 - [ ] **安全**：Spring Security + JWT 接口鉴权；API Key 走 KMS/Vault 管理
   - 验收：未带 token 的请求被拒绝
