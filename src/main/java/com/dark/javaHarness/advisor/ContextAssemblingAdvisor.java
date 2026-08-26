@@ -85,10 +85,12 @@ public class ContextAssemblingAdvisor implements CallAdvisor, StreamAdvisor {
      * 1. 过滤空内容 / 系统噪声（空白内容消息丢弃）；
      * 2. 归一化 role 顺序（以 system 开头，之后 user/assistant 交替压制连续同类）；
      * 3. 从最旧丢弃直至总 token 估算不超过预算（system 始终保留）。
+     * <p>重建 Prompt 时保留原 options（含 model 等 ChatOptions），避免丢失模型参数。
      */
     public Prompt assemble(Prompt prompt) {
         List<Message> raw = prompt.getInstructions();
-        return new Prompt(assemble(raw));
+        List<Message> assembled = assemble(raw);
+        return new Prompt(assembled, prompt.getOptions());
     }
 
     /** 组装消息列表（核心逻辑，纯函数可测）。 */

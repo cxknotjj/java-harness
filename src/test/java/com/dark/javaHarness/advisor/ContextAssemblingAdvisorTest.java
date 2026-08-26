@@ -10,6 +10,8 @@ import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.openai.OpenAiChatOptions;
 
 /**
  * ContextAssemblingAdvisor 上下文组装单测：
@@ -91,5 +93,17 @@ class ContextAssemblingAdvisorTest {
                 new AssistantMessage("hello")));
 
         assertEquals(3, result.size());
+    }
+
+    @Test
+    void assemble_preservesModelOptions() {
+        // 防止回归：重建 Prompt 时必须保留原 options（尤其 model 参数，否则会 400）
+        ContextAssemblingAdvisor a = advisor();
+        OpenAiChatOptions options = OpenAiChatOptions.builder().model("qwen3.7-plus").build();
+        Prompt original = new Prompt(List.of(new UserMessage("hi")), options);
+
+        Prompt assembled = a.assemble(original);
+
+        assertEquals("qwen3.7-plus", assembled.getOptions().getModel(), "组装后应保留 model 参数");
     }
 }
