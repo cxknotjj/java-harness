@@ -60,7 +60,7 @@ public class GeneralAssistantAgent implements Agent {
     @Override
     public String execute(Goal goal) {
         log.info("AI agent '{}' 开始处理目标: {}", name(), goal.objective());
-        String reply = newRequest(goal.sessionId(), goal.objective()).call().content();
+        String reply = buildChatRequestSpec(goal.sessionId(), goal.objective()).call().content();
         log.info("AI agent '{}' 得到回复: {}", name(), reply);
         // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
         return reply;
@@ -76,7 +76,7 @@ public class GeneralAssistantAgent implements Agent {
     public void executeStream(Goal goal, Consumer<String> onToken) {
         log.info("AI agent '{}' 开始流式处理目标: {}", name(), goal.objective());
 
-        Flux<String> flux = newRequest(goal.sessionId(), goal.objective())
+        Flux<String> flux = buildChatRequestSpec(goal.sessionId(), goal.objective())
                 .stream()
                 .content();
         // 真正逐 token 推送：订阅流，每来一个 token 立即回调，阻塞等待流结束
@@ -90,8 +90,8 @@ public class GeneralAssistantAgent implements Agent {
         log.info("AI agent '{}' 流式输出完成", name());
     }
 
-    /** 组装一次请求：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪 */
-    private ChatClient.ChatClientRequestSpec newRequest(String sessionId, String objective) {
+    /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪 */
+    private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective) {
         AgentConfig config = agentService.getAgentConfig(agentName)
                 .orElse(new AgentConfig(null, DEFAULT_SYSTEM_PROMPT));
         String model = config.model();

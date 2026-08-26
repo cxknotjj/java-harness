@@ -1,12 +1,14 @@
 package com.dark.javaHarness.service.impl;
 
 import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.domain.dto.SseMeta;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
+import com.dark.javaHarness.service.RouteJudge;
 import com.dark.javaHarness.service.SessionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -38,10 +40,12 @@ public class ChatServiceImpl implements ChatService {
 
     private final AgentService agentService;
     private final SessionService sessionService;
+    private final RouteJudge routeJudge;
 
-    public ChatServiceImpl(AgentService agentService, SessionService sessionService) {
+    public ChatServiceImpl(AgentService agentService, SessionService sessionService, RouteJudge routeJudge) {
         this.agentService = agentService;
         this.sessionService = sessionService;
+        this.routeJudge = routeJudge;
     }
 
     private static final Logger log = LoggerFactory.getLogger(ChatServiceImpl.class);
@@ -56,6 +60,9 @@ public class ChatServiceImpl implements ChatService {
             sessionId = sessionService.createSession("anonymous", request.message());
             newSession = true;
         }
+
+        // 主 Agent 前置判断：分流「简单(场景A)/复杂(场景B)」，仅打日志，不执行具体任务
+        logRoute(request.message());
 
         Goal goal = agentService.executeSync(GENERAL_AGENT, request.message(), sessionId);
         writeBackContext(sessionId, request.message(), goal);
@@ -87,6 +94,9 @@ public class ChatServiceImpl implements ChatService {
      */
     @Override
     public Flux<String> streamReactive(ChatRequest request) {
+        // 主 Agent 前置判断：分流决策（同步旁路，仅日志，不阻塞后续异步流主体）
+        logRoute(request.message());
+
         String existing = request.sessionId();
         boolean needNew = existing == null || existing.isBlank();
         Mono<SessionCtx> sessionMono = needNew
@@ -142,5 +152,29 @@ public class ChatServiceImpl implements ChatService {
     private static String safeMessage(Throwable ex) {
         String msg = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
         return msg.replaceAll("[\\r\\n]+", " ");
+    }
+
+    /**
+     * 主 Agent 前置判断的日志出口：调用 {@link RouteJudge} 得到分流决策并记录。
+     * 当前只有日志与决策输出；复杂路径（多 Agent Graph）就绪后，
+     * 在调用方据此切换执行链路。route 不写回会话、不改变对外契约。
+     */
+    private void logRoute(String message) {
+        try {
+            RouteDecision route = routeJudge.judge(message);
+            log.info("[route] message '{}' -> {}", trimForLog(message), route);
+        } catch (Exception e) {
+            // 判断异常不得影响请求主流程
+            log.warn("[route] 主 Agent 判断异常，忽略：{}", safeMessage(e));
+        }
+    }
+
+    /** 截断过长的 message 用于日志，避免刷屏 */
+    private static String trimForLog(String message) {
+        if (message == null) {
+            return "";
+        }
+        String single = message.replaceAll("[\\r\\n]+", " ");
+        return single.length() > 80 ? single.substring(0, 80) + "..." : single;
     }
 }

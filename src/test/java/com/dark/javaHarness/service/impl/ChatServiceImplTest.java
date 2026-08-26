@@ -11,11 +11,13 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
+import com.dark.javaHarness.service.RouteJudge;
 import com.dark.javaHarness.service.SessionService;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -41,6 +43,8 @@ class ChatServiceImplTest {
     private AgentService agentService;
     @Mock
     private SessionService sessionService;
+    @Mock
+    private RouteJudge routeJudge;
 
     @InjectMocks
     private ChatServiceImpl chatService;
@@ -168,6 +172,32 @@ class ChatServiceImplTest {
 
         assertTrue(lines.contains("data: writer-token"), "应按 agentId 路由到对应 Agent 的流");
         verify(agentService, never()).executeStreamReactive(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void chat_shouldInvokeMainAgentRouteJudge() {
+        ChatRequest req = new ChatRequest("你好", null, null);
+        when(sessionService.createSession("anonymous", "你好")).thenReturn("1");
+        when(agentService.executeSync(anyString(), anyString(), anyString()))
+                .thenReturn(succeededGoal("1", "你好，我是AI"));
+        when(routeJudge.judge("你好")).thenReturn(RouteDecision.SIMPLE);
+
+        chatService.chat(req);
+
+        verify(routeJudge).judge("你好");
+    }
+
+    @Test
+    void streamReactive_shouldInvokeMainAgentRouteJudge() {
+        ChatRequest req = new ChatRequest("调研竞品", null, null);
+        when(sessionService.createSession("anonymous", "调研竞品")).thenReturn("50");
+        when(agentService.executeStreamReactive("general", "调研竞品", "50"))
+                .thenReturn(Flux.just("a"));
+        when(routeJudge.judge("调研竞品")).thenReturn(RouteDecision.COMPLEX);
+
+        chatService.streamReactive(req).collectList().block();
+
+        verify(routeJudge).judge("调研竞品");
     }
 
     @Test

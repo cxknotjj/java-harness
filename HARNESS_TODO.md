@@ -38,12 +38,14 @@
   - 保证 role 顺序（system → user/assistant 交替，压制连续同类）
   - 单测覆盖：见 `ContextAssemblingAdvisorTest`
 
-### ② 主 Agent 前置判断（现状：尚未实现）⬜
+### ② 主 Agent 前置判断（现状：已具备）✅
 
-- [ ] 新增 **主 Agent / 路由判断器**：通过 LLM（或轻量规则）判断当前请求属于「简单(场景A)」还是「复杂(场景B)」。
-  - 输入：用户 message（+ 可选已组装上下文）
-  - 输出：`simple` 或 `complex` 的路由决策
-- [ ] 主 Agent 判断仅做「分流」，不执行具体任务（保持入口薄）。
+- [x] **主 Agent / 路由判断器**：`RouteJudge` 接口 + `LlmRouteJudge` 实现，通过 LLM 判断请求属于「简单(场景A)」还是「复杂(场景B)」。
+  - 输入：用户 message
+  - 输出：`SIMPLE` / `COMPLEX` 结构化决策（`RouteDecision`）
+  - 已接入 `ChatServiceImpl.chat()` / `streamReactive()` 前置分流（日志输出，不改对外契约）
+- [x] 主 Agent 判断仅做「分流」，不执行具体任务（入口薄）。
+- [x] 判断失败/超时/非 JSON 兜底 `SIMPLE`（宁可简单，TODO ⑤） | 单测覆盖：`LlmRouteJudgeTest`
 
 ### ③ 路径 A —— 普通单次调用芯片（现状：已具备）✅
 
@@ -75,8 +77,8 @@
 |---|---|
 | Harness 外壳入口 | `ChatController` / `ChatService` / `AgentService` |
 | 会话原始数据加载 | `SessionService.loadContext(sessionId)` |
-| 上下文组装(过滤/截断) | **无（TODO）** |
-| 主 Agent 前置判断 | **无（TODO）** |
+| 上下文组装(过滤/截断) | `ContextAssemblingAdvisor` |
+| 主 Agent 前置判断 | `RouteJudge` / `LlmRouteJudge` |
 | 路径 A(简单) 单次调用 | `GeneralAssistantAgent` |
 | 路径 B(复杂) 多 Agent Graph | **无（依赖 `spring-ai-alibaba-graph-core` 已预留）** |
 | 统一响应出口 | `ChatController` 同步 + 响应式 SSE |
