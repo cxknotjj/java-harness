@@ -6,12 +6,12 @@ import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
-import java.util.List;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import reactor.core.publisher.Flux;
 
@@ -56,14 +56,11 @@ public class GeneralAssistantAgent implements Agent {
         return agentName;
     }
 
-    /** 同步执行目标：携带会话历史调用大模型，返回完整回复并写回会话记忆 */
+    /** 同步执行目标：调用大模型返回完整回复（历史由 MessageChatMemoryAdvisor 注入） */
     @Override
     public String execute(Goal goal) {
         log.info("AI agent '{}' 开始处理目标: {}", name(), goal.objective());
-        String sessionId = goal.sessionId();
-        List<Message> history = memoryStore.loadContext(sessionId);
-
-        String reply = newRequest(history, goal.objective()).call().content();
+        String reply = newRequest(goal.sessionId(), goal.objective()).call().content();
         log.info("AI agent '{}' 得到回复: {}", name(), reply);
         // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
         return reply;
@@ -78,10 +75,8 @@ public class GeneralAssistantAgent implements Agent {
     @Override
     public void executeStream(Goal goal, Consumer<String> onToken) {
         log.info("AI agent '{}' 开始流式处理目标: {}", name(), goal.objective());
-        String sessionId = goal.sessionId();
-        List<Message> history = memoryStore.loadContext(sessionId);
 
-        Flux<String> flux = newRequest(history, goal.objective())
+        Flux<String> flux = newRequest(goal.sessionId(), goal.objective())
                 .stream()
                 .content();
         // 真正逐 token 推送：订阅流，每来一个 token 立即回调，阻塞等待流结束
@@ -95,8 +90,8 @@ public class GeneralAssistantAgent implements Agent {
         log.info("AI agent '{}' 流式输出完成", name());
     }
 
-    /** 组装一次请求：按 agent 表模型从注册表取对应 ChatClient，并设定系统提示词/历史/目标/模型 */
-    private ChatClient.ChatClientRequestSpec newRequest(List<Message> history, String objective) {
+    /** 组装一次请求：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪 */
+    private ChatClient.ChatClientRequestSpec newRequest(String sessionId, String objective) {
         AgentConfig config = agentService.getAgentConfig(agentName)
                 .orElse(new AgentConfig(null, DEFAULT_SYSTEM_PROMPT));
         String model = config.model();
@@ -105,10 +100,12 @@ public class GeneralAssistantAgent implements Agent {
         log.info("[agent请求] agentName='{}' -> 配置 model='{}'，实际使用 client={}",
                 name(), model, client == null ? "null" : client.getClass().getSimpleName());
         ChatClient.ChatClientRequestSpec spec = client.prompt()
-                // 上下文组装拦截器：对最终消息序列做过滤/截断/role 归一化（token 预算控制）
+                // 官方记忆 Advisor：从 SessionService(ChatMemory) 按会话ID注入历史
+                .advisors(MessageChatMemoryAdvisor.builder(memoryStore).build())
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
+                // 上下义组装拦截器：对注入后的序列做过滤/截断/role 归一化（token 预算控制）
                 .advisors(new ContextAssemblingAdvisor())
                 .system(config.prompt() != null ? config.prompt() : DEFAULT_SYSTEM_PROMPT)
-                .messages(history)
                 .user(objective);
         if (model != null && !model.isBlank()) {
             spec.options(OpenAiChatOptions.builder().model(model).build());

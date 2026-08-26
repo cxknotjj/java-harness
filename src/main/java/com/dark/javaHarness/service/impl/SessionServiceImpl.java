@@ -180,6 +180,34 @@ public class SessionServiceImpl implements SessionService {
         return sessionMapper.selectOne(qw);
     }
 
+    /* ---------------- Spring AI ChatMemory 接口实现（包装现有逻辑） ---------------- */
+
+    /** ChatMemory.get：按会话ID读取历史，等价于 {@link #loadContext}。 */
+    @Override
+    public List<Message> get(String conversationId) {
+        return loadContext(conversationId);
+    }
+
+    /** ChatMemory.add：追加一组消息到指定会话，等价于逐个 {@link #saveContext}。 */
+    @Override
+    public void add(String conversationId, List<Message> messages) {
+        for (Message m : messages) {
+            saveContext(conversationId, m);
+        }
+    }
+
+    /** ChatMemory.clear：清空指定会话的历史上下文（删除 session_messages 该会话行）。 */
+    @Override
+    public void clear(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) {
+            return;
+        }
+        QueryWrapper<SessionMessageEntity> qw = new QueryWrapper<>();
+        qw.eq("session_id", conversationId);
+        messageMapper.delete(qw);
+        log.info("清空会话上下文 sessionId={}", conversationId);
+    }
+
     /** 字符串 sessionId 转 Long（session 表主键为 BIGINT；非法格式返回 null 并告警） */
     private Long parseSessionId(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {

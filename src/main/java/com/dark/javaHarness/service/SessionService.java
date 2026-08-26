@@ -2,12 +2,17 @@ package com.dark.javaHarness.service;
 
 import com.dark.javaHarness.domain.entity.SessionEntity;
 import java.util.List;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.Message;
 
 /**
  * 会话服务：管理多轮会话记忆（session + session_messages 两张表）。
+ *
+ * 同时实现 Spring AI {@link ChatMemory} 接口，使本服务可作为
+ * {@code MessageChatMemoryAdvisor} 的记忆源被官方 Advisor 机制消费
+ * （conversationId 对应本服务的 sessionId）。
  */
-public interface SessionService {
+public interface SessionService extends ChatMemory {
 
     /**
      * 创建新会话，会话名取首条提问（截断）。
