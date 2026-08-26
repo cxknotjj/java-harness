@@ -191,13 +191,14 @@ class ChatServiceImplTest {
     void streamReactive_shouldInvokeMainAgentRouteJudge() {
         ChatRequest req = new ChatRequest("调研竞品", null, null);
         when(sessionService.createSession("anonymous", "调研竞品")).thenReturn("50");
-        when(agentService.executeStreamReactive("general", "调研竞品", "50"))
+        when(agentService.executeStreamReactive("multi-agent", "调研竞品", "50"))
                 .thenReturn(Flux.just("a"));
         when(routeJudge.judge("调研竞品")).thenReturn(RouteDecision.COMPLEX);
 
         chatService.streamReactive(req).collectList().block();
 
         verify(routeJudge).judge("调研竞品");
+        verify(agentService).executeStreamReactive(eq("multi-agent"), eq("调研竞品"), eq("50"));
     }
 
     @Test

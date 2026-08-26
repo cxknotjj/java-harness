@@ -14,4 +14,7 @@ public final class AgentConstants {
 
     /** 默认 / 兜底 Agent 名称（简单路径、未命中 agentId 时使用）。 */
     public static final String DEFAULT_AGENT = "general";
+
+    /** 复杂路径 Agent 名称（多 Agent 编排：MultiAgentGraphAgent）。 */
+    public static final String MULTI_AGENT = "multi-agent";
 }

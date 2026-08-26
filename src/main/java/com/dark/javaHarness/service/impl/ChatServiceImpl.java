@@ -61,10 +61,10 @@ public class ChatServiceImpl implements ChatService {
             newSession = true;
         }
 
-        // 主 Agent 前置判断：分流「简单(场景A)/复杂(场景B)」，仅打日志，不执行具体任务
-        logRoute(request.message());
+        // 主 Agent 前置判断：分流「场景A简单(general) / 场景B复杂(multi-agent)」
+        String resolvedAgent = resolveAgent(request.message());
 
-        Goal goal = agentService.executeSync(AgentConstants.DEFAULT_AGENT, request.message(), sessionId);
+        Goal goal = agentService.executeSync(resolvedAgent, request.message(), sessionId);
         writeBackContext(sessionId, request.message(), goal);
 
         if (goal.status() == GoalStatus.FAILED) {
@@ -94,8 +94,8 @@ public class ChatServiceImpl implements ChatService {
      */
     @Override
     public Flux<String> streamReactive(ChatRequest request) {
-        // 主 Agent 前置判断：分流决策（同步旁路，仅日志，不阻塞后续异步流主体）
-        logRoute(request.message());
+        // 主 Agent 前置判断：分流「场景A简单(general) / 场景B复杂(multi-agent)」
+        String resolvedAgent = resolveAgent(request.message());
 
         String existing = request.sessionId();
         boolean needNew = existing == null || existing.isBlank();
@@ -109,7 +109,7 @@ public class ChatServiceImpl implements ChatService {
             // agentId 非空时按该 Agent 路由，否则走默认 Agent
             Flux<String> agentTokens = (request.agentId() != null)
                     ? agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())
-                    : agentService.executeStreamReactive(AgentConstants.DEFAULT_AGENT, request.message(), ctx.sid());
+                    : agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid());
             // doOnNext 收集完整回复，流正常结束后由 doOnComplete 统一写回会话记忆（保持多轮记忆语义）
             StringBuilder full = new StringBuilder();
             Flux<String> body = agentTokens
@@ -155,17 +155,24 @@ public class ChatServiceImpl implements ChatService {
     }
 
     /**
-     * 主 Agent 前置判断的日志出口：调用 {@link RouteJudge} 得到分流决策并记录。
-     * 当前只有日志与决策输出；复杂路径（多 Agent Graph）就绪后，
-     * 在调用方据此切换执行链路。route 不写回会话、不改变对外契约。
+     * 主 Agent 前置判断：调用 {@link RouteJudge} 决定走哪条路径。
+     * 复杂(COMPLEX) → multi-agent 多 Agent 编排；否则(简单/未知) → 默认 general。
+     * 判断异常/失败时兜底默认 Agent（宁可简单，不阻塞请求）。
+     *
+     * @return 选中的 agent 名（"general" 或 "multi-agent"）
      */
-    private void logRoute(String message) {
+    private String resolveAgent(String message) {
         try {
             RouteDecision route = routeJudge.judge(message);
-            log.info("[route] message '{}' -> {}", trimForLog(message), route);
+            log.info("[route] message '{}' -> {} -> agent={}", trimForLog(message), route,
+                    route == RouteDecision.COMPLEX ? AgentConstants.MULTI_AGENT : AgentConstants.DEFAULT_AGENT);
+            return route == RouteDecision.COMPLEX
+                    ? AgentConstants.MULTI_AGENT
+                    : AgentConstants.DEFAULT_AGENT;
         } catch (Exception e) {
-            // 判断异常不得影响请求主流程
-            log.warn("[route] 主 Agent 判断异常，忽略：{}", safeMessage(e));
+            // 判断异常不得影响请求主流程：兜底默认（简单）路径
+            log.warn("[route] 主 Agent 判断异常，回退默认 agent：{}", safeMessage(e));
+            return AgentConstants.DEFAULT_AGENT;
         }
     }
 
