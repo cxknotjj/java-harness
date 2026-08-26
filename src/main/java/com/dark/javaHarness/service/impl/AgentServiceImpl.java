@@ -3,6 +3,7 @@ package com.dark.javaHarness.service.impl;
 import com.dark.javaHarness.agent.Agent;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentConfigProvider;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.GoalService;
@@ -27,9 +28,6 @@ import reactor.core.scheduler.Schedulers;
 public class AgentServiceImpl implements AgentService {
 
     private static final Logger log = LoggerFactory.getLogger(AgentServiceImpl.class);
-
-    /** agentId 未命中时的默认 Agent 名称（对应 GeneralAssistantAgent.name()） */
-    private static final String DEFAULT_AGENT_NAME = "general";
 
     private final GoalService goalService;
     private final AgentConfigProvider agentConfigProvider;
@@ -108,9 +106,9 @@ public class AgentServiceImpl implements AgentService {
      */
     @Override
     public Flux<String> executeStreamReactiveByAgentId(Long agentId, String objective, String sessionId) {
-        String agentName = findAgentNameById(agentId).orElse(DEFAULT_AGENT_NAME);
+        String agentName = findAgentNameById(agentId).orElse(AgentConstants.DEFAULT_AGENT);
         log.info("[agent切换] agentId={} -> agentName='{}'{}", agentId, agentName,
-                agentId != null && DEFAULT_AGENT_NAME.equals(agentName) ? " (未命中，回退默认)" : "");
+                agentId != null && AgentConstants.DEFAULT_AGENT.equals(agentName) ? " (未命中，回退默认)" : "");
         return executeStreamReactive(agentName, objective, sessionId);
     }
 

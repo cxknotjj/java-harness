@@ -5,6 +5,7 @@ import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.domain.dto.SseMeta;
+import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
@@ -29,7 +30,6 @@ import reactor.core.scheduler.Schedulers;
 @Service
 public class ChatServiceImpl implements ChatService {
 
-    private static final String GENERAL_AGENT = "general";
     /** SSE 事件名：元数据（sessionId/goalId/status/newSession） */
     private static final String EVENT_META = "meta";
     /** SSE 事件名：异常 */
@@ -64,7 +64,7 @@ public class ChatServiceImpl implements ChatService {
         // 主 Agent 前置判断：分流「简单(场景A)/复杂(场景B)」，仅打日志，不执行具体任务
         logRoute(request.message());
 
-        Goal goal = agentService.executeSync(GENERAL_AGENT, request.message(), sessionId);
+        Goal goal = agentService.executeSync(AgentConstants.DEFAULT_AGENT, request.message(), sessionId);
         writeBackContext(sessionId, request.message(), goal);
 
         if (goal.status() == GoalStatus.FAILED) {
@@ -109,7 +109,7 @@ public class ChatServiceImpl implements ChatService {
             // agentId 非空时按该 Agent 路由，否则走默认 Agent
             Flux<String> agentTokens = (request.agentId() != null)
                     ? agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())
-                    : agentService.executeStreamReactive(GENERAL_AGENT, request.message(), ctx.sid());
+                    : agentService.executeStreamReactive(AgentConstants.DEFAULT_AGENT, request.message(), ctx.sid());
             // doOnNext 收集完整回复，流正常结束后由 doOnComplete 统一写回会话记忆（保持多轮记忆语义）
             StringBuilder full = new StringBuilder();
             Flux<String> body = agentTokens
