@@ -1,10 +1,13 @@
 package com.dark.javaHarness.service.impl;
 
 import com.dark.javaHarness.agent.Agent;
+import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.service.AgentConfigProvider;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.GoalService;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,11 +26,18 @@ public class AgentServiceImpl implements AgentService {
 
     private static final Logger log = LoggerFactory.getLogger(AgentServiceImpl.class);
 
+    /** agentId 未命中时的默认 Agent 名称（对应 GeneralAssistantAgent.name()） */
+    private static final String DEFAULT_AGENT_NAME = "general";
+
     private final GoalService goalService;
+    private final AgentConfigProvider agentConfigProvider;
     private final ConcurrentMap<String, Agent> agents;
 
-    public AgentServiceImpl(GoalService goalService, List<Agent> agentList) {
+    public AgentServiceImpl(GoalService goalService,
+                            AgentConfigProvider agentConfigProvider,
+                            List<Agent> agentList) {
         this.goalService = goalService;
+        this.agentConfigProvider = agentConfigProvider;
         // 以 name() 为 key 建立路由表
         ConcurrentMap<String, Agent> map = new ConcurrentHashMap<>();
         for (Agent agent : agentList) {
@@ -60,18 +70,25 @@ public class AgentServiceImpl implements AgentService {
         return goal;
     }
 
-    /** 流式执行（带会话记忆）：逐 token 回调 onToken，阻塞直至整个流结束 */
+    /** 流式执行（带会话记忆）：逐 token 回调 onToken，流结束后取 goal.summary 作为完整结果 */
     @Override
     public Goal executeStream(String agentName, String objective, String sessionId, Consumer<String> onToken) {
         Agent agent = requireAgent(agentName);
         Goal goal = goalService.create(objective, sessionId);
         goal.markRunning();
         goalService.update(goal);
+        StringBuilder full = new StringBuilder();
         try {
-            String summary = agent.executeStream(goal, onToken);
+            agent.executeStream(goal, token -> {
+                full.append(token);
+                if (onToken != null) {
+                    onToken.accept(token);
+                }
+            });
+            String summary = full.toString();
             goal.succeed(summary);
             goalService.update(goal);
-            log.info("[{}] goal '{}' STREAMED -> 长度={}", goal.id(), goal.objective(), summary == null ? 0 : summary.length());
+            log.info("[{}] goal '{}' STREAMED -> 长度={}", goal.id(), goal.objective(), summary.length());
         } catch (Exception e) {
             String reason = errorReason(e);
             log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), reason);
@@ -81,10 +98,31 @@ public class AgentServiceImpl implements AgentService {
         return goal;
     }
 
+    /** 按 agentId 流式执行：解析出 agentName 后路由，未命中回退默认 Agent（general） */
+    @Override
+    public Goal executeStreamById(Long agentId, String objective, String sessionId, Consumer<String> onToken) {
+        String agentName = findAgentNameById(agentId).orElse(DEFAULT_AGENT_NAME);
+        log.info("[agent切换] agentId={} -> agentName='{}'{}", agentId, agentName,
+                agentId != null && DEFAULT_AGENT_NAME.equals(agentName) ? " (未命中，回退默认)" : "");
+        return executeStream(agentName, objective, sessionId, onToken);
+    }
+
     /** 列出已注册的 Agent 名称 */
     @Override
     public Set<String> agentNames() {
         return agents.keySet();
+    }
+
+    /** 按 agentId 从 agent 表查询 agentName（委托 AgentConfigProvider，CLI 传入 agentId 时用于路由映射） */
+    @Override
+    public Optional<String> findAgentNameById(Long agentId) {
+        return agentConfigProvider.findAgentNameById(agentId);
+    }
+
+    /** 从 agent 表读取指定 Agent 的运行配置（模型 + 系统提示词，委托 AgentConfigProvider） */
+    @Override
+    public Optional<AgentConfig> getAgentConfig(String agentName) {
+        return agentConfigProvider.getAgentConfig(agentName);
     }
 
     /** 按名称查找 Agent，不存在则抛出异常 */

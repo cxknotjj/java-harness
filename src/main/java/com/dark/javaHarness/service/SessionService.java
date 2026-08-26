@@ -1,6 +1,6 @@
 package com.dark.javaHarness.service;
 
-import com.dark.javaHarness.entity.Session;
+import com.dark.javaHarness.domain.entity.SessionEntity;
 import java.util.List;
 import org.springframework.ai.chat.messages.Message;
 
@@ -29,5 +29,5 @@ public interface SessionService {
     void touchSession(String sessionId, String lastQuestion);
 
     /** 查询会话（软删除的不会返回） */
-    Session getSession(String sessionId);
+    SessionEntity getSession(String sessionId);
 }

@@ -1,6 +1,6 @@
 package com.dark.javaHarness.exception;
 
-import com.dark.javaHarness.dto.ErrorResponse;
+import com.dark.javaHarness.domain.dto.ErrorResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;

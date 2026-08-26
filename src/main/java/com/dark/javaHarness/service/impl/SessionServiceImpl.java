@@ -2,8 +2,8 @@ package com.dark.javaHarness.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
-import com.dark.javaHarness.entity.Session;
-import com.dark.javaHarness.entity.SessionMessage;
+import com.dark.javaHarness.domain.entity.SessionEntity;
+import com.dark.javaHarness.domain.entity.SessionMessageEntity;
 import com.dark.javaHarness.mapper.SessionMapper;
 import com.dark.javaHarness.mapper.SessionMessageMapper;
 import com.dark.javaHarness.service.SessionService;
@@ -64,7 +64,7 @@ public class SessionServiceImpl implements SessionService {
     /** 创建新会话（会话名取首条提问截断），返回自增主键的字符串形式 */
     @Override
     public String createSession(String creator, String firstQuestion) {
-        Session session = new Session();
+        SessionEntity session = new SessionEntity();
         session.setAgentId(DEFAULT_AGENT_ID);
         session.setSessionName(truncate(firstQuestion, SESSION_NAME_MAX));
         session.setCreator(creator == null || creator.isBlank() ? "anonymous" : creator);
@@ -81,11 +81,11 @@ public class SessionServiceImpl implements SessionService {
         if (sessionId == null || sessionId.isBlank()) {
             return List.of();
         }
-        QueryWrapper<SessionMessage> qw = new QueryWrapper<>();
+        QueryWrapper<SessionMessageEntity> qw = new QueryWrapper<>();
         qw.eq("session_id", sessionId)
                 .orderByDesc("id")
                 .last("LIMIT 1");
-        SessionMessage latest = messageMapper.selectOne(qw);
+        SessionMessageEntity latest = messageMapper.selectOne(qw);
         if (latest == null || latest.getContent() == null || latest.getContent().isBlank()) {
             return List.of();
         }
@@ -110,11 +110,11 @@ public class SessionServiceImpl implements SessionService {
             return;
         }
         // 查询该会话唯一的上下文行（保留取最新一条以兼容历史多行数据）
-        QueryWrapper<SessionMessage> qw = new QueryWrapper<>();
+        QueryWrapper<SessionMessageEntity> qw = new QueryWrapper<>();
         qw.eq("session_id", sessionId)
                 .orderByDesc("id")
                 .last("LIMIT 1");
-        SessionMessage existing = messageMapper.selectOne(qw);
+        SessionMessageEntity existing = messageMapper.selectOne(qw);
 
         // 读取已有上下文，追加本条消息
         List<Map<String, String>> items = new ArrayList<>();
@@ -139,12 +139,12 @@ public class SessionServiceImpl implements SessionService {
             return;
         }
         if (existing != null) {
-            UpdateWrapper<SessionMessage> uw = new UpdateWrapper<>();
+            UpdateWrapper<SessionMessageEntity> uw = new UpdateWrapper<>();
             uw.eq("id", existing.getId())
                     .set("content", json);
             messageMapper.update(null, uw);
         } else {
-            SessionMessage row = new SessionMessage();
+            SessionMessageEntity row = new SessionMessageEntity();
             row.setSessionId(sessionId);
             row.setTenantId(DEFAULT_TENANT);
             row.setRole(ROLE_CONTEXT);
@@ -162,7 +162,7 @@ public class SessionServiceImpl implements SessionService {
         if (sid == null) {
             return;
         }
-        UpdateWrapper<Session> uw = new UpdateWrapper<>();
+        UpdateWrapper<SessionEntity> uw = new UpdateWrapper<>();
         uw.eq("session_id", sid)
                 .set("last_question", truncate(lastQuestion, 200));
         sessionMapper.update(null, uw);
@@ -170,12 +170,12 @@ public class SessionServiceImpl implements SessionService {
 
     /** 查询会话（非法或空 sessionId 返回 null） */
     @Override
-    public Session getSession(String sessionId) {
+    public SessionEntity getSession(String sessionId) {
         Long sid = parseSessionId(sessionId);
         if (sid == null) {
             return null;
         }
-        QueryWrapper<Session> qw = new QueryWrapper<>();
+        QueryWrapper<SessionEntity> qw = new QueryWrapper<>();
         qw.eq("session_id", sid);
         return sessionMapper.selectOne(qw);
     }

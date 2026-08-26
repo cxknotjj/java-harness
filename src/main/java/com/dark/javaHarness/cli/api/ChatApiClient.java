@@ -1,7 +1,7 @@
 package com.dark.javaHarness.cli.api;
 
-import com.dark.javaHarness.dto.ChatRequest;
-import com.dark.javaHarness.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.ChatRequest;
+import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -42,7 +42,7 @@ public class ChatApiClient {
      * @throws IOException 网络错误，或非 2xx 响应（消息含 HTTP 状态码与响应体）
      */
     public ChatResponse chat(String message, String sessionId) throws IOException {
-        String json = mapper.writeValueAsString(new ChatRequest(message, sessionId));
+        String json = mapper.writeValueAsString(new ChatRequest(message, sessionId, null));
         Request request = new Request.Builder()
                 .url(baseUrl + "/api/chat")
                 .post(RequestBody.create(json, JSON))
@@ -59,11 +59,12 @@ public class ChatApiClient {
     /**
      * 调用 /api/chat/stream 流式聊天（SSE）：逐 token 回调 onToken，
      * 流结束后解析末尾 meta 事件返回响应 DTO。
+     * agentId 可空：为空时服务端走默认 Agent。
      *
      * @throws IOException 网络错误、非 2xx 响应，或服务端 error 事件
      */
-    public ChatResponse chatStream(String message, String sessionId, Consumer<String> onToken) throws IOException {
-        String json = mapper.writeValueAsString(new ChatRequest(message, sessionId));
+    public ChatResponse chatStream(String message, String sessionId, Long agentId, Consumer<String> onToken) throws IOException {
+        String json = mapper.writeValueAsString(new ChatRequest(message, sessionId, agentId));
         Request request = new Request.Builder()
                 .url(baseUrl + "/api/chat/stream")
                 .post(RequestBody.create(json, JSON))

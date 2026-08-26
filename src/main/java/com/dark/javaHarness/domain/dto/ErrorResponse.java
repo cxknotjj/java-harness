@@ -1,4 +1,4 @@
-package com.dark.javaHarness.dto;
+package com.dark.javaHarness.domain.dto;
 
 /**
  * 统一异常响应体（全局异常处理器输出）。

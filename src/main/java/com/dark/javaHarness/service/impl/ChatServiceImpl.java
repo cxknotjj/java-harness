@@ -1,17 +1,18 @@
 package com.dark.javaHarness.service.impl;
 
 import com.dark.javaHarness.domain.Goal;
-import com.dark.javaHarness.dto.ChatRequest;
-import com.dark.javaHarness.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.ChatRequest;
+import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.SseMeta;
 import com.dark.javaHarness.enums.ExecutionType;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
 import com.dark.javaHarness.service.SessionService;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.stereotype.Service;
@@ -40,6 +41,8 @@ public class ChatServiceImpl implements ChatService {
         this.sessionService = sessionService;
     }
 
+    private static final Logger log = LoggerFactory.getLogger(ChatServiceImpl.class);
+
     /** 处理一次聊天请求（默认同步执行） */
     @Override
     public ChatResponse chat(ChatRequest request) {
@@ -59,7 +62,7 @@ public class ChatServiceImpl implements ChatService {
 
         Goal goal = switch (type) {
             case SYNC -> executeSyncBySession(sessionId, request.message());
-            case STREAM -> executeStreamBySession(sessionId, request.message());
+            case STREAM -> executeStreamBySession(sessionId, request.message(), request.agentId(), ignored -> { });
         };
 
         if (goal.status() == GoalStatus.FAILED) {
@@ -81,15 +84,19 @@ public class ChatServiceImpl implements ChatService {
      * 流式执行（丢弃 token）：仅供 chat(..., STREAM) 收集完整结果后写回会话记忆。
      */
     private Goal executeStreamBySession(String sessionId, String message) {
-        return executeStreamBySession(sessionId, message, ignored -> { });
+        return executeStreamBySession(sessionId, message, null, ignored -> { });
     }
 
     /**
      * 流式执行并写回会话记忆：onToken 逐 token 消费（如 SSE 推送），
      * 流结束后统一写回 user/assistant，保证会话记忆与最终回复一致。
+     * agentId 非空时按该 Agent 路由，否则走默认 Agent。
      */
-    private Goal executeStreamBySession(String sessionId, String message, Consumer<String> onToken) {
-        Goal goal = agentService.executeStream(GENERAL_AGENT, message, sessionId, onToken);
+    private Goal executeStreamBySession(String sessionId, String message, Long agentId, Consumer<String> onToken) {
+        Goal goal = (agentId != null)
+                ? agentService.executeStreamById(agentId, message, sessionId, onToken)
+                : agentService.executeStream(GENERAL_AGENT, message, sessionId, onToken);
+        log.info("流式执行路由: agentId={} -> goalId={}, status={}", agentId, goal.id(), goal.status());
         writeBackContext(sessionId, message, goal);
         return goal;
     }
@@ -108,6 +115,8 @@ public class ChatServiceImpl implements ChatService {
     public SseEmitter stream(ChatRequest request) {
         // 0L = 不超时，长连接直到流结束主动关闭
         SseEmitter emitter = new SseEmitter(0L);
+        log.info("收到流式聊天请求: message='{}', sessionId={}, agentId={}",
+                request.message(), request.sessionId(), request.agentId());
 
         // 无 sessionId 时自动建档（session 表），会话名取首条提问
         String sessionId = request.sessionId();
@@ -123,7 +132,7 @@ public class ChatServiceImpl implements ChatService {
             StringBuilder full = new StringBuilder();
             try {
                 // 逐 token 推送，流结束后由 executeStreamBySession 统一写回会话记忆
-                Goal goal = executeStreamBySession(sid, request.message(),
+                Goal goal = executeStreamBySession(sid, request.message(), request.agentId(),
                         token -> {
                             full.append(token);
                             try {
@@ -135,14 +144,12 @@ public class ChatServiceImpl implements ChatService {
 
                 // 发送 DONE + meta 元数据（失败时附带原因）
                 emitter.send(SseEmitter.event().data("[DONE]"));
-                Map<String, Object> meta = new LinkedHashMap<>();
-                meta.put("sessionId", sid);
-                meta.put("newSession", isNew);
-                meta.put("goalId", goal.id());
-                meta.put("status", goal.status().name());
-                if (goal.status() == GoalStatus.FAILED) {
-                    meta.put("error", goal.summary());
-                }
+                SseMeta meta = new SseMeta(
+                        sid,
+                        isNew,
+                        goal.id(),
+                        goal.status().name(),
+                        goal.status() == GoalStatus.FAILED ? goal.summary() : null);
                 emitter.send(SseEmitter.event().name(EVENT_META).data(meta));
                 emitter.complete();
             } catch (Exception e) {

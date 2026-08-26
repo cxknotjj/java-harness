@@ -1,10 +1,10 @@
 package com.dark.javaHarness.controller;
 
 import com.dark.javaHarness.domain.Goal;
-import com.dark.javaHarness.dto.AgentsView;
-import com.dark.javaHarness.dto.GoalView;
-import com.dark.javaHarness.dto.GoalsView;
-import com.dark.javaHarness.dto.SubmitView;
+import com.dark.javaHarness.domain.dto.AgentsView;
+import com.dark.javaHarness.domain.dto.GoalView;
+import com.dark.javaHarness.domain.dto.GoalsView;
+import com.dark.javaHarness.domain.dto.SubmitView;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.GoalService;
 import org.springframework.web.bind.annotation.GetMapping;

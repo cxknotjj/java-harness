@@ -1,4 +1,4 @@
-package com.dark.javaHarness.dto;
+package com.dark.javaHarness.domain.dto;
 
 import com.dark.javaHarness.domain.Goal;
 

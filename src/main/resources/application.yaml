@@ -27,7 +27,16 @@ spring:
 server:
   port: 8080
 
+# 自定义多服务商配置：除自动配置的 DashScope（spring.ai.openai）外，
+# 为 DeepSeek 提供独立端点。DeepSeek 与 OpenAI 兼容，代码中据此手工构建 ChatModel。
+app:
+  deepseek:
+    base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com/chat/completions}
+    api-key: ${DEEPSEEK_API_KEY:dummy-deepseek-key}
+    model: ${DEEPSEEK_MODEL:deepseek-chat}
+
 logging:
   level:
+    root: info
     # 无 API key 时 Spring AI 重试器会打整屏堆栈，压掉（失败信息由 AgentService 紧凑记录）
     org.springframework.ai.retry: ERROR
