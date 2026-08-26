@@ -13,11 +13,11 @@ import static org.mockito.Mockito.when;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
-import com.dark.javaHarness.enums.ExecutionType;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
 import com.dark.javaHarness.service.SessionService;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -26,6 +26,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import reactor.core.publisher.Flux;
 
 /**
  * ChatServiceImpl 多轮会话记忆单测：
@@ -105,5 +106,82 @@ class ChatServiceImplTest {
 
         assertEquals(GoalStatus.FAILED.name(), resp.status());
         verify(sessionService, never()).saveContext(anyString(), any());
+    }
+
+    @Test
+    void streamReactive_emitsSseTokensAndMeta() {
+        ChatRequest req = new ChatRequest("hi", null, null);
+        when(sessionService.createSession("anonymous", "hi")).thenReturn("50");
+        when(agentService.executeStreamReactive("general", "hi", "50"))
+                .thenReturn(Flux.just("a", "b"));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        assertTrue(lines.contains("data: a"), "应包含第 1 个 token");
+        assertTrue(lines.contains("data: b"), "应包含第 2 个 token");
+        assertTrue(lines.contains("data: [DONE]"), "token 结束后应包含 [DONE]");
+        assertTrue(lines.contains("event: meta"), "末尾应包含 meta 事件");
+        String metaData = lines.stream()
+                .filter(l -> l.startsWith("data: {\"sessionId"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("应包含 meta 的 data 行"));
+        assertTrue(metaData.contains("\"sessionId\":\"50\""), "meta 应包含 sessionId=50");
+        assertTrue(metaData.contains("\"status\":\"SUCCEEDED\""), "meta 应包含 status=SUCCEEDED");
+    }
+
+    @Test
+    void streamReactive_success_shouldWriteBackContext() {
+        ChatRequest req = new ChatRequest("hi", "50", null);
+        when(agentService.executeStreamReactive("general", "hi", "50"))
+                .thenReturn(Flux.just("a", "b"));
+
+        chatService.streamReactive(req).collectList().block();
+
+        ArgumentCaptor<UserMessage> userCapture = ArgumentCaptor.forClass(UserMessage.class);
+        ArgumentCaptor<AssistantMessage> assistantCapture = ArgumentCaptor.forClass(AssistantMessage.class);
+        verify(sessionService).saveContext(eq("50"), userCapture.capture());
+        verify(sessionService).saveContext(eq("50"), assistantCapture.capture());
+        verify(sessionService).touchSession(eq("50"), eq("hi"));
+        assertEquals("hi", userCapture.getValue().getText(), "写回 user 应与原始提问一致");
+        assertEquals("ab", assistantCapture.getValue().getText(), "写回 assistant 应为完整回复");
+    }
+
+    @Test
+    void streamReactive_onError_shouldNotWriteBackContext() {
+        ChatRequest req = new ChatRequest("hi", "50", null);
+        when(agentService.executeStreamReactive("general", "hi", "50"))
+                .thenReturn(Flux.error(new IllegalStateException("boom")));
+
+        chatService.streamReactive(req).collectList().block();
+
+        verify(sessionService, never()).saveContext(anyString(), any());
+        verify(sessionService, never()).touchSession(anyString(), anyString());
+    }
+
+    @Test
+    void streamReactive_withAgentId_shouldRouteByAgentId() {
+        ChatRequest req = new ChatRequest("hi", "50", 2L);
+        when(agentService.executeStreamReactiveByAgentId(2L, "hi", "50"))
+                .thenReturn(Flux.just("writer-token"));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        assertTrue(lines.contains("data: writer-token"), "应按 agentId 路由到对应 Agent 的流");
+        verify(agentService, never()).executeStreamReactive(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void streamReactive_onError_emitsErrorEvent() {
+        ChatRequest req = new ChatRequest("hi", "50", null);
+        when(agentService.executeStreamReactive("general", "hi", "50"))
+                .thenReturn(Flux.error(new IllegalStateException("boom")));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        assertTrue(lines.contains("event: error"), "出错时应包含 error 事件");
+        assertTrue(lines.contains("data: boom"), "应包含错误信息");
+        assertTrue(lines.contains("event: meta"), "出错后应以 meta 收尾");
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("data: {\"sessionId") && l.contains("\"status\":\"FAILED\"")),
+                "出错后 meta 应为 FAILED");
     }
 }

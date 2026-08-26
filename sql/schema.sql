@@ -77,16 +77,14 @@ CREATE TABLE IF NOT EXISTS `agent` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 表';
 
 -- ============================================================
--- 种子数据：注册的多个 Agent（多模型路由示例）。
--- 每个 agent_name 对应一个已实例化的 Agent（见 ChatAgentConfig）：
---   general/writer/coder 走 DashScope（spring.ai.openai，模型由本表 model 决定）
+-- 种子数据：注册对应的 Agent（见 ChatAgentConfig 中已实例化的 bean）。
+-- 每个 agent_name 对应一个已实例化的 Agent：
+--   general 走 DashScope（spring.ai.openai，模型由本表 model 决定）
 --   deepseek 走独立端点（app.deepseek，模型由配置决定，本表 model 仅作展示）
 -- INSERT IGNORE 利用唯一键保证幂等。
 -- ============================================================
 INSERT IGNORE INTO `agent` (agent_name, description, model, prompt, status) VALUES
 ('general', '通用 AI 助手（默认）', 'qwen-plus', '你是一个执行任务的 AI 助手，请直接给出简洁、可执行的完成结果。能结合会话历史。', 1),
-('writer',  '写作助手：擅长润色与文案创作', 'qwen-max', '你是专业写作助手，输出注重文笔、结构与可读性。', 1),
-('coder',   '编程助手：专注代码实现与解释', 'qwen-turbo', '你是资深程序员，优先给出可直接运行的代码与必要解释。', 1),
 ('deepseek','深度推理助手（独立端点 DeepSeek）', 'deepseek-chat', '你是 DeepSeek 驱动的助手，给出生动且高质量的回复。', 1);
 
 -- ============================================================
@@ -114,34 +112,3 @@ INSERT IGNORE INTO `model_provider` (model, provider, api_url, status) VALUES
 ('deepseek-chat', 'deepseek', 'https://api.deepseek.com', 1),
 ('deepseek-reasoner', 'deepseek', 'https://api.deepseek.com', 1),
 ('deepseek-v4-flash', 'deepseek', 'https://api.deepseek.com', 1);
-
--- ============================================================
--- Graph Checkpointer 相关表：由 Spring AI Alibaba Graph 的 MysqlSaver
--- （spring-ai-alibaba-graph-core 1.1.2.2）读写，用于持久化图状态断点，
--- 支持断点恢复 / 多版本追溯 / 线程（thread）隔离。
---
--- 说明：
--- 1. 表名与框架内置 DDL 完全一致（GRAPH_THREAD / GRAPH_CHECKPOINT），
---    避免代码侧 MysqlSaver 与手工建表因大小写/结构不一致引发运行时错误。
--- 2. 此处显式建立可纳入版本管理；代码侧仍可用
---    CreateOption.CREATE_IF_NOT_EXISTS 兜底（IF NOT EXISTS 幂等，可重复执行）。
--- 3. state_data 以 JSON 存储序列化后的状态（binaryPayload 为 Base64 的
---    OverAllState 快照）；saved_at 由数据库默认当前时间。
--- ============================================================
-CREATE TABLE IF NOT EXISTS GRAPH_THREAD (
-    thread_id    VARCHAR(36) PRIMARY KEY COMMENT '线程ID（全局唯一，对应一次图运行的隔离上下文）',
-    thread_name  VARCHAR(255) NULL COMMENT '线程名称（逻辑标识，配合 is_released 组成唯一索引）',
-    is_released  BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否已释放：FALSE-活跃 TRUE-已释放（查询时排除已释放线程）',
-    UNIQUE KEY idx_graph_thread_name_released (thread_name, is_released)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Graph 线程表：一次图运行的状态载体';
-
-CREATE TABLE IF NOT EXISTS GRAPH_CHECKPOINT (
-    checkpoint_id VARCHAR(36) PRIMARY KEY COMMENT '检查点ID（唯一，一次状态快照）',
-    thread_id     VARCHAR(36) NOT NULL COMMENT '所属线程ID，关联 GRAPH_THREAD.thread_id',
-    node_id       VARCHAR(255) NULL COMMENT '产生该检查点的节点ID',
-    next_node_id  VARCHAR(255) NULL COMMENT '下一待执行节点ID（断点恢复入口）',
-    state_data    JSON NOT NULL COMMENT '序列化后的节点全局状态（OverAllState 快照，binaryPayload 为 Base64）',
-    saved_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '检查点保存时间',
-    CONSTRAINT GRAPH_FK_THREAD
-        FOREIGN KEY (thread_id) REFERENCES GRAPH_THREAD (thread_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Graph 检查点表：持久化图状态断点';

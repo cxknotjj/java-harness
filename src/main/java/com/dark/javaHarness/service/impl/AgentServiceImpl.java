@@ -16,6 +16,8 @@ import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Schedulers;
 
 /**
  * Agent 编排服务实现：接收一个请求，路由到对应 Agent，
@@ -70,43 +72,46 @@ public class AgentServiceImpl implements AgentService {
         return goal;
     }
 
-    /** 流式执行（带会话记忆）：逐 token 回调 onToken，流结束后取 goal.summary 作为完整结果 */
+    /**
+     * 响应式流式执行：返回逐 token 产出的 {@link Flux}。
+     * 在 AgentService 层完成 goal 生命周期（RUNNING -> SUCCEEDED/FAILED），
+     * doOnNext 收集完整 token，doOnComplete/doOnError 回写 goal 状态；
+     * 阻塞的 DB 操作与 Agent 执行通过 subscribeOn(boundedElastic) 隔离，避免阻塞调用方线程。
+     */
     @Override
-    public Goal executeStream(String agentName, String objective, String sessionId, Consumer<String> onToken) {
+    public Flux<String> executeStreamReactive(String agentName, String objective, String sessionId) {
         Agent agent = requireAgent(agentName);
         Goal goal = goalService.create(objective, sessionId);
         goal.markRunning();
         goalService.update(goal);
         StringBuilder full = new StringBuilder();
-        try {
-            agent.executeStream(goal, token -> {
-                full.append(token);
-                if (onToken != null) {
-                    onToken.accept(token);
-                }
-            });
-            String summary = full.toString();
-            goal.succeed(summary);
-            goalService.update(goal);
-            log.info("[{}] goal '{}' STREAMED -> 长度={}", goal.id(), goal.objective(), summary.length());
-        } catch (Exception e) {
-            String reason = errorReason(e);
-            log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), reason);
-            goal.fail(reason);
-            goalService.update(goal);
-        }
-        return goal;
+        return agent.executeStreamReactive(goal)
+                .doOnNext(full::append)
+                .doOnComplete(() -> {
+                    String summary = full.toString();
+                    goal.succeed(summary);
+                    goalService.update(goal);
+                    log.info("[{}] goal '{}' STREAMED(reactive) -> 长度={}", goal.id(), goal.objective(), summary.length());
+                })
+                .doOnError(e -> {
+                    String reason = errorReason(e);
+                    log.warn("[{}] goal '{}' FAILED(reactive): {}", goal.id(), goal.objective(), reason);
+                    goal.fail(reason);
+                    goalService.update(goal);
+                })
+                // 阻塞 DB 操作（create/markRunning/update）与 Agent 执行切到 boundedElastic，避免阻塞调用方
+                .subscribeOn(Schedulers.boundedElastic());
     }
 
     /**
-     * 按 agentId 流式执行：解析出 agentName 后路由，未命中回退默认 Agent（general）。
+     * 按 agentId 响应式流式执行：解析出 agentName 后路由，未命中回退默认 Agent（general）。
      */
     @Override
-    public Goal executeStreamByAgentId(Long agentId, String objective, String sessionId, Consumer<String> onToken) {
+    public Flux<String> executeStreamReactiveByAgentId(Long agentId, String objective, String sessionId) {
         String agentName = findAgentNameById(agentId).orElse(DEFAULT_AGENT_NAME);
         log.info("[agent切换] agentId={} -> agentName='{}'{}", agentId, agentName,
                 agentId != null && DEFAULT_AGENT_NAME.equals(agentName) ? " (未命中，回退默认)" : "");
-        return executeStream(agentName, objective, sessionId, onToken);
+        return executeStreamReactive(agentName, objective, sessionId);
     }
 
     /** 列出已注册的 Agent 名称 */
@@ -155,7 +160,7 @@ public class AgentServiceImpl implements AgentService {
     }
 
     /** 取异常可读原因：getMessage 为空时回退到 toString，避免失败摘要为 null */
-    private String errorReason(Exception e) {
+    private String errorReason(Throwable e) {
         return e.getMessage() == null || e.getMessage().isBlank() ? e.toString() : e.getMessage();
     }
 }

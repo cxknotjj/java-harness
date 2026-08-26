@@ -1,4 +1,4 @@
-package com.dark.javaHarness.config;
+package com.dark.javaHarness.config.agent;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.dark.javaHarness.domain.entity.ModelProviderEntity;

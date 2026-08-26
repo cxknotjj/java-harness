@@ -34,10 +34,13 @@ src/main/java/com/dark/javaHarness/
 │   ├── ChatService.java          # 聊天用例编排（同步 / 流式 / SSE）
 │   ├── AgentConfigProvider.java  # 从 agent 表读取运行配置（路由映射）
 │   └── impl/                     # 业务实现（AgentServiceImpl 等）
+├── advisor/                      # Spring AI Advisor 拦截器（Agent 流程横切管理）
+│   └── ContextAssemblingAdvisor.java  # 上下文组装：过滤/截断/role 归一化（token 预算）
 ├── config/                       # 配置与装配
-│   ├── ChatAgentConfig.java      # 注册多个 GeneralAssistantAgent（general/writer/coder/deepseek）
-│   ├── ChatClientFactory.java    # 按服务商构建 OpenAI 兼容 ChatClient（Registry 模式）
-│   └── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（从 model_provider 表加载）
+│   └── agent/                    # Agent 配置注册（Agent bean + 多服务商客户端注册）
+│       ├── ChatAgentConfig.java      # 注册 GeneralAssistantAgent（general / deepseek）
+│       ├── ChatClientFactory.java    # 按服务商构建 OpenAI 兼容 ChatClient（Registry 模式）
+│       └── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（从 model_provider 表加载）
 ├── mapper/                       # 数据访问层：MyBatis-Plus Mapper
 │   ├── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper / ModelProviderMapper
 ├── domain/                       # 领域模型（父包）
@@ -48,16 +51,11 @@ src/main/java/com/dark/javaHarness/
 │   │   └── AgentsView / GoalView / GoalsView / SubmitView
 │   └── entity/                   # 数据库实体（对应 agent / goal / session / model_provider 表）
 │       ├── AgentEntity / GoalEntity / SessionEntity / SessionMessageEntity / ModelProviderEntity
-├── enums/                        # 枚举：ExecutionType、GoalStatus
+├── enums/                        # 枚举：GoalStatus
 ├── exception/                    # 全局异常处理（@RestControllerAdvice）
 ├── agent/                        # Agent 抽象与实现
 │   ├── Agent.java                # Agent 接口：name() / execute() / executeStream()
-│   ├── GeneralAssistantAgent.java # 通用 Agent：直接按 model 从 Registry 取客户端调大模型
-│   └── GraphAssistantAgent.java  # Graph 承载的 Agent：StateGraph 编排 + OverAllState + MysqlSaver 持久化
-├── graph/                        # Spring AI Alibaba Graph 相关
-│   ├── SupportEmailGraph.java    # Graph 状态编排示例（条件边/键策略）
-│   ├── SupportEmailRuntime.java  # 示例 runtime（承载与调度）
-│   └── MySqlCheckpointer.java    # MysqlSaver 单例（Checkpointer 持久化）
+│   └── GeneralAssistantAgent.java # 通用 Agent：直接按 model 从 Registry 取客户端调大模型
 ├── cli/
 │   ├── ChatCli.java              # 命令行聊天客户端（独立进程，纯 HTTP 连 8080）
 │   └── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE)
@@ -81,7 +79,7 @@ src/main/java/com/dark/javaHarness/
 
 项目支持**多 Agent + 多模型服务商**，接入手性完全由数据库驱动：
 
-- **Agent**（`agent` 表）：每行定义一个 Agent（`agent_name`/`model`/`prompt`），对应一个已在 [ChatAgentConfig](src/main/java/com/dark/javaHarness/config/ChatAgentConfig.java) 注册的 bean 实例（general / writer / coder / deepseek）。
+- **Agent**（`agent` 表）：每行定义一个 Agent（`agent_name`/`model`/`prompt`），对应一个已在 [ChatAgentConfig](src/main/java/com/dark/javaHarness/config/ChatAgentConfig.java) 注册的 bean 实例（general / deepseek）。
 - **模型映射**（`model_provider` 表）：每行定义 `model → (provider, api_url, status)`。
   - 新增模型/服务商 = 表里加一行（`status=1` 启用），重启即加载；无需改代码。
   - `status=0` 禁用 → 该模型回退到默认 DashScope 客户端。
@@ -193,31 +191,29 @@ data: {"sessionId":"9","newSession":true,"goalId":"goal-1","status":"SUCCEEDED"}
 
 ## 核心流程
 
+Harness 作为请求的执行外壳，统一从应用层接入，经上下文组装后交由主 Agent 前置判断分流——**不是所有请求都强制走复杂多 Agent 流程**，复杂任务仅在需要时才进入多 Agent 编排：
+
 ```
-CLI / REST 请求（可携带 agentId）
-   → AgentService（编排层）路由到对应 Agent（agentId → agentName，未命中回退 general）
-     → 创建 Goal: PENDING → RUNNING
-       → general Agent = GraphAssistantAgent（Spring AI Alibaba Graph 状态编排）
-         StateGraph: prepare(读 agent 表配置 model/prompt + 加载会话记忆) → chat(调 LLM)
-           每次执行经 OverAllState 传递 objective / history / reply 状态
-           （真实 ChatModel：同步 call() 或逐 token stream()，含会话记忆）
-         → 经 MysqlSaver Checkpointer 将节点状态持久化到 GRAPH_THREAD / GRAPH_CHECKPOINT
-       → 回写 Goal: SUCCEEDED / FAILED（含 summary）
+1. 请求进入 Harness
+   CLI / REST 请求（message / sessionId / agentId）→ ChatController（Harness 外壳入口）
+
+2. 加载会话原始数据 + 执行上下文组装
+   sessionId → 读 session_messages → SessionService.loadContext() 还原 Message 列表
+   → 过滤 / 截断 / 角色格式化 → 组装执行上下文
+
+3. 主 Agent 前置判断（区分简单 / 复杂）
+   ├─ 场景 A：问题简单（无需工具、无需拆分子任务）
+   │     → 普通单次调用芯片：GeneralAssistantAgent 读 agent 表配置取 ChatClient
+   │       直接单次调用大模型（同步 call() / 响应式 stream()，含会话记忆）
+   └─ 场景 B：问题复杂（搜索 / 代码 / 多步骤处理）
+         → 多 Agent 编排链路（Spring-AI Graph）：Lead Agent 拆解 → 子 Agent 并行/串行 → 聚合
+
+4. 统一出口
+   两条路径都写回 Goal（SUCCEEDED / FAILED）+ 会话记忆，经同步 / SSE 统一响应
 ```
 
-聊天请求会作为 Goal 留存，可通过 `/api/harness/goals` 查询历史记录。
-
-### Graph 状态编排与 Checkpointer
-
-- **general 用 `GraphAssistantAgent`** 承载执行层：内部以 `StateGraph`（`prepare → chat`）编排对话，`OverAllState` 作为节点间共享状态（键策略 `REPLACE`）。
-- **状态持久化由 `MysqlSaver` 完成**：每次执行按节点写入 `GRAPH_THREAD`（线程隔离）与 `GRAPH_CHECKPOINT`（状态断点快照），`CREATE_IF_NOT_EXISTS` 幂等建表，支持按 `thread_id` 断点续跑。
-- 相关表已声明于 `sql/schema.sql`，表结构与框架内置 DDL 一致。其余 Agent（writer/coder/deepseek）仍走 `GeneralAssistantAgent` 直调路径。
-
-> **风险说明（Checkpointer 持久化）**：
-> 本项目的图状态持久化使用了 `spring-ai-alibaba-graph-core` 内置的 **`MysqlSaver`**。需要特别注意：
-> 1. **官方文档未系统覆盖 MySQL 存储**——Spring AI Alibaba 官方文档主要介绍 Mongo / Postgres / Redis / 内存 saver，`MysqlSaver` 属于「源码内置但未文档化」的实现，仅能从 jar 内类确认其存在与结构。
-> 2. **升级需回归验证**：因其未纳入官方文档与稳定承诺，未来升级 Spring AI Alibaba 版本时，`MysqlSaver` 的建表 DDL / 表结构 / Column 可能发生变动。升级后应回归验证 `GRAPH_THREAD`、`GRAPH_CHECKPOINT` 两张表及断点读写是否兼容。
-> 3. **当前选择理由**：项目本身采用 MySQL（`harness` 库 / MyBatis-Plus），使用 `MysqlSaver` 零额外基础设施。若未来 Graph 成为核心生产能力，建议评估是否迁移到官方文档化的 Postgres / Redis saver 以获取更稳定的长期维护保障。
+> 数据流细节与落地 TODO 见 [`HARNESS_TODO.md`](./HARNESS_TODO.md)。
+> 当前实现：场景 A（简单路径）已由 `GeneralAssistantAgent` + `SessionService.loadContext()` 落地；主 Agent 前置判断与场景 B（多 Agent Graph 编排）为后续演进占位，未强制任何请求走复杂流程。
 
 ## 运行测试
 

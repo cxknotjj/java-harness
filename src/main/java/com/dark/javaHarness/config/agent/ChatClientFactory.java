@@ -1,4 +1,4 @@
-package com.dark.javaHarness.config;
+package com.dark.javaHarness.config.agent;
 
 import com.dark.javaHarness.tool.DemoTools;
 import org.slf4j.Logger;

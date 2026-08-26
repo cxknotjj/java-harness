@@ -5,6 +5,7 @@ import com.dark.javaHarness.domain.Goal;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
+import reactor.core.publisher.Flux;
 
 /**
  * Agent 编排服务：接收一个请求，路由到对应 Agent 执行目标。
@@ -21,16 +22,17 @@ public interface AgentService {
     Goal executeSync(String agentName, String objective, String sessionId);
 
     /**
-     * 创建一个目标并流式执行：逐片段（token）回调 onToken，返回完整执行摘要。
-     * 同步返回前会阻塞直至整个流结束。
+     * 创建一个目标并响应式流式执行：返回一个逐 token 产出的 {@link Flux}。
+     * Flux 订阅后异步执行（内部切到 boundedElastic 隔离阻塞 DB 与 Agent 执行），
+     * 完成后回写 goal 为 SUCCEEDED，出错时回写为 FAILED。
      */
-    Goal executeStream(String agentName, String objective, String sessionId, Consumer<String> onToken);
+    Flux<String> executeStreamReactive(String agentName, String objective, String sessionId);
 
     /**
-     * 按 agentId 流式执行：先解析出对应 agentName 再路由到该 Agent。
+     * 按 agentId 响应式流式执行：先解析出对应 agentName 再路由到该 Agent。
      * agentId 为空或未命中时回退到默认 Agent（general）。
      */
-    Goal executeStreamByAgentId(Long agentId, String objective, String sessionId, Consumer<String> onToken);
+    Flux<String> executeStreamReactiveByAgentId(Long agentId, String objective, String sessionId);
 
     Set<String> agentNames();
 

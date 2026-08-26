@@ -1,10 +1,12 @@
-package com.dark.javaHarness.config;
+package com.dark.javaHarness.config.agent;
 
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 
+import com.dark.javaHarness.config.agent.ChatClientFactory;
+import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.entity.ModelProviderEntity;
 import com.dark.javaHarness.mapper.ModelProviderMapper;
 import java.util.List;

@@ -2,6 +2,7 @@ package com.dark.javaHarness.agent;
 
 import com.dark.javaHarness.domain.Goal;
 import java.util.function.Consumer;
+import reactor.core.publisher.Flux;
 
 /**
  * Agent 抽象：负责执行一个 Goal 并产出摘要。
@@ -25,5 +26,11 @@ public interface Agent {
         if (onToken != null) {
             onToken.accept(result);
         }
+    }
+
+    /** 响应式流式执行：默认退化为同步 execute 后一次性产出；支持真正流式的实现应覆写。 */
+    default Flux<String> executeStreamReactive(Goal goal) {
+        // 用 defer 包住同步 execute，保证订阅时才执行，语义与 Flux.fromCallable 一致
+        return Flux.defer(() -> Flux.just(execute(goal)));
     }
 }

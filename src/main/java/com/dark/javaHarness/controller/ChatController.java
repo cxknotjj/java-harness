@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.publisher.Flux;
 
 /**
  * 千问（Qwen）聊天接口（表现层，纯转发）。
@@ -37,13 +37,14 @@ public class ChatController {
     }
 
     /**
-     * 流式聊天接口（SSE，带多轮会话记忆）
+     * 流式聊天接口（带多轮会话记忆）
      * POST /api/chat/stream  Body: {"message": "你好", "sessionId": "1"}
-     * 响应为 text/event-stream：逐 token data: <文本>，结束 data: [DONE]，
-     * 末尾 event: meta data: {sessionId,newSession,goalId,status}。
+     * 响应为 text/plain，每个 Flux 元素输出独立一行（末尾追加 {@code \n}）：
+     * 逐 token data: <文本>，结束 data: [DONE]，
+     * 末尾 event: meta 与 data: {sessionId,newSession,goalId,status}。
      */
-    @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter stream(@Valid @RequestBody ChatRequest request) {
-        return chatService.stream(request);
+    @PostMapping(value = "/stream", produces = MediaType.TEXT_PLAIN_VALUE)
+    public Flux<String> stream(@Valid @RequestBody ChatRequest request) {
+        return chatService.streamReactive(request).map(s -> s + "\n");
     }
 }

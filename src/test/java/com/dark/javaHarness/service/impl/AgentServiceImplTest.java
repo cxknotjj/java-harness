@@ -4,11 +4,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.agent.Agent;
 import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.service.AgentConfigProvider;
 import com.dark.javaHarness.service.GoalService;
 import java.util.List;
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import reactor.core.publisher.Flux;
 
 /**
  * AgentServiceImpl 多 Agent 路由行为单测：
@@ -78,41 +80,54 @@ class AgentServiceImplTest {
     }
 
     @Test
-    void executeStreamByAgentId_withWriterAgent_two() {
-        // 显式提供同签名的 executeStreamByAgentId(2) → writer
+    void executeStreamReactiveByAgentId_withWriterAgent_routesToWriter() {
         when(agentConfigProvider.findAgentNameById(2L)).thenReturn(Optional.of("writer"));
         stubGoal("writer", null);
 
-        Goal goal = agentService.executeStreamByAgentId(2L, "hi", null, ignored -> { });
+        List<String> tokens = agentService.executeStreamReactiveByAgentId(2L, "hi", null).collectList().block();
 
-        assertEquals("writer", routedTo.get());
+        assertEquals(List.of("ok-writer"), tokens, "响应式也应产出 writer 的完整结果");
+        assertEquals("writer", routedTo.get(), "应按 agentId 路由到 writer");
     }
 
     @Test
-    void executeStreamByAgentId_withMissingAgent_999_shouldFallbackToGeneral() {
-        // agentId=999 无记录 → 回退默认 general
+    void executeStreamReactiveByAgentId_withMissingAgent_999_shouldFallbackToGeneral() {
         when(agentConfigProvider.findAgentNameById(999L)).thenReturn(Optional.empty());
         stubGoal("general", null);
 
-        agentService.executeStreamByAgentId(999L, "hi", null, ignored -> { });
+        agentService.executeStreamReactiveByAgentId(999L, "hi", null).collectList().block();
 
-        assertEquals("general", routedTo.get());
+        assertEquals("general", routedTo.get(), "agentId 未命中应回退默认 general");
     }
 
     @Test
-    void executeStreamByAgentId_withNullAgent_shouldFallbackToGeneral() {
-        // 不传 agentId → 走 general
-        when(agentConfigProvider.findAgentNameById(eq(null))).thenReturn(Optional.empty());
-        stubGoal("general", null);
+    void executeStreamReactive_emitsTokensAndSucceeds() {
+        Agent agent = mock(Agent.class);
+        when(agent.name()).thenReturn("general");
+        when(agent.executeStreamReactive(any())).thenReturn(Flux.just("a", "b"));
+        agentService = new AgentServiceImpl(goalService, agentConfigProvider, List.of(agent));
+        Goal goal = stubGoal("general", null);
 
-        agentService.executeStreamByAgentId(null, "hi", null, ignored -> { });
+        List<String> tokens = agentService.executeStreamReactive("general", "hi", null)
+                .collectList().block();
 
-        assertEquals("general", routedTo.get());
+        assertEquals(List.of("a", "b"), tokens);
+        assertEquals(GoalStatus.SUCCEEDED, goal.status());
+        assertEquals("ab", goal.summary());
     }
 
     @Test
-    void executeStream_withUnknownAgentName_shouldThrow() {
-        assertThrows(IllegalArgumentException.class,
-                () -> agentService.executeStream("caracal-agent", "hi", null, ignored -> { }));
+    void executeStreamReactive_onError_marksFailed() {
+        Agent agent = mock(Agent.class);
+        when(agent.name()).thenReturn("general");
+        when(agent.executeStreamReactive(any())).thenReturn(Flux.error(new RuntimeException("boom")));
+        agentService = new AgentServiceImpl(goalService, agentConfigProvider, List.of(agent));
+        Goal goal = stubGoal("general", null);
+
+        assertThrows(RuntimeException.class,
+                () -> agentService.executeStreamReactive("general", "hi", null).collectList().block());
+
+        assertEquals(GoalStatus.FAILED, goal.status());
+        assertEquals("boom", goal.summary());
     }
 }

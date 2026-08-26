@@ -1,6 +1,7 @@
 package com.dark.javaHarness.agent;
 
-import com.dark.javaHarness.config.ChatClientRegistry;
+import com.dark.javaHarness.advisor.ContextAssemblingAdvisor;
+import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
@@ -104,6 +105,8 @@ public class GeneralAssistantAgent implements Agent {
         log.info("[agent请求] agentName='{}' -> 配置 model='{}'，实际使用 client={}",
                 name(), model, client == null ? "null" : client.getClass().getSimpleName());
         ChatClient.ChatClientRequestSpec spec = client.prompt()
+                // 上下文组装拦截器：对最终消息序列做过滤/截断/role 归一化（token 预算控制）
+                .advisors(new ContextAssemblingAdvisor())
                 .system(config.prompt() != null ? config.prompt() : DEFAULT_SYSTEM_PROMPT)
                 .messages(history)
                 .user(objective);
