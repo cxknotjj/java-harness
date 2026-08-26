@@ -2,6 +2,7 @@ package com.dark.javaHarness.cli.api;
 
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.SessionPageView;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -101,6 +102,30 @@ public class ChatApiClient {
                 throw new IOException("流结束但未收到 meta 事件");
             }
             return meta;
+        }
+    }
+
+    /**
+     * 调用 /api/harness/sessions 获取会话列表，返回第一个会话的 ID。
+     * 无任何会话时返回 null（调用方可决定新建会话）。
+     *
+     * @throws IOException 网络错误，或非 2xx 响应（消息含 HTTP 状态码与响应体）
+     */
+    public String firstSessionId() throws IOException {
+        Request request = new Request.Builder()
+                .url(baseUrl + "/api/harness/sessions")
+                .get()
+                .build();
+        try (Response resp = http.newCall(request).execute()) {
+            String body = resp.body().string();
+            if (!resp.isSuccessful()) {
+                throw new IOException("HTTP " + resp.code() + ": " + body);
+            }
+            SessionPageView view = mapper.readValue(body, SessionPageView.class);
+            if (view.sessions() == null || view.sessions().isEmpty()) {
+                return null;
+            }
+            return view.sessions().get(0).id();
         }
     }
 }

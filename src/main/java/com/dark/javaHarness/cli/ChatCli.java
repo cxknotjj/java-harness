@@ -43,6 +43,8 @@ public class ChatCli {
         System.out.println(" 直接输入文本对话，/help 帮助，/exit 退出");
         System.out.println("==============================================");
 
+        loadExistingSession();
+
         java.io.BufferedReader br =
                 new java.io.BufferedReader(new java.io.InputStreamReader(System.in));
         while (true) {
@@ -76,6 +78,21 @@ public class ChatCli {
             send(line);
         }
         System.out.println("再见！");
+    }
+
+    /** 进入对话前，先调 /api/harness/sessions 取一个已有会话，后续 stream 请求携带其 sessionId 延续上下文 */
+    private void loadExistingSession() {
+        try {
+            String existing = api.firstSessionId();
+            if (existing != null && !existing.isBlank()) {
+                this.sessionId = existing;
+                System.out.println("已加载会话 " + sessionId + "（后续请求携带该 sessionId 延续上下文）");
+            } else {
+                System.out.println("暂无历史会话，将新建会话");
+            }
+        } catch (IOException e) {
+            System.out.println("获取会话列表失败（将新建会话）: " + e.getMessage());
+        }
     }
 
     /** 处理 /agent 命令：切换或查看当前 Agent */

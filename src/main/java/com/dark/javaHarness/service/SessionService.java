@@ -1,5 +1,6 @@
 package com.dark.javaHarness.service;
 
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.dark.javaHarness.domain.entity.SessionEntity;
 import java.util.List;
 import org.springframework.ai.chat.memory.ChatMemory;
@@ -35,4 +36,12 @@ public interface SessionService extends ChatMemory {
 
     /** 查询会话（软删除的不会返回） */
     SessionEntity getSession(String sessionId);
+
+    /**
+     * 分页查询会话（软删除的不会返回），按会话ID降序（最新在前）。
+     * @param current 页码，从 1 开始
+     * @param size    每页条数
+     * @return MyBatis-Plus 分页结果（含总数与页数）
+     */
+    Page<SessionEntity> page(long current, long size);
 }

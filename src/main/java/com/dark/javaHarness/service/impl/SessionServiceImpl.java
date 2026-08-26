@@ -2,6 +2,7 @@ package com.dark.javaHarness.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.dark.javaHarness.domain.entity.SessionEntity;
 import com.dark.javaHarness.domain.entity.SessionMessageEntity;
 import com.dark.javaHarness.mapper.SessionMapper;
@@ -178,6 +179,14 @@ public class SessionServiceImpl implements SessionService {
         QueryWrapper<SessionEntity> qw = new QueryWrapper<>();
         qw.eq("session_id", sid);
         return sessionMapper.selectOne(qw);
+    }
+
+    /** 分页查询会话（软删除的不会返回），按会话ID降序（最新在前） */
+    @Override
+    public Page<SessionEntity> page(long current, long size) {
+        QueryWrapper<SessionEntity> qw = new QueryWrapper<>();
+        qw.orderByDesc("session_id");
+        return sessionMapper.selectPage(new Page<>(Math.max(current, 1), Math.max(size, 1)), qw);
     }
 
     /* ---------------- Spring AI ChatMemory 接口实现（包装现有逻辑） ---------------- */
