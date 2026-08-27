@@ -32,7 +32,11 @@ public class ChatApiClient {
         this.baseUrl = baseUrl;
         this.http = new OkHttpClient.Builder()
                 .connectTimeout(Duration.ofSeconds(5))
-                .callTimeout(Duration.ofMinutes(3))
+                // 多 Agent 编排 = lead + N 子任务 + 聚合共 4+ 次 LLM 调用，全程可达分钟级：
+                // readTimeout 约束"相邻两行数据间隔"，callTimeout 约束整个调用预算。
+                // （曾回退为 1min 导致长任务中途被掐断、CLI 收到残缺结果）
+                .readTimeout(Duration.ofMinutes(15))
+                .callTimeout(Duration.ofMinutes(30))
                 .build();
     }
 
@@ -59,12 +63,14 @@ public class ChatApiClient {
 
     /**
      * 调用 /api/chat/stream 流式聊天（SSE）：逐 token 回调 onToken，
+     * 多 Agent 编排的阶段反馈（event:progress）回调 onProgress，
      * 流结束后解析末尾 meta 事件返回响应 DTO。
      * agentId 可空：为空时服务端走默认 Agent。
      *
      * @throws IOException 网络错误、非 2xx 响应，或服务端 error 事件
      */
-    public ChatResponse chatStream(String message, String sessionId, Long agentId, Consumer<String> onToken) throws IOException {
+    public ChatResponse chatStream(String message, String sessionId, Long agentId,
+                                   Consumer<String> onToken, Consumer<String> onProgress) throws IOException {
         String json = mapper.writeValueAsString(new ChatRequest(message, sessionId, agentId));
         Request request = new Request.Builder()
                 .url(baseUrl + "/api/chat/stream")
@@ -91,9 +97,13 @@ public class ChatApiClient {
                             meta = mapper.readValue(data, ChatResponse.class);
                         } else if ("error".equals(event)) {
                             throw new IOException(data);
+                        } else if ("progress".equals(event)) {
+                            if (onProgress != null) {
+                                onProgress.accept(data);
+                            }
                         } else if (!"[DONE]".equals(data)) {
                             // [DONE] 后还会跟 meta 事件，忽略但不中断，继续读到 meta
-                            onToken.accept(data);
+                            onToken.accept(unescapeLineBreaks(data));
                         }
                     }
                 }
@@ -103,6 +113,35 @@ public class ChatApiClient {
             }
             return meta;
         }
+    }
+
+    /**
+     * 还原服务端对内容行的换行转义（服务端 {@code escapeLineBreaks} 的逆操作）：
+     * 字面量 {@code \\} → 反斜杠、{@code \n} → 换行、{@code \r} → 回车；非法序列原样保留。
+     */
+    private static String unescapeLineBreaks(String s) {
+        if (s == null || s.indexOf('\\') < 0) {
+            return s;
+        }
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                char n = s.charAt(++i);
+                if (n == 'n') {
+                    sb.append('\n');
+                } else if (n == 'r') {
+                    sb.append('\r');
+                } else if (n == '\\') {
+                    sb.append('\\');
+                } else {
+                    sb.append(c).append(n);
+                }
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     /**

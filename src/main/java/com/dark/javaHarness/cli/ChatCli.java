@@ -2,6 +2,7 @@ package com.dark.javaHarness.cli;
 
 import com.dark.javaHarness.cli.api.ChatApiClient;
 import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.net.ConnectException;
 
@@ -22,8 +23,16 @@ public class ChatCli {
     /** 会话ID：首轮为空（由服务端自动建档），从首次响应中获取后复用，实现多轮记忆 */
     private String sessionId;
 
-    /** 当前选中的 Agent ID：为空表示使用默认 Agent（general），可用 /agent <id> 切换 */
-    private Long agentId = 1L;
+    /**
+     * 当前选中的 Agent ID：null 表示交由服务端「主 Agent 前置判断」分流
+     * （SIMPLE → general 单模型；COMPLEX → multi-agent 编排并推送进度事件）。
+     * 注意：一旦非空（如默认带 1），服务端会绕过 RouteJudge 直接路由，
+     * 永远走单 Agent 且无任何 progress 事件——所以默认必须保持 null。
+     * 可用 /agent <id> 显式切换；/agent off 恢复分流。
+     */
+    private Long agentId = null;
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** 默认连本机主服务 8080 */
     public ChatCli() {
@@ -66,8 +75,9 @@ public class ChatCli {
             if ("/exit".equals(line) || "/quit".equals(line)) {
                 break;
             } else if ("/help".equals(line)) {
-                System.out.println("  直接输入文本与当前 agent 聊天（默认 general）");
-                System.out.println("  /agent <id>  切换到指定 Agent（agent 表主键）");
+                System.out.println("  直接输入文本与 AI 聊天（默认由服务端智能分流：简单→general / 复杂→multi-agent）");
+                System.out.println("  /agent <id>  切换到指定 Agent（agent 表主键，此后不走分流）");
+                System.out.println("  /agent off   取消指定，恢复服务端自动分流");
                 System.out.println("  /agent       查看当前 Agent");
                 System.out.println("  /exit        退出");
                 continue;
@@ -95,29 +105,51 @@ public class ChatCli {
         }
     }
 
-    /** 处理 /agent 命令：切换或查看当前 Agent */
+    /** 处理 /agent 命令：切换、查看或取消（off）当前 Agent */
     private void handleAgentCommand(String line) {
         String arg = line.substring("/agent".length()).trim();
         if (arg.isEmpty()) {
-            System.out.println("当前 Agent: " + (agentId == null ? "默认(general)" : agentId));
+            System.out.println("当前 Agent: " + (agentId == null ? "自动分流（服务端按复杂度选择）" : agentId));
+            return;
+        }
+        if ("off".equalsIgnoreCase(arg)) {
+            this.agentId = null;
+            System.out.println("已恢复服务端自动分流");
             return;
         }
         try {
             this.agentId = Long.parseLong(arg);
-            System.out.println("已切换到 Agent #" + agentId + "（后续请求携带该 agentId）");
+            System.out.println("已切换到 Agent #" + agentId
+                    + "（此后请求固定路由到该 Agent，不再自动分流；/agent off 可恢复）");
         } catch (NumberFormatException e) {
-            System.out.println("agent 编号无效，用法: /agent <数字Id> 或 /agent");
+            System.out.println("agent 编号无效，用法: /agent <数字Id> | /agent off | /agent");
         }
     }
 
-    /** 发送一条消息到主服务 /api/chat/stream（SSE 流式），边收 token 边打印 */
+    /** 解析并打印一条进度事件（{@code {"stage":..,"detail":..}}），多 Agent 编排的分阶段反馈 */
+    private void printProgress(String data) {
+        String stage = "";
+        String detail = data;
+        try {
+            var node = MAPPER.readTree(data);
+            stage = node.path("stage").asText("");
+            detail = node.path("detail").asText("");
+        } catch (IOException e) {
+            // 解析失败则原样打印 data，不中断
+        }
+        System.out.print("\n[" + stage + "] " + detail);
+        System.out.flush();
+    }
+
+    /** 发送一条消息到主服务 /api/chat/stream（SSE 流式），边收 token 边打印。
+     *  多 Agent 编排的阶段反馈（event:progress）以进度行形式实时提示，避免等待无反馈。 */
     private void send(String message) {
         try {
             System.out.print("\n千问> ");
             ChatResponse resp = api.chatStream(message, sessionId, agentId, token -> {
                 System.out.print(token);
                 System.out.flush();
-            });
+            }, data -> printProgress(data));
             System.out.println();
             // 记住服务端返回的会话ID，后续请求携带以延续多轮上下文
             if (resp.sessionId() != null && !resp.sessionId().isBlank()) {

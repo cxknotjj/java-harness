@@ -7,9 +7,11 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.dark.javaHarness.agent.ProgressLine;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
@@ -124,12 +126,12 @@ class ChatServiceImplTest {
         assertTrue(lines.contains("data: a"), "应包含第 1 个 token");
         assertTrue(lines.contains("data: b"), "应包含第 2 个 token");
         assertTrue(lines.contains("data: [DONE]"), "token 结束后应包含 [DONE]");
-        assertTrue(lines.contains("event: meta"), "末尾应包含 meta 事件");
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: meta")), "末尾应包含 meta 事件");
         String metaData = lines.stream()
-                .filter(l -> l.startsWith("data: {\"sessionId"))
+                .filter(l -> l.contains("\"sessionId\":\"50\""))
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("应包含 meta 的 data 行"));
-        assertTrue(metaData.contains("\"sessionId\":\"50\""), "meta 应包含 sessionId=50");
+                .orElseThrow(() -> new AssertionError("应包含 meta 的事件块"));
+        assertTrue(metaData.startsWith("event: meta"), "meta 的 event 与 data 应在同一元素内");
         assertTrue(metaData.contains("\"status\":\"SUCCEEDED\""), "meta 应包含 status=SUCCEEDED");
     }
 
@@ -209,10 +211,53 @@ class ChatServiceImplTest {
 
         List<String> lines = chatService.streamReactive(req).collectList().block();
 
-        assertTrue(lines.contains("event: error"), "出错时应包含 error 事件");
-        assertTrue(lines.contains("data: boom"), "应包含错误信息");
-        assertTrue(lines.contains("event: meta"), "出错后应以 meta 收尾");
-        assertTrue(lines.stream().anyMatch(l -> l.startsWith("data: {\"sessionId") && l.contains("\"status\":\"FAILED\"")),
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: error")), "出错时应包含 error 事件");
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: error") && l.contains("data: boom")),
+                "error 的 event 与 data 应在同一元素内且包含错误信息");
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: meta")), "出错后应以 meta 收尾");
+        assertTrue(lines.stream().anyMatch(l -> l.contains("\"status\":\"FAILED\"")),
                 "出错后 meta 应为 FAILED");
+    }
+
+    /** 复杂多 Agent 流的「进度行」应转成 event:progress + data JSON，且不作为内容 token 输出 */
+    @Test
+    void streamReactive_shouldMapProgressRowToProgressEvent() {
+        ChatRequest req = new ChatRequest("调研竞品", null, null);
+        when(sessionService.createSession("anonymous", "调研竞品")).thenReturn("50");
+        // 一条进度行（MARK 前缀 + stage\u0001detail）+ 一条内容行
+        String progressRow = ProgressLine.encode("拆解", "2 个子任务已就绪");
+        when(agentService.executeStreamReactive("multi-agent", "调研竞品", "50"))
+                .thenReturn(Flux.just(progressRow, "最终回答A"));
+        when(routeJudge.judge("调研竞品")).thenReturn(RouteDecision.COMPLEX);
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress")), "应包含 event: progress");
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress") && l.contains("\"stage\":\"拆解\"")),
+                "进度行的 event 与 data 应在同一元素内并带 stage JSON");
+        assertTrue(lines.contains("data: 最终回答A"), "内容行仍按普通 token 输出");
+        assertFalse(lines.stream().anyMatch(l -> l.contains("{\"stage\"") == false && l.contains("子任务已就绪")),
+                "进度行不应以内容 token 形式泄漏");
+    }
+
+    /**
+     * 内容行含换行时必须转义为单条 SSE data 行：
+     * 裸 \n 会把一条 data 断成多个物理行，CLI 按行解析只认前缀行，断行后半段被静默丢弃（结果不全）。
+     */
+    @Test
+    void streamReactive_contentRowWithLineBreaks_shouldBeEscapedInSingleDataLine() {
+        ChatRequest req = new ChatRequest("hi", "50", null);
+        when(agentService.executeStreamReactive("general", "hi", "50"))
+                .thenReturn(Flux.just("第一段\n第二段\r\n第三段"));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        assertTrue(lines.contains("data: 第一段\\n第二段\\r\\n第三段"),
+                "换行应转义为 \\n/\\r 字面量并保持在同一条 data 行内, 实际输出: " + lines);
+        // 不允许出现任何裸内容行（不带 data:/event: 前缀的非空行）
+        assertTrue(lines.stream().noneMatch(l -> !l.startsWith("data:") && !l.startsWith("event:")),
+                "流中不得出现脱前缀的物理断行, 实际输出: " + lines);
+        // 写回记忆仍为 user+assistant 两条（转义只发生在传输层，不污染存储原文）
+        verify(sessionService, times(2)).saveContext(eq("50"), any());
     }
 }

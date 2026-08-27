@@ -90,6 +90,19 @@ public class GeneralAssistantAgent implements Agent {
         log.info("AI agent '{}' 流式输出完成", name());
     }
 
+    /**
+     * 响应式流式执行：真·逐 token 发射（ChatClient.stream().content()）。
+     * 覆写接口 default——否则会退化为「同步 execute 阻塞生成完 → 一次性产出」，CLI 将全程无输出干等。
+     * 会话记忆持久化由框架 Advisor 与 ChatService 在流结束后统一负责，此处不做。
+     */
+    @Override
+    public Flux<String> executeStreamReactive(Goal goal) {
+        log.info("AI agent '{}' 开始响应式流式处理目标: {}", name(), goal.objective());
+        return buildChatRequestSpec(goal.sessionId(), goal.objective())
+                .stream()
+                .content();
+    }
+
     /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪 */
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective) {
         AgentConfig config = agentService.getAgentConfig(agentName)

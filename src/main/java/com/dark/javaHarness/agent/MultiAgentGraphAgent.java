@@ -1,9 +1,14 @@
 package com.dark.javaHarness.agent;
 
+import com.alibaba.cloud.ai.graph.CompileConfig;
 import com.alibaba.cloud.ai.graph.CompiledGraph;
+import com.alibaba.cloud.ai.graph.GraphLifecycleListener;
+import com.alibaba.cloud.ai.graph.NodeOutput;
 import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.StateGraph;
 import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
+import com.alibaba.cloud.ai.graph.exception.GraphStateException;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
@@ -14,9 +19,14 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Sinks;
 
 /**
  * 多 Agent 编排器：路径 B（复杂请求）的执行体。
@@ -31,8 +41,9 @@ import org.springframework.ai.chat.client.ChatClient;
  * {@link #execute(Goal)} 返回最终回答 String；Goal 生命周期与会话记忆写回
  * 统一由 AgentService / ChatService 负责。
  *
- * <p>图只构建一次（结构固定，节点配置 sub-agent 复用同一 ChatClientRegistry），
- * 每次 execute 以「objective + sessionId」作为初始状态 invokes。
+ * <p>图拓扑只构建一次；同步执行 {@link #execute(Goal)} 走 invoke；
+ * 流式执行 {@link #executeStreamReactive(Goal)} 采用「stream 主干帧 + 生命周期钩子旁路」双通道
+ * （详见该方法说明与死锁教训）。
  */
 public class MultiAgentGraphAgent implements Agent {
 
@@ -57,9 +68,14 @@ public class MultiAgentGraphAgent implements Agent {
     private static final String K_RESULT_PREFIX = "result_";
     private static final String K_FINAL = "final";
 
+    /** 子任务节点名前缀 */
+    private static final String SUBTASK_NODE_PREFIX = "subtask-";
+
     private final String agentName;
     private final ChatClientRegistry clientRegistry;
     private final AgentService agentService;
+    /** 图拓扑（构建一次）：同步执行缓存编译 {@link #graph}；流式执行每次带监听器重新编译 */
+    private final StateGraph stateGraph;
     private final CompiledGraph graph;
 
     public MultiAgentGraphAgent(String agentName,
@@ -68,7 +84,13 @@ public class MultiAgentGraphAgent implements Agent {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.agentService = agentService;
-        this.graph = buildGraph();
+        try {
+            this.stateGraph = buildStateGraph();
+            // 同步执行用的常驻实例
+            this.graph = stateGraph.compile();
+        } catch (GraphStateException e) {
+            throw new IllegalStateException("构建/编译多 Agent 编排 StateGraph 失败", e);
+        }
     }
 
     @Override
@@ -88,44 +110,178 @@ public class MultiAgentGraphAgent implements Agent {
                 .orElse(goal.objective());
     }
 
-    /* ---------------- StateGraph 构建 ---------------- */
+    /**
+     * 流式执行复杂目标：stream 主干帧 + 生命周期钩子旁路 双通道。
+     *
+     * <p>主干：{@link CompiledGraph#stream(Map)} 帧 → {@link #toRows} 行；
+     * 旁路：{@link BranchProgressListener} 补齐 stream 合并掉的并行分支「子任务完成」事件。
+     *
+     * <p>⚠️ 死锁教训：关闸 {@code doFinally} 必须挂在 mergeWith **之前**的主干段上——
+     * merge 要求两源都终结才向下传 complete，关闸挂 merge 之后会循环等待、永不收尾。
+     */
+    @Override
+    public Flux<String> executeStreamReactive(Goal goal) {
+        Map<String, Object> input = new HashMap<>();
+        input.put(K_OBJECTIVE, goal.objective());
+        AtomicBoolean contentSent = new AtomicBoolean(false);
 
-    private CompiledGraph buildGraph() {
+        Sinks.Many<String> branchEvents = Sinks.many().unicast().onBackpressureBuffer();
+        CompiledGraph streamingGraph;
         try {
-            StateGraph g = new StateGraph();
+            streamingGraph = stateGraph.compile(CompileConfig.builder()
+                    .withLifecycleListener(new BranchProgressListener(branchEvents))
+                    .build());
+        } catch (GraphStateException e) {
+            throw new IllegalStateException("编译带监听器的 StateGraph 失败", e);
+        }
 
-            // lead：拆解复杂目标为多条子任务
-            g.addNode(NODE_LEAD, AsyncNodeAction.node_async(this::lead));
-            // 子任务池：固定 4 个并行节点
-            for (int i = 0; i < MAX_SUBTASKS; i++) {
-                final int idx = i;
-                g.addNode(subtaskName(idx), AsyncNodeAction.node_async(state -> subtask(state, idx)));
-            }
-            // 聚合：收集各子任务结果生成最终回答
-            g.addNode(NODE_AGGREGATE, AsyncNodeAction.node_async(this::aggregate));
+        // 关闸在 merge 之前（见死锁说明）；complete 与 next 共用同一把锁，防迟到事件竞争
+        Flux<String> mainLine = streamingGraph.stream(input)
+                .concatMap(out -> toRows(out, goal.objective(), contentSent))
+                .doFinally(sig -> tryCompleteSerialized(branchEvents));
 
-            // 并联：lead → 同时派发到所有子任务节点（addEdge(from, List) 并行扇出）
-            List<String> subtasks = new ArrayList<>();
-            for (int i = 0; i < MAX_SUBTASKS; i++) {
-                subtasks.add(subtaskName(i));
+        return mainLine.mergeWith(branchEvents.asFlux())
+                .onErrorResume(e -> {
+                    log.warn("[multi-agent] 流式执行异常：{}", safe(e));
+                    return Flux.just(ProgressLine.encode("编排", "异常，已回退：" + safe(e)));
+                });
+    }
+
+    /**
+     * 把一个主干节点输出帧映射为 0..n 条输出行（保序）：
+     * START→编排开始；lead→拆解结果；aggregate→聚合进度+最终内容；END→内容兜底。
+     * 并行 subtask 分支事件由生命周期钩子旁路提供，不走此处。
+     */
+    private Flux<String> toRows(NodeOutput out, String objective,
+                                java.util.concurrent.atomic.AtomicBoolean contentSent) {
+        if (out == null) {
+            return Flux.empty();
+        }
+        String node = out.node();
+        OverAllState state = out.state();
+        if (out.isSTART()) {
+            return Flux.just(ProgressLine.encode("编排", "开始拆解复杂目标…"));
+        }
+        // END 帧：确保一定有内容行（防 aggregate 帧 state 未含 final 的时序差异）
+        if (out.isEND()) {
+            return contentSent.get() ? Flux.empty() : Flux.just(objective);
+        }
+        if (NODE_LEAD.equals(node)) {
+            int n = state.value(K_SUBTASK_COUNT, Integer.class).orElse(0);
+            return Flux.just(ProgressLine.encode("拆解", n + " 个子任务已就绪"));
+        }
+        if (NODE_AGGREGATE.equals(node)) {
+            String fin = state.value(K_FINAL, String.class).orElse(null);
+            if (fin != null && !fin.isBlank()) {
+                contentSent.set(true);
+                // 先发聚合进度，再发最终回答内容行（不加进度前缀）
+                return Flux.just(
+                        ProgressLine.encode("聚合", "汇总子任务结果，生成最终回答"),
+                        fin);
             }
-            g.addEdge(NODE_LEAD, subtasks);
-            // 各子任务 → 聚合
-            for (int i = 0; i < MAX_SUBTASKS; i++) {
-                g.addEdge(subtaskName(i), NODE_AGGREGATE);
+            return Flux.just(ProgressLine.encode("聚合", "正在生成最终回答…"));
+        }
+        return Flux.empty(); // subtask 等其它 superstep 合并帧：由钩子旁路负责
+    }
+
+    /* ---------------- 流式旁路监听器 ---------------- */
+
+    /**
+     * 并行分支进度监听器：before/after 配对过滤 lead 未布置的短路槽位
+     * （进入节点的输入态必含已布置的 subtask_i，空槽位执行即短路返回空 map），
+     * 仅对真实执行的子任务经旁路 Sink 播报「完成」，避免向 CLI 推虚假进度。
+     */
+    static final class BranchProgressListener implements GraphLifecycleListener {
+
+        private final Sinks.Many<String> events;
+        /** before 登记已布置槽位，after 消费：不在集合中即静默 */
+        private final Set<Integer> scheduled = ConcurrentHashMap.newKeySet();
+
+        BranchProgressListener(Sinks.Many<String> events) {
+            this.events = events;
+        }
+
+        @Override
+        public void before(String node, Map<String, Object> state,
+                           RunnableConfig config, Long costMillis) {
+            Integer idx = subtaskIndexIfAny(node);
+            if (idx != null && state != null) {
+                Object task = state.get(K_SUBTASK_PREFIX + idx);
+                if (task instanceof String s && !s.isBlank()) {
+                    scheduled.add(idx);
+                }
             }
-            // 聚合 → 结束
-            g.addEdge(NODE_AGGREGATE, StateGraph.END);
-            // 入口：START → lead
-            g.addEdge(StateGraph.START, NODE_LEAD);
-            return g.compile();
-        } catch (Exception e) {
-            throw new IllegalStateException("构建多 Agent 编排 StateGraph 失败", e);
+        }
+
+        @Override
+        public void after(String node, Map<String, Object> state,
+                          RunnableConfig config, Long costMillis) {
+            Integer idx = subtaskIndexIfAny(node);
+            if (idx == null || !scheduled.remove(idx)) {
+                return; // 非子任务帧或短路槽位：静默
+            }
+            log.info("[multi-agent][hook] subtask-{} 完成", idx);
+            tryEmitSerialized(events,
+                    ProgressLine.encode("子任务", "第 " + (idx + 1) + " 个子任务完成"));
         }
     }
 
+    /* ---------------- 工具方法 ---------------- */
+
+    /** 子任务节点名 */
     private String subtaskName(int i) {
-        return "subtask-" + i;
+        return SUBTASK_NODE_PREFIX + i;
+    }
+
+    /** 节点名为 "subtask-{i}" 时返回索引 i，否则返回 null（供生命周期钩子判定是否子任务帧）。 */
+    private static Integer subtaskIndexIfAny(String nodeName) {
+        if (nodeName == null || !nodeName.startsWith(SUBTASK_NODE_PREFIX)) {
+            return null;
+        }
+        int idx = parseSubtaskIndex(nodeName);
+        return idx >= 0 ? idx : null;
+    }
+
+    /** 从 "subtask-{i}" 解析索引，非法返回 -1。 */
+    private static int parseSubtaskIndex(String nodeName) {
+        try {
+            return Integer.parseInt(nodeName.substring(SUBTASK_NODE_PREFIX.length()));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /* ---------------- StateGraph 构建 ---------------- */
+
+    private StateGraph buildStateGraph() throws GraphStateException {
+        StateGraph g = new StateGraph();
+
+        // lead：拆解复杂目标为多条子任务
+        g.addNode(NODE_LEAD, AsyncNodeAction.node_async(this::lead));
+        // 子任务池：固定 MAX_SUBTASKS 个并行节点
+        for (int i = 0; i < MAX_SUBTASKS; i++) {
+            final int idx = i;
+            g.addNode(subtaskName(idx), AsyncNodeAction.node_async(state -> subtask(state, idx)));
+        }
+        // 聚合：收集各子任务结果生成最终回答
+        g.addNode(NODE_AGGREGATE, AsyncNodeAction.node_async(this::aggregate));
+
+        // 并联：lead → 同时派发到所有子任务节点（addEdge(from, List) 并行扇出）
+        List<String> subtasks = new ArrayList<>();
+        for (int i = 0; i < MAX_SUBTASKS; i++) {
+            subtasks.add(subtaskName(i));
+        }
+        g.addEdge(NODE_LEAD, subtasks);
+        // 各子任务 → 聚合
+        for (int i = 0; i < MAX_SUBTASKS; i++) {
+            g.addEdge(subtaskName(i), NODE_AGGREGATE);
+        }
+        // 聚合 → 结束
+        g.addEdge(NODE_AGGREGATE, StateGraph.END);
+        // 入口：START → lead
+        g.addEdge(StateGraph.START, NODE_LEAD);
+
+        return g;
     }
 
     /* ------------ 节点实现（同步 NodeAction，返回状态更新 Map） ------------ */
@@ -234,7 +390,21 @@ public class MultiAgentGraphAgent implements Agent {
         }
     }
 
-    private static String safe(Exception e) {
-        return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+    private static String safe(Throwable t) {
+        return t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+    }
+
+    /** 串行化向旁路 Sink 发射一条事件（并行钩子线程可能同时回调，Reactor 单播 Sink 拒绝并发发射）。 */
+    private static void tryEmitSerialized(Sinks.Many<String> sink, String line) {
+        synchronized (sink) {
+            sink.tryEmitNext(line);
+        }
+    }
+
+    /** 串行化关闸：与 {@link #tryEmitSerialized} 共用同一把锁，防止迟到发射与 complete 竞争。 */
+    private static void tryCompleteSerialized(Sinks.Many<String> sink) {
+        synchronized (sink) {
+            sink.tryEmitComplete();
+        }
     }
 }

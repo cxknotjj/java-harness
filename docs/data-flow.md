@@ -73,7 +73,8 @@ ChatService.streamReactive(request)
          COMPLEX → executeStreamReactive(multi-agent, ...)
        └─ AgentService：create(sessionId) → markRunning → 订阅 Agent 流
   4. Flux 管道：data: token… → data: [DONE] → event: meta
-                       （出错改为 event:error + data:msg）
+       （多 Agent 复杂路径：进度行另作 event: progress + data:{stage,detail}；仅内容 token 计入写回摘要）
+                 （出错改为 event:error + data:msg）
   5. doOnComplete → writeBackContext() 写回 session_memory（多轮记忆）
 ```
 
@@ -90,7 +91,7 @@ RouteJudge.judge(message)（接口）
        2. clientRegistry.get("route-judge") 取 ChatClient
        3. prompt.system(路由提示词).user(message).call()   ← 一次轻量 LLM
        4. 解析 JSON route：complex → COMPLEX，否则 → SIMPLE
-       兜底（任何失败都 SIMPLE，TODO「宁可简单」）：
+       兜底（任何失败都 SIMPLE，「宁可简单」）：
            异常 / 超时 / 空 / 非 JSON → SIMPLE
 ```
 
@@ -167,9 +168,52 @@ MultiAgentGraphAgent.execute(goal)
 └── 统一出口：AgentService / ChatService 写回多轮记忆
 ```
 
-**关键点**：① Lead 拆 ≤ `MAX_SUBTASKS=4`；② `addEdge(lead,List)` 并行；③ 复用 `ChatClientRegistry`；④ 输出 `final`；⑤ 与路径 A 契约一致，SSE 用默认退化逐块输出。
+**关键点**：① Lead 拆 ≤ `MAX_SUBTASKS=4`；② `addEdge(lead,List)` 并行；③ 复用 `ChatClientRegistry`；④ 输出 `final`。
 
-**测试**：`MultiAgentGraphAgentTest`（mock Registry/ChatClient 固定返回）。
+**流式执行（`executeStreamReactive`：「主干帧 + 生命周期钩子旁路」双通道）**：
+
+> 动机：graph-core 的 `stream()` 按 superstep 吐帧，会把并行分支合并掉，「每个子任务何时完成」在主干里拿不到。
+> 于是一路走主干帧覆盖能看到的节点，另一路挂 `GraphLifecycleListener` 补齐分支事件，最后 merge 成一条流。
+
+```
+MultiAgentGraphAgent.executeStreamReactive(goal)
+│
+│ ① 主干：CompiledGraph.stream({objective})（superstep 粒度）
+│     START 帧      → 进度行「编排 开始拆解复杂目标…」
+│     lead 帧       → 进度行「拆解 N 个子任务已就绪」
+│     aggregate 帧  → 进度行「聚合 …」+ 内容行(final 最终回答)
+│     END 帧        → （aggregate 已发内容则空，否则兜底 objective）
+│         │ concatMap(toRows)
+│         ▼
+│ ② 旁路：BranchProgressListener（本次执行单独 compile 时注入 CompileConfig）
+│     before(subtask-i)：进入节点的 state 含已布置的 subtask_i → 登记 scheduled
+│     after (subtask-i)：登记命中才播报（lead 未布置的短路槽位静默，防虚假进度）
+│         │ ProgressLine.encode("子任务", "第 i+1 个子任务完成")
+│         │ tryEmitSerialized 加锁串行发射 ← 单播 Sink 拒绝并行线程并发发射
+│         │   （FAIL_NON_SERIALIZED 会静默丢事件，踩坑记录）
+│         ▼
+│ ③ 合流：mainLine.mergeWith(branchEvents.asFlux())
+│     ⚠️ 关闸 doFinally(tryCompleteSerialized) 必须挂在 merge **之前**的主干段上：
+│        merge 要求两源都终结才传 complete，关闸挂 merge 之后会循环等待 → 死锁（踩坑记录）
+```
+
+**行级线协议**（`ProgressLine`，跨组件统一格式）：
+
+| 行类型 | 格式 |
+| --- | --- |
+| 进度行 | `\u0000stage\u0001detail`（首字符 MARK，非打印字符防撞内容） |
+| 内容行 | 无前缀原文（token / 最终回答 final） |
+
+**服务端 → CLI 转换（`ChatServiceImpl.streamReactive`）**：
+
+| Agent 流出行 | SSE 输出 | 记忆写回 |
+| --- | --- | --- |
+| 进度行 | `event: progress` + `data: {"stage":..,"detail":..}`（Jackson 序列化 `StageRow` record） | 排除，不写回 |
+| 内容行 | `data: <row>` | `doOnNext` 收集，`[DONE]` 后统一写回多轮记忆 |
+
+CLI 解析到 `event: progress` 打印 `[阶段] 描述`，实时看到编排/拆解/子任务/聚合各阶段推进；最终回答仍按内容流呈现。
+
+**测试**：`MultiAgentGraphAgentTest`（mock Registry/ChatClient 固定返回，断言进度阶段时序与子任务事件数量）+ `ChatServiceImplTest.streamReactive_shouldMapProgressRowToProgressEvent`。
 
 ***
 
@@ -198,5 +242,5 @@ MultiAgentGraphAgent.execute(goal)
 | 统一出口       | `ChatController` 同步 + SSE                            |
 | 兜底         | `AgentService` → general                             |
 
-> 更新日期：2026-08-26。
+> 更新日期：2026-08-27。
 

@@ -1,5 +1,6 @@
 package com.dark.javaHarness.service.impl;
 
+import com.dark.javaHarness.agent.ProgressLine;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
@@ -34,6 +35,8 @@ public class ChatServiceImpl implements ChatService {
     private static final String EVENT_META = "meta";
     /** SSE 事件名：异常 */
     private static final String EVENT_ERROR = "error";
+    /** SSE 事件名：执行进度（多 Agent 编排的阶段反馈） */
+    private static final String EVENT_PROGRESS = "progress";
 
     /** Jackson 序列化（SseMeta 为 record，默认序列化即可） */
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -111,22 +114,48 @@ public class ChatServiceImpl implements ChatService {
                     ? agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())
                     : agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid());
             // doOnNext 收集完整回复，流正常结束后由 doOnComplete 统一写回会话记忆（保持多轮记忆语义）
+            // 其中「进度行」（以 ProgressLine.MARK 开头，多 Agent 编排的阶段反馈）不计入会话摘要
             StringBuilder full = new StringBuilder();
             Flux<String> body = agentTokens
-                    .doOnNext(full::append)
-                    .map(token -> "data: " + token)
+                    .doOnNext(row -> { if (!ProgressLine.isProgress(row)) { full.append(row); } })
+                    .flatMap(ChatServiceImpl::toSseRows)
                     .concatWithValues("data: [DONE]")
                     .concatWith(metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.SUCCEEDED.name(), null))
                     .doOnComplete(() -> writeBackContext(ctx.sid(), request.message(), full.toString()))
                     .onErrorResume(ex -> {
                         String err = safeMessage(ex);
                         return Flux.concat(
-                                Flux.just("event: " + EVENT_ERROR,
-                                        "data: " + err),
+                                Flux.just("event: " + EVENT_ERROR + "\ndata: " + err),
                                 metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.FAILED.name(), err));
                     });
             return body;
         });
+    }
+
+    /**
+     * 把 Agent 流出的一行转成 SSE 行序列：
+     * - 进度行 {@code \u0000stage\u0001detail} → {@code event: progress} + {@code data: {"stage":..,"detail":..}}
+     * - 其它（内容 token）→ {@code data: <token>}
+     *
+     * <p>progress 的 data JSON 直接用 Jackson 序列化 record，转义交给它，不再手写。
+     */
+    private static Flux<String> toSseRows(String row) {
+        ProgressLine.StageRow p = ProgressLine.decode(row);
+        if (p == null) {
+            // 内容行：裸换行会把一条 data 断成多个物理行，CLI 只认前缀行会丢内容——必须行内转义（可逆）
+            return Flux.just("data: " + escapeLineBreaks(row));
+        }
+        try {
+            // event 与 data 必须在同一元素内：MVC 逐元素 flush，拆成两个元素会被其它事件的行交叉插入
+            return Flux.just("event: " + EVENT_PROGRESS + "\ndata: " + OBJECT_MAPPER.writeValueAsString(p));
+        } catch (Exception e) {
+            return Flux.just("event: " + EVENT_PROGRESS + "\ndata: {\"stage\":\"?\",\"detail\":\"?\"}");
+        }
+    }
+
+    /** 内容行传输转义：反斜杠与换行符替换为字面量序列；还原在 CLI 端 unescapeLineBreaks 完成。 */
+    private static String escapeLineBreaks(String s) {
+        return s.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n");
     }
 
     /** 流式成功后写回会话记忆（响应式路径：assistant 完整回复已由 doOnNext 收集） */
@@ -138,13 +167,13 @@ public class ChatServiceImpl implements ChatService {
         }
     }
 
-    /** 组装 SSE meta 事件两行：{@code event: meta} + {@code data: {json}} */
+    /** 组装 SSE meta 事件单元素块（event+data 同元素，保证成对不被交叉）：{@code event: meta\n data: {json}} */
     private Flux<String> metaEvent(String sessionId, boolean newSession, String status, String error) {
         SseMeta meta = new SseMeta(sessionId, newSession, null, status, error);
         try {
-            return Flux.just("event: " + EVENT_META, "data: " + OBJECT_MAPPER.writeValueAsString(meta));
+            return Flux.just("event: " + EVENT_META + "\ndata: " + OBJECT_MAPPER.writeValueAsString(meta));
         } catch (Exception e) {
-            return Flux.just("event: " + EVENT_META, "data: {\"error\":\"meta serialization failed\"}");
+            return Flux.just("event: " + EVENT_META + "\ndata: {\"error\":\"meta serialization failed\"}");
         }
     }
 

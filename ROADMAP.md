@@ -28,8 +28,9 @@
   - 验收：能对本地文档做"知识库问答"
 - [ ] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，替换/扩展 `DemoTools`
   - 验收：模型可调用一个外部 MCP 工具完成真实任务
-- [ ] **多 Agent 编排**：引入 Spring AI Alibaba 或自研规划-执行循环（Planner + Executor）
+- [x] **多 Agent 编排**：基于 Spring AI Alibaba `StateGraph`（`MultiAgentGraphAgent`）实现规划-执行循环
   - 验收：一个复杂目标被拆分为多个子任务并由子 Agent 执行
+  - 现状：主 Agent（`RouteJudge`/`resolveAgent`）判定 `COMPLEX` 路由到 `multi-agent`，`MultiAgentGraphAgent` 用 `lead→并行子任务→聚合` 编排；子任务上限 `MAX_SUBTASKS=4`；已在 `ChatAgentConfig` 注册 `multiAgent` bean；测试见 `MultiAgentGraphAgentTest` / `ChatServiceImplTest`
 - [ ] **异步任务治理**：`CompletableFuture.runAsync` 改为 `@Async` + 自定义线程池，或加任务表支持失败重投
   - 验收：并发提交 10 个 Goal 稳定执行，无线程池耗尽
 - [ ] **数据库迁移工具**：Flyway 替代 `spring.sql.init` 管理 schema 演进
