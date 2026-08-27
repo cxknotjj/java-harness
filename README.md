@@ -8,8 +8,9 @@
 |---|---|---|
 | 框架 | Spring Boot 3.5.14 | 应用骨架、依赖注入、REST、自动配置 |
 | AI 模型接入 | Spring AI 1.1.4 + `spring-ai-starter-model-openai` | 通过 OpenAI 兼容协议接入多个服务商（DashScope / DeepSeek），`Registry` 模式按 model 路由 |
+| Graph 编排 | `spring-ai-alibaba-graph-core`（BOM 1.1.2.2） | 复杂任务多 Agent 编排：StateGraph「lead 拆解 → 并行子任务 → 聚合」+ 生命周期钩子进度推送 |
 | 大模型 | 多模型（qwen-plus/max/turbo、gpt-4o、deepseek-chat 等） | 由 `model_provider` 表 + `agent` 表共同决定 |
-| 命令行交互 | `ChatCli`（自研循环） | 交互式终端：直接输入文本对话，`/agent` 切换 Agent |
+| 命令行交互 | `ChatCli`（自研循环） | 交互式终端：直接输入文本对话；`/agent <id>` 切换专家、`/agent off` 关闭手动指定恢复智能分流 |
 | HTTP | OkHttp 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`） |
 | ORM | MyBatis-Plus 3.5.7 | `goal` / `session` / `session_messages` / `agent` / `model_provider` 表的 CRUD |
 | 参数校验 | Jakarta Validation | `spring-boot-starter-validation` + `@Valid` |
@@ -31,9 +32,10 @@ src/main/java/com/dark/javaHarness/
 │   ├── AgentService.java         # Agent 编排：路由、执行目标、回写状态
 │   ├── GoalService.java          # 目标生命周期管理
 │   ├── SessionService.java       # 多轮会话记忆（session + session_messages）
-│   ├── ChatService.java          # 聊天用例编排（同步 / 流式 / SSE）
+│   ├── ChatService.java          # 聊天用例编排（同步 / 流式 / SSE / 进度事件转换）
+│   ├── RouteJudge.java           # 主 Agent 路由判断（SIMPLE / COMPLEX 分流）
 │   ├── AgentConfigProvider.java  # 从 agent 表读取运行配置（路由映射）
-│   └── impl/                     # 业务实现（AgentServiceImpl 等）
+│   └── impl/                     # 业务实现（AgentServiceImpl / ChatServiceImpl / LlmRouteJudge 等）
 ├── advisor/                      # Spring AI Advisor 拦截器（Agent 流程横切管理）
 │   └── ContextAssemblingAdvisor.java  # 上下文组装：过滤/截断/role 归一化（token 预算）
 ├── config/                       # 配置与装配
@@ -46,16 +48,20 @@ src/main/java/com/dark/javaHarness/
 ├── domain/                       # 领域模型（父包）
 │   ├── Goal.java                 # 目标 + 状态（PENDING/RUNNING/SUCCEEDED/FAILED）
 │   ├── AgentConfig.java          # Agent 运行配置（model + prompt），来自 agent 表
+│   ├── RouteDecision.java        # 路由决策枚举（SIMPLE / COMPLEX）
 │   ├── dto/                      # 传输对象（请求/响应体）
 │   │   ├── ChatRequest / ChatResponse / ErrorResponse / SseMeta
-│   │   └── AgentsView / GoalView / GoalsView / SubmitView
+│   │   ├── AgentsView / GoalView / GoalsView / SubmitView
+│   │   └── PageResult / SessionPageView（分页）
 │   └── entity/                   # 数据库实体（对应 agent / goal / session / model_provider 表）
 │       ├── AgentEntity / GoalEntity / SessionEntity / SessionMessageEntity / ModelProviderEntity
-├── enums/                        # 枚举：GoalStatus
+├── enums/                        # 枚举与共享常量：GoalStatus、AgentConstants
 ├── exception/                    # 全局异常处理（@RestControllerAdvice）
 ├── agent/                        # Agent 抽象与实现
-│   ├── Agent.java                # Agent 接口：name() / execute() / executeStream()
-│   └── GeneralAssistantAgent.java # 通用 Agent：直接按 model 从 Registry 取客户端调大模型
+│   ├── Agent.java                # Agent 接口：name() / execute() / executeStreamReactive()
+│   ├── GeneralAssistantAgent.java  # 路径 A：单次调用大模型（同步 call() / 真·逐 token stream()）
+│   ├── MultiAgentGraphAgent.java   # 路径 B：StateGraph 多 Agent 编排（lead→并行子任务→聚合）+ 钩子进度旁路
+│   └── ProgressLine.java           # 进度行线协议（MARK+stage+SEP+detail）编解码，服务端↔CLI 共用
 ├── cli/
 │   ├── ChatCli.java              # 命令行聊天客户端（独立进程，纯 HTTP 连 8080）
 │   └── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE)
@@ -176,17 +182,23 @@ curl -s -X POST http://localhost:8080/api/chat \
 响应 `Content-Type: text/event-stream`，事件流如下：
 
 ```
+event: progress
+data: {"stage":"编排","detail":"开始拆解复杂目标…"}
+event: progress
+data: {"stage":"拆解","detail":"4 个子任务已就绪"}
 data: 片段1
 data: 片段2
 ...
 data: [DONE]
 event: meta
-data: {"sessionId":"9","newSession":true,"goalId":"goal-1","status":"SUCCEEDED"}
+data: {"sessionId":"9","newSession":true,"goalId":null,"status":"SUCCEEDED","error":null}
 ```
 
-- 每段 `data:` 为模型生成的一个文本片段（逐 token 推送）
+- **内容 token**：普通 `data:` 行为模型生成的文本片段（逐 token 推送；行内换行已转义保证单行完整）
+- **执行进度**：`event: progress` + `data: {stage, detail}` JSON——复杂任务（多 Agent 编排）各阶段实时推送（编排/拆解/子任务完成/聚合），进度不计入会话记忆
 - 全部推完发送 `[DONE]`
 - 末尾 `event: meta` 携带 `sessionId` / `newSession` / `goalId` / `status`；失败时 `status=FAILED` 且追加 `error` 字段
+- 每个 SSE 事件以单个元素成对输出（`event:`+`data:` 不会被其它事件交叉打断）
 - 可用 `curl -N` 观察逐段到达
 
 ## 核心流程
@@ -201,36 +213,40 @@ Harness 作为请求的执行外壳，统一从应用层接入，经上下文组
    sessionId → 读 session_messages → SessionService.loadContext() 还原 Message 列表
    → 过滤 / 截断 / 角色格式化 → 组装执行上下文
 
-3. 主 Agent 前置判断（区分简单 / 复杂）
+3. 主 Agent 前置判断（RouteJudge，LLM 决策 SIMPLE / COMPLEX，失败兜底 SIMPLE）
    ├─ 场景 A：问题简单（无需工具、无需拆分子任务）
    │     → 普通单次调用芯片：GeneralAssistantAgent 读 agent 表配置取 ChatClient
-   │       直接单次调用大模型（同步 call() / 响应式 stream()，含会话记忆）
+   │       直接单次调用大模型（同步 call() / 响应式 stream() 真·逐 token 推送，含会话记忆）
    └─ 场景 B：问题复杂（搜索 / 代码 / 多步骤处理）
-         → 多 Agent 编排链路（Spring-AI Graph）：Lead Agent 拆解 → 子 Agent 并行/串行 → 聚合
+         → 多 Agent 编排链路（spring-ai-alibaba-graph-core StateGraph）：
+           Lead Agent 拆解 → 子 Agent 并行执行 → 聚合
+           生命周期钩子旁路实时推送各阶段进度（event: progress SSE）
 
 4. 统一出口
-   两条路径都写回 Goal（SUCCEEDED / FAILED）+ 会话记忆，经同步 / SSE 统一响应
+   两条路径都写回 Goal（SUCCEEDED / FAILED）+ 会话记忆（进度行不计入），经同步 / SSE 统一响应
 ```
 
-> 数据流细节与落地 TODO 见 [`HARNESS_TODO.md`](./HARNESS_TODO.md)。
-> 当前实现：场景 A（简单路径）已由 `GeneralAssistantAgent` + `SessionService.loadContext()` 落地；主 Agent 前置判断与场景 B（多 Agent Graph 编排）为后续演进占位，未强制任何请求走复杂流程。
+> 数据流细节见 [`docs/data-flow.md`](./docs/data-flow.md)，落地 TODO 见 [`HARNESS_TODO.md`](./HARNESS_TODO.md)，测试全景见 [`docs/functional-testing.md`](./docs/functional-testing.md)。
 
 ## 运行测试
 
-项目包含单元测试（基于 JUnit 5 + Mockito，不依赖真实数据库 / 网络 / API Key）：
+项目包含单元测试（基于 JUnit 5 + Mockito，不依赖真实数据库 / 网络 / API Key；当前 10 个测试类 / 50 用例全绿）：
 
 ```bash
 mvn -s .mvn/settings.xml test
 ```
 
-覆盖范围：
-
 | 测试 | 验证点 |
 |---|---|
+| `LlmRouteJudgeTest` | 主 Agent 分流判定：简单/复杂/异常 JSON 兜底 |
 | `AgentServiceImplTest` | 多 Agent 路由：`agentId` → `writer` / 未命中回退 `general` / `null` 走默认 |
 | `AgentConfigProviderTest` | 从 `agent` 表读取配置（model / prompt）：命中、缺失、空白降级 |
 | `ChatClientRegistryTest` | 多服务商：新增 `gpt-4o` 命中、禁用模型回退默认客户端 |
-| `ChatServiceImplTest` | 多轮记忆：首轮 `newSession=true` 建档、带 sessionId 复用、成功写回上下文 |
-| `ChatServiceImplStreamTest` | 流式：逐 token 回调、收集完整回复、FAILED 返回 error |
+| `ChatControllerTest` | Controller 层：流式 Flux 逐元素 + 换行、同步接口契约 |
+| `ContextAssemblingAdvisorTest` | 上下文组装：token 预算裁剪、role 归一化边界 |
+| `ChatServiceImplTest` | 多轮记忆、SSE 契约（progress/meta/error 单元素成对）、内容换行转义 |
+| `GeneralAssistantAgentTest` | 路径 A：逐 token 渐进发射（防伪流式回归）、同步 execute |
+| `MultiAgentGraphAgentTest` | 路径 B：StateGraph 编排闭环、进度阶段时序（防死锁/丢事件回归） |
+| `ProgressLineTest` | 进度线协议编解码 |
 
 > 注意：`JavaHarnessApplicationTests` 是 `@SpringBootTest`，会尝试连接本机 MySQL；在无数据库环境运行该单个类可能因连接失败而报错（其余业务测试不受影响）。

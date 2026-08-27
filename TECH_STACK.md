@@ -6,10 +6,11 @@
 
 ## 一、项目现状
 
-- **定位**：Agent 编排框架 —— 通过 `Agent` 抽象路由到不同实现（当前为通用 AI 助手），执行目标（Goal）并维护其生命周期（PENDING → RUNNING → SUCCEEDED/FAILED）。
+- **定位**：两路径 AI Agent 编排框架 —— 主 Agent（`RouteJudge` LLM 决策）按复杂度分流：简单请求走单次调用（路径 A），复杂请求走 StateGraph 多 Agent 编排（路径 B）；执行目标（Goal）全生命周期（PENDING → RUNNING → SUCCEEDED/FAILED）落库可追溯。
 - **入口**：REST API（`/api/chat`、`/api/chat/stream`、`/api/harness/*`）+ CLI 聊天客户端（`mvn exec:java`）。
 - **会话记忆**：MySQL 两张表（`session` + `session_messages`，一对一），`session_messages.content` 以 JSON 快照存储完整上下文。
 - **目标存储**：`Goal` 持久化到 MySQL `goal` 表，重启不丢，可追溯历史。
+- **执行反馈**：路径 A 逐 token 流式；路径 B 各阶段进度经生命周期钩子实时推送（`event: progress` SSE）。
 
 ***
 
@@ -21,43 +22,44 @@
 | 构建       | Maven                      | -      | 依赖与构建管理，本地仓库重定向 `.mvn-repo`                                                    |
 | 核心框架     | Spring Boot                | 3.5.14 | Web 应用框架（**硬约束：与 Spring AI 1.1.4 兼容**）                                         |
 | AI 框架    | Spring AI                  | 1.1.4  | `spring-ai-starter-model-openai`，以 OpenAI 兼容模式对接通义千问 DashScope（qwen3.7-plus）   |
-| Web      | Spring MVC                 | 随 Boot | REST + SSE（`SseEmitter` 流式推送）+ 全局异常处理（`@RestControllerAdvice`）                 |
+| Graph 编排  | spring-ai-alibaba-graph-core | BOM 1.1.2.2 | StateGraph 多 Agent 编排（lead→并行子任务→聚合）+ `GraphLifecycleListener` 进度旁路（路径 B） |
+| Web      | Spring MVC                 | 随 Boot | REST + 响应式 SSE（Controller 返回 `Flux<String>`，`text/event-stream`）+ 全局异常处理 |
 | ORM      | MyBatis-Plus               | 3.5.7  | `mybatis-plus-spring-boot3-starter`，goal / session / session\_messages / agent 表的 CRUD |
 | 数据库      | MySQL                      | 9.2.0  | `mysql-connector-j`（runtime），连接池 HikariCP                                      |
 | 参数校验     | Jakarta Validation         | 随 Boot | `spring-boot-starter-validation` + `@Valid` 注解校验                               |
 | HTTP 客户端 | OkHttp                     | 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`）                                   |
 | 序列化      | Jackson                    | 随 Boot | DTO 序列化 / SSE meta 解析                                                          |
 | 代码生成     | Lombok                     | -      | 实体类简化                                                                          |
-| 测试       | JUnit 5 / Spring Boot Test | 随 Boot | 上下文加载测试                                                                        |
+| 测试       | JUnit 5 / Mockito          | 随 Boot | 10 个测试类 / 50 用例（不依赖真实 DB/网络，见 docs/functional-testing.md）                     |
 | 日志       | SLF4J + Logback            | 随 Boot | Agent 执行状态日志                                                                   |
 | 初始化 SQL  | schema.sql                 | -      | 启动时 `spring.sql.init` 建表                                                       |
-
-未来可引入Spring AI Alibaba，进行agent多轮任务的控制与调度.
 
 ### 架构分层
 
 ```
 controller（REST + SSE 流式 + 全局异常处理）
-  └─ service（接口 + impl：AgentService / ChatService / GoalService / SessionService）
-        ├─ agent（Agent 抽象 + GeneralAssistantAgent）
+  └─ service（接口 + impl：AgentService / ChatService / GoalService / SessionService
+             ├─ RouteJudge + LlmRouteJudge（主 Agent 分流判定）
+             └─ AgentConfigProvider（agent 表运行配置）
+        ├─ agent（Agent 抽象 + GeneralAssistantAgent 路径A + MultiAgentGraphAgent 路径B）
+        │     └─ ProgressLine（进度行线协议，服务端↔CLI 共用）
+        ├─ advisor（ContextAssemblingAdvisor：上下文组装/token 裁剪）
         ├─ tool（DemoTools：@Tool 工具调用）
-        ├─ cli（ChatCli 交互端） + cli/api（ChatApiClient：OkHttp + SSE）
-        ├─ domain（领域模型父包，含 dto 与 entity）
-        │     ├─ Goal / AgentConfig（领域模型）
-        │     ├─ dto（请求/响应体）
-        │     └─ entity（对应 agent / goal / session 表）
-        ├─ mapper（Agent / Goal / Session / SessionMessage）
-        ├─ enums（ExecutionType / GoalStatus）
-        └─ 配置（application.yaml）
+        ├─ cli（ChatCli 交互端） + cli/api（ChatApiClient：OkHttp + SSE 解析）
+        ├─ domain（领域模型父包，含 dto 与 entity；RouteDecision 分流决策枚举）
+        ├─ mapper（Agent / Goal / Session / SessionMessage / ModelProvider）
+        ├─ enums（GoalStatus / AgentConstants）
+        └─ 配置（application.yaml + config/agent：ChatAgentConfig、ChatClientFactory、ChatClientRegistry）
 ```
 
 ### 关键设计
 
-- **流式聊天**：`/api/chat/stream` 走 SSE，逐 token 推送，结束发 `[DONE]` + `meta`（sessionId/goalId/status/error）。
-- **逐 token 推送**：`GeneralAssistantAgent.executeStream` 以 Reactor `Flux` 订阅真正边收边发，`AgentService` 在线拼装完整摘要写回 Goal。
-- **Agent 路由**：`agent` 表按 `agentId` 登记 Agent；CLI 传 `agentId`，服务端 `executeStreamById` 先映射为 `agentName`，未命中回退 `general`。
+- **两路径分流**：`LlmRouteJudge` LLM 决策 SIMPLE/COMPLEX（异常兜底 SIMPLE 宁可简单）；`ChatServiceImpl.resolveAgent()` 据此路由 `general` 或 `multi-agent`。
+- **流式聊天**：`/api/chat/stream` 返回 `Flux<String>`（SSE）；每个事件单元素成对输出——内容 token 为普通 `data:` 行，进度为 `event: progress` + `{stage, detail}` JSON，结束发 `[DONE]` + `meta`（sessionId/goalId/status/error）。
+- **逐 token 推送**：路径 A `GeneralAssistantAgent.executeStreamReactive` 走 `.stream().content()` 真流式边收边发；路径 B 子任务完成事件由 graph-core 生命周期钩子旁路捕获后并入主流（before/after 过滤短路槽位、串行发射防丢事件）。
+- **Agent 路由**：请求显式携带 `agentId` 时优先按 agent 表映射路由（CLI `/agent <id>` 手动指定），否则按分流结果选择执行体；未命中回退 `general`。
 - **动态配置**：每次调用经 `AgentService.getAgentConfig(agent_name)` 读 agent 表的 `model / prompt`，改库即时生效，无需重启。
-- **会话写回统一**：同步 / 流式路径都在 `ChatServiceImpl` 统一写回会话记忆。
+- **会话写回统一**：同步 / 流式路径都在 `ChatServiceImpl` 统一写回会话记忆（进度行不计入摘要）。
 - **工具调用**：`ChatClient.defaultTools(new DemoTools())` 注册，模型可调用时间/计算/天气等工具。
 - **统一异常响应**：`GlobalExceptionHandler` 把所有异常转成 `{code, message}` 结构（400/404/500），非法请求返回统一 400 错误体。
 
@@ -98,7 +100,6 @@ controller（REST + SSE 流式 + 全局异常处理）
 | 建议     | 说明                                                                        |
 | ------ | ------------------------------------------------------------------------- |
 | API 文档 | springdoc-openapi（Swagger UI / OpenAPI 3）                                 |
-| 参数校验   | `spring-boot-starter-validation`（jakarta validation），替换手写 `message 非空` 校验 |
 | DTO 映射 | MapStruct 替代手写 VO 转换                                                      |
 
 ### 5. 安全（优先级：视需求）
@@ -113,7 +114,7 @@ controller（REST + SSE 流式 + 全局异常处理）
 | 建议             | 说明                                           |
 | -------------- | -------------------------------------------- |
 | Testcontainers | 集成测试起 MySQL/向量库真实环境                          |
-| Mockito        | 单元测试 service 层（当前仅上下文加载测试）                   |
+| Mockito 补全     | service 层核心场景已有 50 用例，继续补长尾分支与异常路径           |
 | 契约测试           | 对 `/api/chat/stream` SSE 格式做契约测试，防止客户端/服务端漂移 |
 
 ### 7. 工程化与交付（优先级：低-中）
