@@ -8,6 +8,7 @@ import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.domain.dto.SseMeta;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.enums.GoalStatus;
+import com.dark.javaHarness.enums.SseProtocol;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
 import com.dark.javaHarness.service.RouteJudge;
@@ -31,12 +32,7 @@ import reactor.core.scheduler.Schedulers;
 @Service
 public class ChatServiceImpl implements ChatService {
 
-    /** SSE 事件名：元数据（sessionId/goalId/status/newSession） */
-    private static final String EVENT_META = "meta";
-    /** SSE 事件名：异常 */
-    private static final String EVENT_ERROR = "error";
-    /** SSE 事件名：执行进度（多 Agent 编排的阶段反馈） */
-    private static final String EVENT_PROGRESS = "progress";
+    /** SSE 事件名/结束标记等协议常量统一在 {@link SseProtocol}（与 CLI 端共用） */
 
     /** Jackson 序列化（SseMeta 为 record，默认序列化即可） */
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -119,13 +115,13 @@ public class ChatServiceImpl implements ChatService {
             Flux<String> body = agentTokens
                     .doOnNext(row -> { if (!ProgressLine.isProgress(row)) { full.append(row); } })
                     .flatMap(ChatServiceImpl::toSseRows)
-                    .concatWithValues("data: [DONE]")
+                    .concatWithValues("data: " + SseProtocol.DONE_MARKER)
                     .concatWith(metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.SUCCEEDED.name(), null))
                     .doOnComplete(() -> writeBackContext(ctx.sid(), request.message(), full.toString()))
                     .onErrorResume(ex -> {
                         String err = safeMessage(ex);
                         return Flux.concat(
-                                Flux.just("event: " + EVENT_ERROR + "\ndata: " + err),
+                                Flux.just("event: " + SseProtocol.EVENT_ERROR + "\ndata: " + err),
                                 metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.FAILED.name(), err));
                     });
             return body;
@@ -143,19 +139,14 @@ public class ChatServiceImpl implements ChatService {
         ProgressLine.StageRow p = ProgressLine.decode(row);
         if (p == null) {
             // 内容行：裸换行会把一条 data 断成多个物理行，CLI 只认前缀行会丢内容——必须行内转义（可逆）
-            return Flux.just("data: " + escapeLineBreaks(row));
+            return Flux.just("data: " + SseProtocol.escapeLineBreaks(row));
         }
         try {
             // event 与 data 必须在同一元素内：MVC 逐元素 flush，拆成两个元素会被其它事件的行交叉插入
-            return Flux.just("event: " + EVENT_PROGRESS + "\ndata: " + OBJECT_MAPPER.writeValueAsString(p));
+            return Flux.just("event: " + SseProtocol.EVENT_PROGRESS + "\ndata: " + OBJECT_MAPPER.writeValueAsString(p));
         } catch (Exception e) {
-            return Flux.just("event: " + EVENT_PROGRESS + "\ndata: {\"stage\":\"?\",\"detail\":\"?\"}");
+            return Flux.just("event: " + SseProtocol.EVENT_PROGRESS + "\ndata: {\"stage\":\"?\",\"detail\":\"?\"}");
         }
-    }
-
-    /** 内容行传输转义：反斜杠与换行符替换为字面量序列；还原在 CLI 端 unescapeLineBreaks 完成。 */
-    private static String escapeLineBreaks(String s) {
-        return s.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n");
     }
 
     /** 流式成功后写回会话记忆（响应式路径：assistant 完整回复已由 doOnNext 收集） */
@@ -171,9 +162,9 @@ public class ChatServiceImpl implements ChatService {
     private Flux<String> metaEvent(String sessionId, boolean newSession, String status, String error) {
         SseMeta meta = new SseMeta(sessionId, newSession, null, status, error);
         try {
-            return Flux.just("event: " + EVENT_META + "\ndata: " + OBJECT_MAPPER.writeValueAsString(meta));
+            return Flux.just("event: " + SseProtocol.EVENT_META + "\ndata: " + OBJECT_MAPPER.writeValueAsString(meta));
         } catch (Exception e) {
-            return Flux.just("event: " + EVENT_META + "\ndata: {\"error\":\"meta serialization failed\"}");
+            return Flux.just("event: " + SseProtocol.EVENT_META + "\ndata: {\"error\":\"meta serialization failed\"}");
         }
     }
 

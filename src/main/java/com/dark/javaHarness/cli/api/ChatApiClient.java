@@ -3,6 +3,7 @@ package com.dark.javaHarness.cli.api;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.domain.dto.SessionPageView;
+import com.dark.javaHarness.enums.SseProtocol;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -93,17 +94,17 @@ public class ChatApiClient {
                         event = line.substring("event:".length()).trim();
                     } else if (line.startsWith("data:")) {
                         String data = line.substring("data:".length()).trim();
-                        if ("meta".equals(event)) {
+                        if (SseProtocol.EVENT_META.equals(event)) {
                             meta = mapper.readValue(data, ChatResponse.class);
-                        } else if ("error".equals(event)) {
+                        } else if (SseProtocol.EVENT_ERROR.equals(event)) {
                             throw new IOException(data);
-                        } else if ("progress".equals(event)) {
+                        } else if (SseProtocol.EVENT_PROGRESS.equals(event)) {
                             if (onProgress != null) {
                                 onProgress.accept(data);
                             }
-                        } else if (!"[DONE]".equals(data)) {
+                        } else if (!SseProtocol.DONE_MARKER.equals(data)) {
                             // [DONE] 后还会跟 meta 事件，忽略但不中断，继续读到 meta
-                            onToken.accept(unescapeLineBreaks(data));
+                            onToken.accept(SseProtocol.unescapeLineBreaks(data));
                         }
                     }
                 }
@@ -113,35 +114,6 @@ public class ChatApiClient {
             }
             return meta;
         }
-    }
-
-    /**
-     * 还原服务端对内容行的换行转义（服务端 {@code escapeLineBreaks} 的逆操作）：
-     * 字面量 {@code \\} → 反斜杠、{@code \n} → 换行、{@code \r} → 回车；非法序列原样保留。
-     */
-    private static String unescapeLineBreaks(String s) {
-        if (s == null || s.indexOf('\\') < 0) {
-            return s;
-        }
-        StringBuilder sb = new StringBuilder(s.length());
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '\\' && i + 1 < s.length()) {
-                char n = s.charAt(++i);
-                if (n == 'n') {
-                    sb.append('\n');
-                } else if (n == 'r') {
-                    sb.append('\r');
-                } else if (n == '\\') {
-                    sb.append('\\');
-                } else {
-                    sb.append(c).append(n);
-                }
-            } else {
-                sb.append(c);
-            }
-        }
-        return sb.toString();
     }
 
     /**
