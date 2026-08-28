@@ -91,6 +91,10 @@ class MultiAgentGraphAgentTest {
 
         assertNotNull(reply);
         assertFalse(reply.isBlank(), "execute 应产出最终回答");
+        // lead 拆解与聚合按独立角色行查配置（与编排器 multi-agent 解耦）
+        verify(agentService).getAgentConfig("lead");
+        verify(agentService).getAgentConfig("aggregator");
+        verify(agentService, never()).getAgentConfig("multi-agent");
     }
 
     @Test

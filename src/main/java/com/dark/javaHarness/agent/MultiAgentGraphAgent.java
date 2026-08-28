@@ -35,11 +35,12 @@ import reactor.core.publisher.Sinks;
  * 多 Agent 编排器：路径 B（复杂请求）的执行体。
  *
  * <p>基于 {@link StateGraph} 编排「Lead 拆解 → 并行子任务 → 聚合」三阶段，
- * 每个阶段都是一次独立的 ChatClient 单次调用（复用 {@link ChatClientRegistry} 的客户端）：
- * - lead 节点：把复杂目标拆成至多 {@link #MAX_SUBTASKS} 条子任务（JSON 解析），
- *   并为每条子任务指派专家（researcher/coder/analyst/writer/general，白名单校验，非法回退）
+ * 每个阶段都是一次独立的 ChatClient 单次调用（复用 {@link ChatClientRegistry} 的客户端），
+ * 配置（模型 + 提示词）均取自 agent 表对应角色行：
+ * - lead 节点：查 {@code lead} 行（无则内置兜底），把复杂目标拆成至多 {@link #MAX_SUBTASKS} 条子任务
+ *   （JSON 解析），并为每条子任务指派专家（researcher/coder/analyst/writer/general，白名单校验，非法回退）
  * - subtask-i 节点：并行执行，按指派的专家名查 agent 表配置取对应 ChatClient 产出该子任务结果
- * - aggregate 节点：收集各子任务结果，调用模型汇总成最终回答
+ * - aggregate 节点：查 {@code aggregator} 行（无则内置兜底），收集各子任务结果汇总成最终回答
  *
  * <p>与路径 A 的 {@link GeneralAssistantAgent} 对 Key 契约一致：
  * {@link #execute(Goal)} 返回最终回答 String；Goal 生命周期与会话记忆写回
@@ -64,6 +65,10 @@ public class MultiAgentGraphAgent implements Agent {
     /** 节点名常量 */
     private static final String NODE_LEAD = "lead";
     private static final String NODE_AGGREGATE = "aggregate";
+
+    /** 编排环节角色名（agent 表行名）：lead 拆解器、aggregator 聚合器，与编排器 multi-agent 行解耦 */
+    private static final String ROLE_LEAD = "lead";
+    private static final String ROLE_AGGREGATOR = "aggregator";
 
     /** 状态键 */
     private static final String K_OBJECTIVE = "objective";
@@ -369,13 +374,24 @@ public class MultiAgentGraphAgent implements Agent {
 
     /* ---------- ChatClient 单次调用 ---------- */
 
+    /** lead 拆解兜底提示词（agent 表无 lead 行时使用；正常情况以表配置为准） */
+    private static final String LEAD_FALLBACK_PROMPT =
+            "你是多 Agent 的 Lead 拆解器。把用户复杂目标拆解为若干条可并行执行的子任务，"
+                    + "并为每条子任务指派最合适的专家执行。可选专家（只能用这些名字）："
+                    + "researcher（资料调研）、coder（代码编写/修复）、analyst（数据分析）、writer（汇总撰写）、general（通用兜底）。"
+                    + "拆解数量必须与任务难度匹配，禁止凑数：至多 4 条；简单任务只拆 1 条，中等任务 2~3 条，"
+                    + "只有确实存在多个可独立并行、且各自对最终结果都有贡献的部分时才拆满；"
+                    + "任何一条子任务如果只是原任务换个说法，就不要拆。"
+                    + "只输出一行 JSON，格式："
+                    + "{\"subtasks\":[{\"desc\":\"子任务描述\",\"agent\":\"专家名\"}]}，不要任何解释。";
+
+    /** 聚合兜底提示词（agent 表无 aggregator 行时使用；正常情况以表配置为准） */
+    private static final String AGGREGATOR_FALLBACK_PROMPT =
+            "你是聚合汇总的 AI 助手，依据多个子结果的最终回答可直接呈现给用户。";
+
+    /** lead 拆解：按 agent 表 lead 行的提示词/模型执行（无配置时回退内置兜底） */
     private String predictLead(String objective) {
-        String sys = "你是多 Agent 的 Lead 拆解器。把用户复杂目标拆解为若干条可并行执行的子任务，"
-                + "并为每条子任务指派最合适的专家执行。可选专家（只能用这些名字）："
-                + "researcher（资料调研）、coder（代码编写/修复）、analyst（数据分析）、writer（汇总撰写）、general（通用兜底）。"
-                + "只输出一行 JSON，格式："
-                + "{\"subtasks\":[{\"desc\":\"子任务描述\",\"agent\":\"专家名\"}]}，不要任何解释。";
-        return call(null, sys, "拆解目标：" + objective);
+        return call(ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective);
     }
 
     /** 子任务执行前日志埋点便于诊断专家指派（predictSubtask 包装处统一记审计） */
@@ -398,13 +414,17 @@ public class MultiAgentGraphAgent implements Agent {
         for (int i = 0; i < results.size(); i++) {
             sb.append("【子任务").append(i + 1).append("】\n").append(results.get(i)).append("\n\n");
         }
-        return call(null, "你是聚合汇总的 AI 助手，依据多个子结果的最终回答可直接呈现给用户。", sb.toString());
+        return call(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, sb.toString());
     }
 
     /**
      * 单次 ChatClient 调用：按 agentName 查 agent 表运行配置（model/prompt），再从注册表取客户端。
      *
-     * @param forAgent 用于查配置的 agent 名（null = 用编排器自身配置）；专家子任务传专家名
+     * <p>提示词优先级：agent 表该角色行的 prompt &gt; 调用方传入的兜底角色指令 {@code system}
+     * &gt; 内置 {@link #DEFAULT_SYSTEM_PROMPT}。表配置存在时以其为 system、
+     * {@code user} 不再重复拼接角色指令；无表配置时回退内置默认 system 并拼接兜底指令。
+     *
+     * @param forAgent 用于查配置的 agent 名（null = 用编排器自身配置）；各环节传角色/专家名
      */
     private String call(String forAgent, String system, String user) {
         String configName = forAgent != null ? forAgent : agentName;
@@ -412,9 +432,12 @@ public class MultiAgentGraphAgent implements Agent {
                 : agentService.getAgentConfig(configName).orElse(null);
         String model = config != null ? config.model() : null;
         ChatClient client = clientRegistry.get(model);
+        boolean hasTablePrompt = config != null && config.prompt() != null && !config.prompt().isBlank();
+        String sysText = hasTablePrompt ? config.prompt() : DEFAULT_SYSTEM_PROMPT;
+        String userText = hasTablePrompt ? user : system + "\n" + user;
         ChatClient.ChatClientRequestSpec spec = client.prompt()
-                .system(config != null && config.prompt() != null ? config.prompt() : DEFAULT_SYSTEM_PROMPT)
-                .user(system + "\n" + user);
+                .system(sysText)
+                .user(userText);
         if (model != null && !model.isBlank()) {
             // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
             spec.options(OpenAiChatOptions.builder().model(model).build());
