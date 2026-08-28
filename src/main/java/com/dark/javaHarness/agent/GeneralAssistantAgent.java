@@ -7,6 +7,9 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.tool.ToolAssignments;
+import com.dark.javaHarness.tool.ToolCallTracer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +17,9 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.ai.tool.ToolCallback;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Sinks;
 
 /**
  * 通用 ChatModel 驱动 Agent：使用 Spring AI ChatClient 调用大模型来完成目标。
@@ -98,18 +103,30 @@ public class GeneralAssistantAgent implements Agent {
     /**
      * 响应式流式执行：真·逐 token 发射（ChatClient.stream().content()）。
      * 覆写接口 default——否则会退化为「同步 execute 阻塞生成完 → 一次性产出」，CLI 将全程无输出干等。
-     * 会话记忆持久化由框架 Advisor 与 ChatService 在流结束后统一负责，此处不做。
+     * 工具调用起止经旁路 sink 合并进同一 Flux（ProgressLine 进度行，与路径 B 通道一致），
+     * CLI 据此展示工具调用行；会话记忆持久化由框架 Advisor 与 ChatService 在流结束后统一负责，此处不做。
      */
     @Override
     public Flux<String> executeStreamReactive(Goal goal) {
         log.info("AI agent '{}' 开始响应式流式处理目标: {}", name(), goal.objective());
-        return buildChatRequestSpec(goal.sessionId(), goal.objective())
+        Sinks.Many<String> toolEvents = Sinks.many().unicast().onBackpressureBuffer();
+        // 关闸挂 merge 之前的主干段（多 Agent 侧同款死锁教训：关闸在 merge 后会循环等待）
+        Flux<String> content = buildChatRequestSpec(goal.sessionId(), goal.objective(),
+                        row -> BranchProgressListener.tryEmitSerialized(toolEvents, row))
                 .stream()
-                .content();
+                .content()
+                .doFinally(sig -> BranchProgressListener.tryCompleteSerialized(toolEvents));
+        return content.mergeWith(toolEvents.asFlux());
     }
 
     /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪 */
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective) {
+        return buildChatRequestSpec(sessionId, objective, null);
+    }
+
+    /** 组装请求（toolEmitter 非 null 时注入追踪版工具，调用起止经其发进度行） */
+    private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective,
+                                                                  Consumer<String> toolEmitter) {
         AgentConfig config = agentService.getAgentConfig(agentName)
                 .orElse(new AgentConfig(null, DEFAULT_SYSTEM_PROMPT));
         String model = config.model();
@@ -129,13 +146,23 @@ public class GeneralAssistantAgent implements Agent {
         ToolAssignments.ToolSet toolSet = toolAssignments == null
                 ? ToolAssignments.ToolSet.EMPTY
                 : toolAssignments.forAgent(agentName);
-        if (!toolSet.annotated().isEmpty()) {
-            // 必须 toArray 走 varargs Object... 重载（@Tool 对象解析）；传 List 会匹配
-            // List<ToolCallback> 重载导致「No @Tool annotated methods found」异常
-            spec.tools(toolSet.annotated().toArray());
-        }
-        if (!toolSet.callbacks().isEmpty()) {
-            spec.toolCallbacks(toolSet.callbacks().toArray(new org.springframework.ai.tool.ToolCallback[0]));
+        if (toolEmitter != null) {
+            // 追踪模式：双通道统一为「装饰后的 ToolCallback」单通道，工具执行起止经 emitter 发进度行
+            List<ToolCallback> traced = new ArrayList<>(
+                    ToolCallTracer.trace(toolSet.callbacks(), toolEmitter));
+            traced.addAll(ToolCallTracer.traceAnnotated(toolSet.annotated(), toolEmitter));
+            if (!traced.isEmpty()) {
+                spec.toolCallbacks(traced.toArray(new ToolCallback[0]));
+            }
+        } else {
+            if (!toolSet.annotated().isEmpty()) {
+                // 必须 toArray 走 varargs Object... 重载（@Tool 对象解析）；传 List 会匹配
+                // List<ToolCallback> 重载导致「No @Tool annotated methods found」异常
+                spec.tools(toolSet.annotated().toArray());
+            }
+            if (!toolSet.callbacks().isEmpty()) {
+                spec.toolCallbacks(toolSet.callbacks().toArray(new ToolCallback[0]));
+            }
         }
         if (model != null && !model.isBlank()) {
             spec.options(OpenAiChatOptions.builder().model(model).build());

@@ -4,6 +4,10 @@ import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.tool.ToolAssignments;
+import com.dark.javaHarness.tool.ToolCallTracer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
@@ -45,7 +49,12 @@ final class AgentChatCaller {
      * @param user           任务指令（纯任务内容，不含角色设定）
      */
     String call(String forAgent, String fallbackSystem, String user) {
-        return buildSpec(forAgent, fallbackSystem, user).call().content();
+        return call(forAgent, fallbackSystem, user, null);
+    }
+
+    /** 带工具事件发射器的调用：emitter 非 null 时本次调用的工具执行起止经其发进度行（供 CLI 展示） */
+    String call(String forAgent, String fallbackSystem, String user, Consumer<String> toolEmitter) {
+        return buildSpec(forAgent, fallbackSystem, user, toolEmitter).call().content();
     }
 
     /**
@@ -59,8 +68,14 @@ final class AgentChatCaller {
      */
     String stream(String forAgent, String fallbackSystem, String user,
                   java.util.function.Consumer<String> onToken) {
+        return stream(forAgent, fallbackSystem, user, onToken, null);
+    }
+
+    /** 带工具事件发射器的流式调用：语义同 {@link #stream(String, String, String, Consumer)} */
+    String stream(String forAgent, String fallbackSystem, String user,
+                  Consumer<String> onToken, Consumer<String> toolEmitter) {
         StringBuilder collected = new StringBuilder();
-        buildSpec(forAgent, fallbackSystem, user)
+        buildSpec(forAgent, fallbackSystem, user, toolEmitter)
                 .stream()
                 .content()
                 .doOnNext(token -> {
@@ -72,7 +87,8 @@ final class AgentChatCaller {
     }
 
     /** 组装请求（查表配置 → 取客户端 → system/user → 请求级 model → 工具注入），call/stream 共用 */
-    private ChatClient.ChatClientRequestSpec buildSpec(String forAgent, String fallbackSystem, String user) {
+    private ChatClient.ChatClientRequestSpec buildSpec(String forAgent, String fallbackSystem, String user,
+                                                       Consumer<String> toolEmitter) {
         AgentConfig config = agentService == null ? null
                 : agentService.getAgentConfig(forAgent).orElse(null);
         String model = config != null ? config.model() : null;
@@ -91,6 +107,17 @@ final class AgentChatCaller {
         ToolAssignments.ToolSet toolSet = toolAssignments == null
                 ? ToolAssignments.ToolSet.EMPTY
                 : toolAssignments.forAgent(forAgent);
+        if (toolEmitter != null) {
+            // 追踪模式：双通道统一为「装饰后的 ToolCallback」单通道——
+            // @Tool 注解对象也转回调再装饰，工具执行起止经 emitter 发进度行（CLI 工具调用行）
+            List<ToolCallback> traced = new ArrayList<>(
+                    ToolCallTracer.trace(toolSet.callbacks(), toolEmitter));
+            traced.addAll(ToolCallTracer.traceAnnotated(toolSet.annotated(), toolEmitter));
+            if (!traced.isEmpty()) {
+                spec.toolCallbacks(traced.toArray(new ToolCallback[0]));
+            }
+            return spec;
+        }
         if (!toolSet.annotated().isEmpty()) {
             // 必须 toArray 走 varargs Object... 重载（@Tool 对象解析）；传 List 会匹配
             // List<ToolCallback> 重载导致「No @Tool annotated methods found」异常

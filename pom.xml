@@ -90,6 +90,17 @@
             <version>4.12.0</version>
         </dependency>
 
+        <!--
+ JLine 3：CLI 交互输入（上下键历史 / `/` 命令补全 / 多行粘贴）。
+ 引入理由（不可替代性）：Windows 控制台无纯 Java 的逐键 raw 输入，
+ BufferedReader 行缓冲拿不到方向键事件，历史翻阅与补全菜单必须依赖终端库；
+ JLine 3 是事实标准（Spring Shell 同款），仅在 CLI 进程使用，服务端零依赖。 -->
+        <dependency>
+            <groupId>org.jline</groupId>
+            <artifactId>jline</artifactId>
+            <version>3.27.1</version>
+        </dependency>
+
         <!-- JDBC + MySQL 驱动 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -177,5 +188,31 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- CLI 完整输入体验（历史/补全需真实 TTY）：mvn -s .mvn/settings.xml -Pcli compile exec:exec
+         fork 出独立 java 进程并继承当前终端，JLine 可接管按键；exec:java 内嵌 JVM 无 TTY 会降级 -->
+    <profiles>
+        <profile>
+            <id>cli</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <configuration>
+                            <executable>java</executable>
+                            <arguments>
+                                <argument>-Dfile.encoding=UTF-8</argument>
+                                <argument>-classpath</argument>
+                                <classpath/>
+                                <argument>com.dark.javaHarness.cli.ChatCli</argument>
+                            </arguments>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
 </project>

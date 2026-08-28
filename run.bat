@@ -47,7 +47,9 @@ goto :wait
 echo.
 echo Opening CLI chat window...
 echo Type text to chat, /exit to quit.
-start "java_harness_cli" cmd /k "cd /d %~dp0 && mvn -q -s .mvn\settings.xml exec:java"
+REM exec:java is not part of the compile lifecycle - compile must run first,
+REM otherwise stale classes stay in target\classes (caused mojibake regression once)
+start "java_harness_cli" cmd /k "cd /d %~dp0 && mvn -s .mvn\settings.xml compile exec:java"
 
 echo.
 echo Server and CLI launched. Two windows opened.

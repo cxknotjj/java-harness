@@ -92,12 +92,16 @@
   - 验收：新增表结构变更通过迁移脚本自动应用
 - [ ] **模型调用重试/限流**：Spring Retry / Resilience4j，模型失败自动重试，接口限流防刷
   - 验收：bad key 场景按策略重试后失败，限流返回 429
-- [ ] **CLI 输出优化（对标 Claude Code 的终端体验）**：
+- [x] **CLI 输出优化（对标 Claude Code 的终端体验）**：
   - 流式 Markdown 渲染：逐 token 渲染标题/列表/**粗体**/代码块语法高亮，而非纯文本直出
-  - 过程状态原位刷新：`编排/拆解/子任务/聚合` 等进度用 spinner + 已耗时在固定状态行刷新，完成后折叠归档，不随内容滚动刷屏
+  - 过程状态原位刷新：`编排/拆解/子任务/聚合` 等进度用 spinner + 已耗时在固定状态行刷新，完成后折叠归档成单行摘要（如 `✓ 子任务1 · researcher · 42s`），不随内容滚动刷屏
+  - 工具调用行：服务端新增 `ToolCallTracer` 装饰 ToolCallback（schema 原样透传，模型不可见），调用起止经旁路 sink 发 `tool`/`tool-done` 进度行（路径 A/B 通用，复用 ProgressLine→SSE 通道）；CLI 展示 `⏺ 工具名(参数摘要)` spinner，完成后归档 `✓ 耗时 · +N/-M 行`（连续多次调用天然折叠为单行紧凑列表）
+  - 变更 diff 展示：从工具入参 old/new 串行数近似计算 `+N/-M 行`，归档行内 +绿 / -红 着色（best-effort：键名候选匹配 path/content/old_string/new_string/text 等）
+  - 配色体系：过程/进度用弱化色（灰），正文正常色，关键结论加粗——层次感对齐 Claude Code
   - 回合小结：回答结束后展示本回合统计（耗时、子任务数、token 近似量）
-  - 选型提示：需要 ANSI 控制/按键处理时评估 JLine 3 / Lanterna（JLine 曾作为遗留依赖清理过，若引入需给出不可替代的理由）
-  - 验收：复杂任务全程可视（进度非刷屏式），最终回答以排版后的 Markdown 呈现
+  - 输入体验：引入 JLine 3——上下键翻阅输入历史（持久化 `~/.javaHarness_history`）、`/` 命令 Tab 补全菜单、多行粘贴（bracketed paste）；无 TTY 环境（exec:java 内嵌 JVM）自动降级行式读取
+  - 选型说明：**JLine 3 引入理由（不可替代性）**——Windows 控制台无纯 Java 的逐键 raw 输入，BufferedReader 行缓冲拿不到方向键事件，历史翻阅/补全菜单必须依赖终端库；JLine 3 是事实标准（Spring Shell 同款），uber jar 自带 jansi/jna/ffm 全部 Windows provider，仅 CLI 进程使用、服务端零依赖。启动方式升级：`mvn -s .mvn/settings.xml -Pcli compile exec:exec`（fork 独立进程接管真实终端，历史/补全可用）
+  - 验收 ✅：复杂任务全程可视（进度非刷屏式、过程可折叠）；最终回答以排版后的 Markdown 呈现；路径 A 逐 token 与路径 B 聚合逐 token 均有打字机效果；工具调用起止实时可见。测试：`ToolCallTracerTest`（15 用例：事件组装/装饰行为/失败重抛/schema 透传）+ `TerminalRendererTest` 工具行 2 用例，全量 107 用例通过
 
 ## 侧重点 · 提升工程深度
 

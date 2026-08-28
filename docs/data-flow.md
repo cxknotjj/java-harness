@@ -170,7 +170,7 @@ MultiAgentGraphAgent.execute(goal)
 
 **关键点**：① Lead 拆 ≤ `MAX_SUBTASKS=4`；② `addEdge(lead,List)` 并行；③ 复用 `ChatClientRegistry`；④ 输出 `final`。
 
-**流式执行（`executeStreamReactive`：「主干帧 + 生命周期钩子旁路」双通道）**：
+**流式执行（`executeStreamReactive`：「主干帧 + 三条旁路」多通道）**：
 
 > 动机：graph-core 的 `stream()` 按 superstep 吐帧，会把并行分支合并掉，「每个子任务何时完成」在主干里拿不到。
 > 于是一路走主干帧覆盖能看到的节点，另一路挂 `GraphLifecycleListener` 补齐分支事件，最后 merge 成一条流。
@@ -192,7 +192,16 @@ MultiAgentGraphAgent.executeStreamReactive(goal)
 │         │ tryEmitSerialized 加锁串行发射 ← 单播 Sink 拒绝并行线程并发发射
 │         │   （FAIL_NON_SERIALIZED 会静默丢事件，踩坑记录）
 │         ▼
-│ ③ 合流：mainLine.mergeWith(branchEvents.asFlux())
+│ ③ 旁路：聚合 token（liveTokens）——聚合节点流式调用逐 token 直推（含首个 token 前「聚合」进度行）
+│
+│ ④ 旁路：子任务工具事件（toolEvents）——子任务节点经 AgentChatCaller 注入「追踪版工具」
+│     （ToolCallTracer 装饰 ToolCallback：schema 原样透传，仅 call 前后发事件）：
+│       调用前 → ProgressLine.encode("tool", "WriteFile(/tmp/a.py)")
+│       调用后 → ProgressLine.encode("tool-done", "WriteFile ✓ 1.2s · +12/-3 行")
+│       （失败 → "WriteFile ✗ 0.3s"；diff 摘要从入参 old/new 串行数近似，仅文件写入/编辑类可得）
+│     路径 A（GeneralAssistantAgent.executeStreamReactive）同样以旁路 sink 合并工具事件
+│
+│ ⑤ 合流：mainLine.mergeWith(branchEvents).mergeWith(liveTokens).mergeWith(toolEvents)
 │     ⚠️ 关闸 doFinally(tryCompleteSerialized) 必须挂在 merge **之前**的主干段上：
 │        merge 要求两源都终结才传 complete，关闸挂 merge 之后会循环等待 → 死锁（踩坑记录）
 ```
@@ -211,9 +220,9 @@ MultiAgentGraphAgent.executeStreamReactive(goal)
 | 进度行 | `event: progress` + `data: {"stage":..,"detail":..}`（Jackson 序列化 `StageRow` record） | 排除，不写回 |
 | 内容行 | `data: <row>` | `doOnNext` 收集，`[DONE]` 后统一写回多轮记忆 |
 
-CLI 解析到 `event: progress` 打印 `[阶段] 描述`，实时看到编排/拆解/子任务/聚合各阶段推进；最终回答仍按内容流呈现。
+CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spinner（原位刷新，完成折叠归档灰色 `✓ 阶段 · 耗时`）、`拆解/子任务` 直接归档摘要行、`tool` 转 `⏺ 工具名(参数)` spinner、`tool-done` 归档着色结果行（✓ 绿 / ✗ 红，`+N/-M 行` diff 着色）；最终回答仍按内容流逐 token 呈现打字机效果。
 
-**测试**：`MultiAgentGraphAgentTest`（mock Registry/ChatClient 固定返回，断言进度阶段时序与子任务事件数量）+ `ChatServiceImplTest.streamReactive_shouldMapProgressRowToProgressEvent`。
+**测试**：`MultiAgentGraphAgentTest`（mock Registry/ChatClient 固定返回，断言进度阶段时序与子任务事件数量）+ `ChatServiceImplTest.streamReactive_shouldMapProgressRowToProgressEvent` + `ToolCallTracerTest`（事件组装/装饰行为/schema 透传）+ `TerminalRendererTest`（工具行渲染）。
 
 ***
 
@@ -227,6 +236,8 @@ CLI 解析到 `event: progress` 打印 `[阶段] 描述`，实时看到编排/�
 ① 工具注入（请求组装期）
    MultiAgentGraphAgent.call() / GeneralAssistantAgent
    → ToolAssignments.forAgent(专家名) → ToolSet{annotated(@Tool), callbacks(ToolCallback)}
+   → 流式路径带工具事件发射器：ToolCallTracer 把回调（含 @Tool 转 ToolCallbacks.from）装饰为
+     「调用前发 tool / 调用后发 tool-done 进度行」的追踪版（schema 原样透传，模型不可见差异）
    → spec.tools(annotated.toArray()) + spec.toolCallbacks(callbacks)
    ⚠️ 服务端硬边界：未分配的工具 schema 不出服务端，模型不可见也无执行注册
 │

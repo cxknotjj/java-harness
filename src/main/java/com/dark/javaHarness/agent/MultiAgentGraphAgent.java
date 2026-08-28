@@ -145,10 +145,12 @@ public class MultiAgentGraphAgent implements Agent {
 
         Sinks.Many<String> branchEvents = Sinks.many().unicast().onBackpressureBuffer();
         Sinks.Many<String> liveTokens = Sinks.many().unicast().onBackpressureBuffer();
+        // 旁路三：子任务节点内的工具调用起止（专家执行工具时 CLI 展示工具调用行）
+        Sinks.Many<String> toolEvents = Sinks.many().unicast().onBackpressureBuffer();
         CompiledGraph streamingGraph;
         try {
             // 流式拓扑每次执行独立构建（聚合节点绑定本次执行的 token 旁路，保证并发安全）
-            streamingGraph = buildStateGraph(liveTokens, contentSent)
+            streamingGraph = buildStateGraph(liveTokens, contentSent, toolEvents)
                     .compile(CompileConfig.builder()
                             .withLifecycleListener(new BranchProgressListener(
                                     branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX))
@@ -163,11 +165,13 @@ public class MultiAgentGraphAgent implements Agent {
                 .doFinally(sig -> {
                     BranchProgressListener.tryCompleteSerialized(branchEvents);
                     BranchProgressListener.tryCompleteSerialized(liveTokens);
+                    BranchProgressListener.tryCompleteSerialized(toolEvents);
                 });
 
         return mainLine
                 .mergeWith(branchEvents.asFlux())
                 .mergeWith(liveTokens.asFlux())
+                .mergeWith(toolEvents.asFlux())
                 .onErrorResume(e -> {
                     log.warn("[multi-agent] 流式执行异常：{}", safe(e));
                     return Flux.just(ProgressLine.encode("编排", "异常，已回退：" + safe(e)));
@@ -225,7 +229,7 @@ public class MultiAgentGraphAgent implements Agent {
     /* ---------------- StateGraph 构建 ---------------- */
 
     private StateGraph buildStateGraph() throws GraphStateException {
-        return buildStateGraph(null, null);
+        return buildStateGraph(null, null, null);
     }
 
     /**
@@ -234,17 +238,23 @@ public class MultiAgentGraphAgent implements Agent {
      * @param liveTokens  非 null 时聚合节点走流式调用并把 token 旁路发射到该 sink（含首个 token 前的「聚合」进度行）；
      *                    null 时聚合节点阻塞调用（同步 execute 路径）
      * @param contentSent 流式模式的内容已发射标志（与主干 {@link #toRows} 共享，防重复发射）；可为 null
+     * @param toolEvents  非 null 时子任务节点注入追踪版工具（执行起止经该 sink 发进度行，供 CLI 工具调用行）
      */
     private StateGraph buildStateGraph(Sinks.Many<String> liveTokens,
-                                       AtomicBoolean contentSent) throws GraphStateException {
+                                       AtomicBoolean contentSent,
+                                       Sinks.Many<String> toolEvents) throws GraphStateException {
         StateGraph g = new StateGraph();
+        // 子任务工具事件发射器：并行节点可能同时回调，经 Sink 锁串行化
+        java.util.function.Consumer<String> toolEmitter = toolEvents == null ? null
+                : row -> BranchProgressListener.tryEmitSerialized(toolEvents, row);
 
         // lead：拆解复杂目标为多条子任务
         g.addNode(NODE_LEAD, AsyncNodeAction.node_async(this::lead));
         // 子任务池：固定 MAX_SUBTASKS 个并行节点
         for (int i = 0; i < MAX_SUBTASKS; i++) {
             final int idx = i;
-            g.addNode(subtaskName(idx), AsyncNodeAction.node_async(state -> subtask(state, idx)));
+            g.addNode(subtaskName(idx),
+                    AsyncNodeAction.node_async(state -> subtask(state, idx, toolEmitter)));
         }
         // 聚合：收集各子任务结果生成最终回答（流式模式逐 token 旁路推送）
         g.addNode(NODE_AGGREGATE,
@@ -295,13 +305,14 @@ public class MultiAgentGraphAgent implements Agent {
     }
 
     /** 子任务节点：读 subtask_i 与指派的 subtaskAgent_i，若存在则调用对应专家 ChatClient 生成 result_i。 */
-    private Map<String, Object> subtask(OverAllState state, int idx) {
+    private Map<String, Object> subtask(OverAllState state, int idx,
+                                        java.util.function.Consumer<String> toolEmitter) {
         String task = state.value(K_SUBTASK_PREFIX + idx, String.class).orElse(null);
         if (task == null || task.isBlank()) {
             return new HashMap<>(); // lead 未设置该子任务 → 快速短路
         }
         String expert = state.value(K_SUBTASK_AGENT_PREFIX + idx, String.class).orElse(null);
-        String result = predictSubtask(task, expert);
+        String result = predictSubtask(task, expert, toolEmitter);
         Map<String, Object> updates = new HashMap<>();
         updates.put(K_RESULT_PREFIX + idx, result);
         log.info("[multi-agent][subtask-{}] 完成（专家={}），结果长度={}", idx, expert, result.length());
@@ -400,12 +411,13 @@ public class MultiAgentGraphAgent implements Agent {
         return raw;
     }
 
-    private String predictSubtask(String task, String expert) {
+    private String predictSubtask(String task, String expert,
+                                  java.util.function.Consumer<String> toolEmitter) {
         // 未指派（lead 输出旧格式或漏 agent 字段）→ 回退 general：通用兜底且持有全量工具
         String resolved = (expert == null || expert.isBlank())
                 ? AgentConstants.DEFAULT_AGENT : expert;
         String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。";
-        return chatCaller.call(resolved, persona, task);
+        return chatCaller.call(resolved, persona, task, toolEmitter);
     }
 
     private String predictAggregate(List<String> results) {
