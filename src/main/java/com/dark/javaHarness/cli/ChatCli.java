@@ -76,10 +76,14 @@ public class ChatCli {
                 break;
             } else if ("/help".equals(line)) {
                 System.out.println("  直接输入文本与 AI 聊天（默认由服务端智能分流：简单→general / 复杂→multi-agent）");
+                System.out.println("  /new         新建会话（后续对话使用新上下文，旧会话保留）");
                 System.out.println("  /agent <id>  切换到指定 Agent（agent 表主键，此后不走分流）");
                 System.out.println("  /agent off   取消指定，恢复服务端自动分流");
                 System.out.println("  /agent       查看当前 Agent");
                 System.out.println("  /exit        退出");
+                continue;
+            } else if ("/new".equals(line)) {
+                handleNewSession();
                 continue;
             } else if (line.startsWith("/agent")) {
                 handleAgentCommand(line);
@@ -102,6 +106,17 @@ public class ChatCli {
             }
         } catch (IOException e) {
             System.out.println("获取会话列表失败（将新建会话）: " + e.getMessage());
+        }
+    }
+
+    /** 处理 /new 命令：调用服务端新建空会话并切换当前会话（旧会话保留，可随时通过会话列表找回） */
+    private void handleNewSession() {
+        try {
+            String newId = api.createSession();
+            this.sessionId = newId;
+            System.out.println("已开启新会话 " + newId + "（后续对话不再携带旧会话上下文）");
+        } catch (IOException e) {
+            System.out.println("新建会话失败: " + e.getMessage());
         }
     }
 

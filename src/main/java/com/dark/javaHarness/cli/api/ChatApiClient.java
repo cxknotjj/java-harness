@@ -139,4 +139,24 @@ public class ChatApiClient {
             return view.sessions().get(0).id();
         }
     }
+
+    /**
+     * 调用 POST /api/harness/sessions 新建空会话。
+     *
+     * @return 新会话的 sessionId
+     * @throws IOException 网络错误，或非 2xx 响应（消息含 HTTP 状态码与响应体）
+     */
+    public String createSession() throws IOException {
+        Request request = new Request.Builder()
+                .url(baseUrl + "/api/harness/sessions")
+                .post(RequestBody.create(new byte[0], null))
+                .build();
+        try (Response resp = http.newCall(request).execute()) {
+            String body = resp.body().string();
+            if (!resp.isSuccessful()) {
+                throw new IOException("HTTP " + resp.code() + ": " + body);
+            }
+            return mapper.readTree(body).path("sessionId").asText();
+        }
+    }
 }

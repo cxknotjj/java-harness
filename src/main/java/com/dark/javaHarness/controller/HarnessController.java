@@ -5,6 +5,7 @@ import com.dark.javaHarness.domain.dto.AgentsView;
 import java.util.List;
 import com.dark.javaHarness.domain.dto.GoalView;
 import com.dark.javaHarness.domain.dto.GoalsView;
+import com.dark.javaHarness.domain.dto.SessionCreatedView;
 import com.dark.javaHarness.domain.dto.SessionPageView;
 import com.dark.javaHarness.domain.dto.SubmitView;
 import com.dark.javaHarness.service.AgentService;
@@ -45,6 +46,16 @@ public class HarnessController {
     public SessionPageView sessions(@RequestParam(defaultValue = "1") long page,
                                     @RequestParam(defaultValue = "10") long size) {
         return SessionPageView.from(sessionService.page(page, size));
+    }
+
+    /**
+     * 新建空会话：立即建档返回 sessionId，后续聊天请求携带该 id 延续上下文。
+     * 会话名默认占位「新会话」，最近提问由首条消息的写回流程更新。
+     */
+    @PostMapping("/sessions")
+    public SessionCreatedView createSession(@RequestParam(defaultValue = "新会话") String name) {
+        String sessionId = sessionService.createSession("cli", name);
+        return new SessionCreatedView(sessionId, name);
     }
 
     /** 提交一个目标给指定 Agent 异步执行 */
