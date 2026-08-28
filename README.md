@@ -142,7 +142,7 @@ CLI 是纯 HTTP 客户端，**不监听任何端口**（占用的是你当前的
 ```
 - 直接输入文本 → 与当前 Agent（默认 general）聊天
 - 多轮记忆：自动创建会话，后续请求携带 sessionId 延续上下文
-- `/agent <id>` 切换到指定 Agent（agent 表主键）、`/agent` 查看当前、`/help` `/exit` 帮助/退出
+- `/new [名称]` 新建会话并切换（旧会话保留）；`/agent <id>` 切换到指定 Agent（agent 表主键）、`/agent` 查看当前、`/help` `/exit` 帮助/退出
 
 ### 3. REST 直接聊天（无需 CLI）
 
@@ -171,6 +171,7 @@ $env:QWEN_API = "sk-你的key"
 | GET | `/api/harness/goals` | 目标（含聊天记录）与状态 |
 | GET | `/api/harness/goals/{id}` | 查询单个目标状态 |
 | POST | `/api/harness/submit?agent=general&objective=...` | 提交一个异步目标 |
+| POST | `/api/harness/sessions` | 新建会话（可选 `name`，默认「新会话」），返回 sessionId/name |
 | POST | `/api/chat` | 同步聊天：`{"message":"你好","agentId":1}` |
 | POST | `/api/chat/stream` | 流式聊天（SSE）：同请求体，逐 token 推送 |
 
@@ -226,7 +227,9 @@ Harness 作为请求的执行外壳，统一从应用层接入，经上下文组
    │       直接单次调用大模型（同步 call() / 响应式 stream() 真·逐 token 推送，含会话记忆）
    └─ 场景 B：问题复杂（搜索 / 代码 / 多步骤处理）
          → 多 Agent 编排链路（spring-ai-alibaba-graph-core StateGraph）：
-           Lead Agent 拆解 → 子 Agent 并行执行 → 聚合
+           Lead Agent 按难度拆解（至多 4 条、禁凑数）→ 子 Agent 并行执行 → 聚合
+           子任务按专家查 agent 表配置取客户端，并按 ToolAssignments 注入工具
+           （沙箱执行/文件/浏览器 + 网页抓取，未分配的工具对模型不可见）
            生命周期钩子旁路实时推送各阶段进度（event: progress SSE）
 
 4. 统一出口
@@ -237,7 +240,7 @@ Harness 作为请求的执行外壳，统一从应用层接入，经上下文组
 
 ## 运行测试
 
-项目包含单元测试（基于 JUnit 5 + Mockito，不依赖真实数据库 / 网络 / API Key；当前 10 个测试类 / 50 用例全绿）：
+项目包含单元测试（基于 JUnit 5 + Mockito，不依赖真实数据库 / 网络 / API Key；当前 11 个测试类 / 75 用例全绿）：
 
 ```bash
 mvn -s .mvn/settings.xml test
@@ -253,7 +256,9 @@ mvn -s .mvn/settings.xml test
 | `ContextAssemblingAdvisorTest` | 上下文组装：token 预算裁剪、role 归一化边界 |
 | `ChatServiceImplTest` | 多轮记忆、SSE 契约（progress/meta/error 单元素成对）、内容换行转义 |
 | `GeneralAssistantAgentTest` | 路径 A：逐 token 渐进发射（防伪流式回归）、同步 execute |
-| `MultiAgentGraphAgentTest` | 路径 B：StateGraph 编排闭环、进度阶段时序（防死锁/丢事件回归） |
+| `MultiAgentGraphAgentTest` | 路径 B：StateGraph 编排闭环、进度阶段时序（防死锁/丢事件回归）、专家派遣与白名单回退、流式进度事件次序 |
 | `ProgressLineTest` | 进度线协议编解码 |
+| `ToolAssignmentsTest` | 工具分配：双通道注入、专家分配语义、未登记专家空集不触发沙箱初始化 |
+| `WebToolsTest` | 网页抓取：HTML→纯文本、协议白名单（http/https） |
 
 > 注意：`JavaHarnessApplicationTests` 是 `@SpringBootTest`，会尝试连接本机 MySQL；在无数据库环境运行该单个类可能因连接失败而报错（其余业务测试不受影响）。
