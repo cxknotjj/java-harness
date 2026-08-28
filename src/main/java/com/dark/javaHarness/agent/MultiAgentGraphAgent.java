@@ -123,10 +123,16 @@ public class MultiAgentGraphAgent implements Agent {
     }
 
     /**
-     * 流式执行复杂目标：stream 主干帧 + 生命周期钩子旁路 双通道。
+     * 流式执行复杂目标：stream 主干帧 + 双旁路（生命周期钩子 + 聚合 token）。
      *
      * <p>主干：{@link CompiledGraph#stream(Map)} 帧 → {@link #toRows} 行；
-     * 旁路：{@link BranchProgressListener} 补齐 stream 合并掉的并行分支「子任务完成」事件。
+     * 旁路一：{@link BranchProgressListener} 补齐 stream 合并掉的并行分支「子任务完成」事件；
+     * 旁路二：聚合节点内逐 token 实时推送最终回答（含首个 token 前的「聚合」进度行）——
+     * 图节点是同步动作，token 在节点内经回调旁路发射，节点返回时 state 已含完整内容，
+     * 主干对已推送内容的帧不再重复发射（见 {@link #toRows} 的 contentSent 短路）。
+     *
+     * <p>子任务节点保持阻塞调用：多子任务并行执行，token 直推会交错乱序；用户体感关键
+     * 在最终回答的打字机效果，由聚合节点承担。lead 产出为 JSON 中间产物，不推送 token。
      *
      * <p>⚠️ 死锁教训：关闸 {@code doFinally} 必须挂在 mergeWith **之前**的主干段上——
      * merge 要求两源都终结才向下传 complete，关闸挂 merge 之后会循环等待、永不收尾。
@@ -138,12 +144,15 @@ public class MultiAgentGraphAgent implements Agent {
         AtomicBoolean contentSent = new AtomicBoolean(false);
 
         Sinks.Many<String> branchEvents = Sinks.many().unicast().onBackpressureBuffer();
+        Sinks.Many<String> liveTokens = Sinks.many().unicast().onBackpressureBuffer();
         CompiledGraph streamingGraph;
         try {
-            streamingGraph = stateGraph.compile(CompileConfig.builder()
-                    .withLifecycleListener(new BranchProgressListener(
-                            branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX))
-                    .build());
+            // 流式拓扑每次执行独立构建（聚合节点绑定本次执行的 token 旁路，保证并发安全）
+            streamingGraph = buildStateGraph(liveTokens, contentSent)
+                    .compile(CompileConfig.builder()
+                            .withLifecycleListener(new BranchProgressListener(
+                                    branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX))
+                            .build());
         } catch (GraphStateException e) {
             throw new IllegalStateException("编译带监听器的 StateGraph 失败", e);
         }
@@ -151,9 +160,14 @@ public class MultiAgentGraphAgent implements Agent {
         // 关闸在 merge 之前（见死锁说明）；complete 与 next 共用同一把锁，防迟到事件竞争
         Flux<String> mainLine = streamingGraph.stream(input)
                 .concatMap(out -> toRows(out, goal.objective(), contentSent))
-                .doFinally(sig -> BranchProgressListener.tryCompleteSerialized(branchEvents));
+                .doFinally(sig -> {
+                    BranchProgressListener.tryCompleteSerialized(branchEvents);
+                    BranchProgressListener.tryCompleteSerialized(liveTokens);
+                });
 
-        return mainLine.mergeWith(branchEvents.asFlux())
+        return mainLine
+                .mergeWith(branchEvents.asFlux())
+                .mergeWith(liveTokens.asFlux())
                 .onErrorResume(e -> {
                     log.warn("[multi-agent] 流式执行异常：{}", safe(e));
                     return Flux.just(ProgressLine.encode("编排", "异常，已回退：" + safe(e)));
@@ -184,6 +198,10 @@ public class MultiAgentGraphAgent implements Agent {
             return Flux.just(ProgressLine.encode("拆解", n + " 个子任务已就绪"));
         }
         if (NODE_AGGREGATE.equals(node)) {
+            // 流式模式：token 已由聚合节点内旁路实时推送，此处不再重复发射
+            if (contentSent.get()) {
+                return Flux.empty();
+            }
             String fin = state.value(K_FINAL, String.class).orElse(null);
             if (fin != null && !fin.isBlank()) {
                 contentSent.set(true);
@@ -207,6 +225,18 @@ public class MultiAgentGraphAgent implements Agent {
     /* ---------------- StateGraph 构建 ---------------- */
 
     private StateGraph buildStateGraph() throws GraphStateException {
+        return buildStateGraph(null, null);
+    }
+
+    /**
+     * 构建「lead → 并行子任务 → 聚合」拓扑。
+     *
+     * @param liveTokens  非 null 时聚合节点走流式调用并把 token 旁路发射到该 sink（含首个 token 前的「聚合」进度行）；
+     *                    null 时聚合节点阻塞调用（同步 execute 路径）
+     * @param contentSent 流式模式的内容已发射标志（与主干 {@link #toRows} 共享，防重复发射）；可为 null
+     */
+    private StateGraph buildStateGraph(Sinks.Many<String> liveTokens,
+                                       AtomicBoolean contentSent) throws GraphStateException {
         StateGraph g = new StateGraph();
 
         // lead：拆解复杂目标为多条子任务
@@ -216,8 +246,9 @@ public class MultiAgentGraphAgent implements Agent {
             final int idx = i;
             g.addNode(subtaskName(idx), AsyncNodeAction.node_async(state -> subtask(state, idx)));
         }
-        // 聚合：收集各子任务结果生成最终回答
-        g.addNode(NODE_AGGREGATE, AsyncNodeAction.node_async(this::aggregate));
+        // 聚合：收集各子任务结果生成最终回答（流式模式逐 token 旁路推送）
+        g.addNode(NODE_AGGREGATE,
+                AsyncNodeAction.node_async(state -> aggregate(state, liveTokens, contentSent)));
 
         // 并联：lead → 同时派发到所有子任务节点（addEdge(from, List) 并行扇出）
         List<String> subtasks = new ArrayList<>();
@@ -279,6 +310,16 @@ public class MultiAgentGraphAgent implements Agent {
 
     /** 聚合：读 result_0..result_{n-1}（按 subtaskCount），调用 ChatClient 汇总为 final。 */
     private Map<String, Object> aggregate(OverAllState state) {
+        return aggregate(state, null, null);
+    }
+
+    /**
+     * 聚合节点实现：非流式（liveTokens=null）阻塞调用；流式时逐 token 旁路发射，
+     * 首个内容 token 前先发「聚合」进度行，失败回退阻塞调用（未推过 token 时主干兜底发完整内容）。
+     */
+    private Map<String, Object> aggregate(OverAllState state,
+                                          Sinks.Many<String> liveTokens,
+                                          AtomicBoolean contentSent) {
         int n = state.value(K_SUBTASK_COUNT, Integer.class).orElse(0);
         List<String> results = new ArrayList<>();
         for (int i = 0; i < n; i++) {
@@ -290,13 +331,44 @@ public class MultiAgentGraphAgent implements Agent {
         if (results.isEmpty()) {
             // 子任务全失败：兜底
             finalAnswer = state.value(K_FINAL, String.class).orElse("（未生成最终回答）");
-        } else {
+        } else if (liveTokens == null) {
             finalAnswer = predictAggregate(results);
+        } else {
+            finalAnswer = predictAggregateStreaming(results, liveTokens, contentSent);
         }
         Map<String, Object> updates = new HashMap<>();
         updates.put(K_FINAL, finalAnswer);
         log.info("[multi-agent][aggregate] 汇总 {} 个子任务结果", results.size());
         return updates;
+    }
+
+    /**
+     * 流式聚合：首个内容 token 前推「聚合」进度行，随后逐 token 实时发射；
+     * 流式异常时回退阻塞调用——已推出过 token 则以已收内容为准（避免内容重复），
+     * 一个 token 都没推过则整段回退（主干 toRows 会兜底发聚合进度+完整内容）。
+     */
+    private String predictAggregateStreaming(List<String> results,
+                                             Sinks.Many<String> liveTokens,
+                                             AtomicBoolean contentSent) {
+        BranchProgressListener.tryEmitSerialized(liveTokens,
+                ProgressLine.encode("聚合", "汇总子任务结果，生成最终回答"));
+        StringBuilder collected = new StringBuilder();
+        try {
+            chatCaller.stream(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT,
+                    aggregateUserPrompt(results),
+                    token -> {
+                        if (token == null || token.isEmpty()) {
+                            return;
+                        }
+                        collected.append(token);
+                        contentSent.set(true);
+                        BranchProgressListener.tryEmitSerialized(liveTokens, token);
+                    });
+            return collected.toString();
+        } catch (Exception e) {
+            log.warn("[multi-agent][aggregate] 流式聚合失败，回退阻塞调用：{}", safe(e));
+            return collected.length() > 0 ? collected.toString() : predictAggregate(results);
+        }
     }
 
     /* ---------- ChatClient 单次调用 ---------- */
@@ -337,11 +409,16 @@ public class MultiAgentGraphAgent implements Agent {
     }
 
     private String predictAggregate(List<String> results) {
+        return chatCaller.call(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, aggregateUserPrompt(results));
+    }
+
+    /** 聚合请求的 user 内容：各子任务结果顺序拼接（阻塞/流式两版共用） */
+    private static String aggregateUserPrompt(List<String> results) {
         StringBuilder sb = new StringBuilder("以下是各子任务结果，请汇总为一份完整、连贯的最终回答：\n");
         for (int i = 0; i < results.size(); i++) {
             sb.append("【子任务").append(i + 1).append("】\n").append(results.get(i)).append("\n\n");
         }
-        return chatCaller.call(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, sb.toString());
+        return sb.toString();
     }
 
     /**

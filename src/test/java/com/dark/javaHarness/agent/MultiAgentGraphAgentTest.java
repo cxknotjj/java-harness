@@ -25,6 +25,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClient.CallResponseSpec;
 import org.springframework.ai.chat.client.ChatClient.ChatClientRequestSpec;
+import org.springframework.ai.chat.client.ChatClient.StreamResponseSpec;
+import reactor.core.publisher.Flux;
 
 /**
  * MultiAgentGraphAgent 单测：
@@ -46,6 +48,8 @@ class MultiAgentGraphAgentTest {
     @Mock
     private CallResponseSpec responseSpec;
     @Mock
+    private StreamResponseSpec streamSpec;
+    @Mock
     private AgentService agentService;
     @Mock
     private ToolAssignments toolAssignments;
@@ -66,6 +70,9 @@ class MultiAgentGraphAgentTest {
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.call()).thenReturn(responseSpec);
         when(responseSpec.content()).thenReturn(content);
+        // 流式执行时聚合节点走 stream 通道（lead/子任务仍走 call）
+        lenient().when(requestSpec.stream()).thenReturn(streamSpec);
+        lenient().when(streamSpec.content()).thenReturn(Flux.just(content));
     }
 
     /** 独立 stub 的客户端：专家子任务使用，内容固定（避免与共享 mock 的 stub 冲突） */
@@ -73,11 +80,14 @@ class MultiAgentGraphAgentTest {
         ChatClient c = mock(ChatClient.class);
         ChatClientRequestSpec rs = mock(ChatClientRequestSpec.class);
         CallResponseSpec cs = mock(CallResponseSpec.class);
+        StreamResponseSpec ss = mock(StreamResponseSpec.class);
         when(c.prompt()).thenReturn(rs);
         when(rs.system(anyString())).thenReturn(rs);
         when(rs.user(anyString())).thenReturn(rs);
         when(rs.call()).thenReturn(cs);
         when(cs.content()).thenReturn(content);
+        lenient().when(rs.stream()).thenReturn(ss);
+        lenient().when(ss.content()).thenReturn(Flux.just(content));
         return c;
     }
 
@@ -180,6 +190,40 @@ class MultiAgentGraphAgentTest {
         assertTrue(last.content(), "流应以最终回答内容行收尾");
         assertEquals(fixedContent(), rows.get(rows.size() - 1), "内容行应为聚合产出的最终回答");
         assertEquals("聚合", parsed.get(parsed.size() - 2).stage(), "内容行前应紧邻聚合进度行");
+    }
+
+    /** 聚合节点逐 token：多段 token 按序发射、拼接=完整内容，「聚合」进度在首 token 之前，主干不重复发射 */
+    @Test
+    void executeStreamReactive_streamsFinalAnswerTokenByToken() {
+        stubChat(fixedContent());
+        // 覆盖聚合节点的 stream 内容：三段 token（含一个空片段，模拟真实流的空 token）
+        when(streamSpec.content())
+                .thenReturn(Flux.just("最终回答", "", "第二段", "。"));
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+
+        java.util.List<String> rows = agent
+                .executeStreamReactive(new Goal("g8", "调研竞品并输出报告"))
+                .collectList()
+                .block();
+
+        assertNotNull(rows);
+        // 尾部应为：... 聚合进度, token1, token2, token3（空 token 不发射）
+        int n = rows.size();
+        assertEquals("最终回答", rows.get(n - 3), "token1 应倒数第三");
+        assertEquals("第二段", rows.get(n - 2), "token2 应倒数第二（空 token 被跳过）");
+        assertEquals("。", rows.get(n - 1), "token3 应收尾");
+        ProgressLine.StageRow agg = ProgressLine.decode(rows.get(n - 4));
+        assertNotNull(agg, "首 token 前应有聚合进度行");
+        assertEquals("聚合", agg.stage(), "聚合进度应紧邻首 token 之前");
+
+        // 全流拼接的内容 = token 序列拼接（主干不重复发完整内容）
+        StringBuilder content = new StringBuilder();
+        for (String r : rows) {
+            if (r.isEmpty() || r.charAt(0) != ProgressLine.MARK) {
+                content.append(r);
+            }
+        }
+        assertEquals("最终回答第二段。", content.toString(), "所有内容行拼接应为完整最终回答");
     }
 
     /** 解析行容器：stage（进度行非空，内容行为 null）+ 是否内容行 */

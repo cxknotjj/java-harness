@@ -45,6 +45,34 @@ final class AgentChatCaller {
      * @param user           任务指令（纯任务内容，不含角色设定）
      */
     String call(String forAgent, String fallbackSystem, String user) {
+        return buildSpec(forAgent, fallbackSystem, user).call().content();
+    }
+
+    /**
+     * 流式 ChatClient 调用：请求组装与 {@link #call} 完全一致，但走 stream 通道——
+     * 每个 token 到达即回调 {@code onToken}，方法阻塞至流结束并返回完整内容。
+     *
+     * <p>供图节点（如聚合）在生成过程中实时向外推送 token；调用方负责异常处理
+     * （本方法不做降级，流式失败直接抛出，由调用方回退 {@link #call}）。
+     *
+     * @param onToken 每个 token 片段到达时的回调（可能包含空串）
+     */
+    String stream(String forAgent, String fallbackSystem, String user,
+                  java.util.function.Consumer<String> onToken) {
+        StringBuilder collected = new StringBuilder();
+        buildSpec(forAgent, fallbackSystem, user)
+                .stream()
+                .content()
+                .doOnNext(token -> {
+                    collected.append(token);
+                    onToken.accept(token);
+                })
+                .blockLast();
+        return collected.toString();
+    }
+
+    /** 组装请求（查表配置 → 取客户端 → system/user → 请求级 model → 工具注入），call/stream 共用 */
+    private ChatClient.ChatClientRequestSpec buildSpec(String forAgent, String fallbackSystem, String user) {
         AgentConfig config = agentService == null ? null
                 : agentService.getAgentConfig(forAgent).orElse(null);
         String model = config != null ? config.model() : null;
@@ -71,6 +99,6 @@ final class AgentChatCaller {
         if (!toolSet.callbacks().isEmpty()) {
             spec.toolCallbacks(toolSet.callbacks().toArray(new ToolCallback[0]));
         }
-        return spec.call().content();
+        return spec;
     }
 }

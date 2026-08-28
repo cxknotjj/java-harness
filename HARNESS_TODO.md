@@ -51,7 +51,7 @@
     | `writer`      | 汇总撰写                | qwen-max      | 把多方结果整合成结构化报告（标题/要点/结论），忠实引用子任务产出             | 无            |
     | `general`     | 通用兜底（已存在）           | 现配置           | 通用助手，未匹配到专家时由 lead 回退指派                       | 无            |
   - 落地顺序：先插 `multi-agent` 行解 P0 配置退回 → 再建专家行（prompt 可先简配）→ 最后打通 lead 按 `agentId` 派遣；未识别的 agentId 一律回退 `general`。
-- [ ] **Graph 内逐 token 流式**：复杂路径当前只做到「阶段进度实时推送 + 聚合结果一次性输出」，子任务节点仍是阻塞单次调用；演进为 Graph 各节点产出逐 token 流。
+- [x] **Graph 内逐 token 流式**：聚合节点（最终回答）已改为流式调用——首个 token 前推「聚合」进度行，随后逐 token 经旁路 sink 实时发射，主干对已推送内容不再重复发射（contentSent 短路）；流式失败回退阻塞调用（已推部分 token 以已收内容为准，未推过则主干兜底发完整内容）。**权衡说明**：子任务节点保持阻塞调用——多子任务并行执行时 token 直推会交错乱序，用户体感关键在最终回答的打字机效果；子任务 token 分区渲染归入「CLI 输出优化」条目。lead 产出为 JSON 中间产物不推送。验证：单测新增多 token 时序用例全绿；真实 LLM 端到端——「聚合」进度后 139 个 token 片段逐段到达，meta SUCCEEDED。`AgentChatCaller` 拆出 buildSpec 供 call/stream 共用（新增 stream(forAgent, fallback, user, onToken)）。
 - [ ] **并发断连的可观测处理**：多 Agent 并发执行期间若客户端断开（超时/退出），Tomcat 会报 `AsyncRequestNotUsableException`（Connection reset by peer）。根因（CLI 超时过短、伪流式等待）已修复，服务端还需把「下游断开」降噪为 warn 并及时终止编排，避免无谓消耗。
 - [ ] 为复杂路径注册 Checkpointer（可选，落库断点）——如需再评估。
 
