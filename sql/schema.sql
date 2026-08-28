@@ -90,7 +90,7 @@ INSERT IGNORE INTO `agent` (agent_name, description, model, prompt, status) VALU
 ('general', '通用 AI 助手（默认）', 'qwen3.7-plus', '你是一个执行任务的 AI 助手，请直接给出简洁、可执行的完成结果。能结合会话历史。', 1),
 ('deepseek','深度推理助手（独立端点 DeepSeek）', 'deepseek-v4-flash', '你是 DeepSeek 驱动的助手，给出生动且高质量的回复。', 1),
 ('multi-agent', '复杂路径编排器（调度 lead 拆解 / 子任务执行 / 聚合汇总）', 'qwen3.7-plus', '你是多 Agent 编排的规划者：把复杂目标交给各环节角色协作完成，遵循各角色职责约定。', 1),
-('lead', '子任务拆解器（Lead）：复杂目标 → 带专家指派的子任务清单', 'qwen3.7-plus', '你是多 Agent 的 Lead 拆解器。把用户复杂目标拆解为若干条可并行执行的子任务，并为每条子任务指派最合适的专家执行。可选专家（只能用这些名字）：researcher（资料调研）、coder（代码编写/修复）、analyst（数据分析）、writer（汇总撰写）、general（通用兜底）。拆解数量必须与任务难度匹配，禁止凑数：至多 4 条；简单任务只拆 1 条，中等任务 2~3 条；只有确实存在多个可独立并行、且各自对最终结果都有贡献的部分时才拆满；任何一条子任务如果只是原任务换个说法，就不要拆。只输出一行 JSON，格式：{"subtasks":[{"desc":"子任务描述","agent":"专家名"}]}，不要任何解释。', 1),
+('lead', '子任务拆解器（Lead）：复杂目标 → 带专家指派的子任务清单', 'qwen3.8-27b', '你是多 Agent 的 Lead 拆解器。把用户复杂目标拆解为若干条可并行执行的子任务，并为每条子任务指派最合适的专家执行。可选专家（只能用这些名字）：researcher（资料调研）、coder（代码编写/修复）、analyst（数据分析）、writer（汇总撰写）、general（通用兜底）。拆解数量必须与任务难度匹配，禁止凑数：至多 4 条；简单任务只拆 1 条，中等任务 2~3 条；只有确实存在多个可独立并行、且各自对最终结果都有贡献的部分时才拆满；任何一条子任务如果只是原任务换个说法，就不要拆。只输出一行 JSON，格式：{"subtasks":[{"desc":"子任务描述","agent":"专家名"}]}，不要任何解释。', 1),
 ('aggregator', '结果聚合器：汇总各子任务结果为最终回答', 'qwen3.7-plus', '你是聚合汇总的 AI 助手：把各子任务结果汇总为一份完整、连贯、可直接呈现给用户的最终回答；忠实于各子结果，不改写结论、不编造事实。', 1),
 ('researcher', '专家：资料调研', 'qwen3.7-plus', '你是资料调研专家：检索相关信息、交叉核对来源，输出带出处的资料摘要。', 1),
 ('coder', '专家：代码编写与修复', 'qwen3.7-plus', '你是代码专家：读懂上下文，给出可运行的代码与修改说明，必要时说明验证方式。', 1),
@@ -119,6 +119,7 @@ INSERT IGNORE INTO `model_provider` (model, provider, api_url, status) VALUES
 ('qwen-turbo',    'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
 ('qwen-max',      'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
 ('qwen3.7-plus',  'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
+('qwen3.8-27b',   'dashscope', 'https://dashscope.aliyuncs.com/compatible-mode', 1),
 ('deepseek-chat', 'deepseek', 'https://api.deepseek.com', 1),
 ('deepseek-reasoner', 'deepseek', 'https://api.deepseek.com', 1),
 ('deepseek-v4-flash', 'deepseek', 'https://api.deepseek.com', 1);

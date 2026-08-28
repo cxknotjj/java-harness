@@ -27,8 +27,11 @@ public class LlmRouteJudge implements RouteJudge {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    /** 判断用模型 key：注册表未匹配时使用默认 DashScope 客户端（Registry 模式兜底）。 */
-    private static final String ROUTE_MODEL = "route-judge";
+    /**
+     * 判断用模型 key：命中注册表（model_provider 有对应行）则用轻量模型提速，
+     * 未匹配时使用默认 DashScope 客户端兜底（Registry 模式兜底）。
+     */
+    private static final String ROUTE_MODEL = "qwen3.8-27b";
 
     private static final String SYSTEM_PROMPT =
             "你是 Harness 的主路由判断器。判断一条用户请求应该走「简单」还是「复杂」路径。\n"
