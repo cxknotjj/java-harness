@@ -1,5 +1,6 @@
 -- ============================================================
--- javaHarness - Schema 初始化脚本
+-- V1 - Schema 初始化：业务表全量建表 + 种子数据（由 spring.sql.init 时代的 sql/schema.sql 平移而来）
+-- 全部使用 CREATE TABLE IF NOT EXISTS / INSERT IGNORE，幂等。
 -- ============================================================
 
 -- 目标表：持久化 Goal 的生命周期状态（由 GoalServiceImpl 读写）
@@ -20,8 +21,6 @@ CREATE TABLE IF NOT EXISTS goal (
 -- content 以 JSON 形式存储该会话的【完整会话上下文】：
 -- [{"role":"user","content":"..."},{"role":"assistant","content":"..."},...]
 -- 每轮对话后整体覆盖更新该行。
--- （该表已由人工创建，此处保留幂等定义与实际结构一致；
---   已有环境需手工执行一对一改造，见文末 ALTER 语句）
 -- ============================================================
 CREATE TABLE IF NOT EXISTS session_messages (
     id          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '消息唯一主键ID',
@@ -36,21 +35,13 @@ CREATE TABLE IF NOT EXISTS session_messages (
     UNIQUE KEY uk_session_id (session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='Agent 会话消息表';
 
--- 已有环境的一对一改造（先去重保留每会话最新一行，再加唯一约束）：
--- DELETE m FROM session_messages m
--- JOIN (SELECT session_id, MAX(id) AS keep_id FROM session_messages GROUP BY session_id) k
---   ON m.session_id = k.session_id AND m.id <> k.keep_id;
--- ALTER TABLE session_messages
---   DROP INDEX idx_session_id,
---   ADD UNIQUE KEY uk_session_id (session_id);
-
 -- ============================================================
 -- 会话表：一个会话（session）对应一次与 Agent 的连续对话，
 -- 关联创建者与所属 Agent，软删除用 is_delete 标记。
 -- ============================================================
 CREATE TABLE IF NOT EXISTS `session` (
-    session_id     BIGINT(8)    NOT NULL AUTO_INCREMENT COMMENT '会话ID' ,
-    agent_id       INT(11)      NOT NULL COMMENT '关联的 Agent',
+    session_id     BIGINT       NOT NULL AUTO_INCREMENT COMMENT '会话ID',
+    agent_id       INT          NOT NULL COMMENT '关联的 Agent',
     session_name   VARCHAR(300) NOT NULL COMMENT '会话名称',
     creator        VARCHAR(30)  NOT NULL COMMENT '创建者',
     last_question  VARCHAR(200) NULL COMMENT '最近一次提问',

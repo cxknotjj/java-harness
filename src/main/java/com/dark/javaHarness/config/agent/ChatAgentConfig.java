@@ -5,6 +5,7 @@ import com.dark.javaHarness.agent.MultiAgentGraphAgent;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
+import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -19,6 +20,7 @@ import org.springframework.context.annotation.Lazy;
  *
  * 全部 Agent 统一采用 GeneralAssistantAgent（直接单次调用大模型的简单路径）。
  * 多 Agent 任务编排链路（Spring-AI Graph）由 multiAgent bean 承载，供复杂请求（COMPLEX）使用。
+ * 所有 Agent 共享 LlmCallRecorder：每次 LLM 调用的耗时/token 异步落 llm_call_log（观测层）。
  */
 @Configuration
 public class ChatAgentConfig {
@@ -27,23 +29,29 @@ public class ChatAgentConfig {
     public GeneralAssistantAgent generalAgent(ChatClientRegistry registry,
                                               SessionService memoryStore,
                                               @Lazy AgentService agentService,
-                                              ToolAssignments toolAssignments) {
-        return new GeneralAssistantAgent("general", registry, memoryStore, agentService, toolAssignments);
+                                              ToolAssignments toolAssignments,
+                                              LlmCallRecorder recorder) {
+        return new GeneralAssistantAgent("general", registry, memoryStore, agentService,
+                toolAssignments, recorder);
     }
 
     @Bean
     public GeneralAssistantAgent deepseekAgent(ChatClientRegistry registry,
                                                SessionService memoryStore,
                                                @Lazy AgentService agentService,
-                                               ToolAssignments toolAssignments) {
-        return new GeneralAssistantAgent("deepseek", registry, memoryStore, agentService, toolAssignments);
+                                               ToolAssignments toolAssignments,
+                                               LlmCallRecorder recorder) {
+        return new GeneralAssistantAgent("deepseek", registry, memoryStore, agentService,
+                toolAssignments, recorder);
     }
 
     /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合）。 */
     @Bean
     public MultiAgentGraphAgent multiAgent(ChatClientRegistry registry,
                                            @Lazy AgentService agentService,
-                                           ToolAssignments toolAssignments) {
-        return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService, toolAssignments);
+                                           ToolAssignments toolAssignments,
+                                           LlmCallRecorder recorder) {
+        return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService,
+                toolAssignments, recorder);
     }
 }

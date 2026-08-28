@@ -63,13 +63,13 @@ class MultiAgentGraphAgentTest {
 
     private void stubChat(String content) {
         when(clientRegistry.get(any())).thenReturn(chatClient);
-        when(agentService.getAgentConfig(anyString())).thenReturn(java.util.Optional.empty());
+        when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
         lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.call()).thenReturn(responseSpec);
-        when(responseSpec.content()).thenReturn(content);
+        when(responseSpec.chatResponse()).thenReturn(chatResponseOf(content));
         // 流式执行时聚合节点走 stream 通道（lead/子任务仍走 call）
         lenient().when(requestSpec.stream()).thenReturn(streamSpec);
         lenient().when(streamSpec.content()).thenReturn(Flux.just(content));
@@ -85,16 +85,23 @@ class MultiAgentGraphAgentTest {
         when(rs.system(anyString())).thenReturn(rs);
         when(rs.user(anyString())).thenReturn(rs);
         when(rs.call()).thenReturn(cs);
-        when(cs.content()).thenReturn(content);
+        when(cs.chatResponse()).thenReturn(chatResponseOf(content));
         lenient().when(rs.stream()).thenReturn(ss);
         lenient().when(ss.content()).thenReturn(Flux.just(content));
         return c;
     }
 
+    /** 构造带固定文本的真实 ChatResponse（AgentChatCaller 经 chatResponse() 取内容） */
+    private static org.springframework.ai.chat.model.ChatResponse chatResponseOf(String content) {
+        return new org.springframework.ai.chat.model.ChatResponse(java.util.List.of(
+                new org.springframework.ai.chat.model.Generation(
+                        new org.springframework.ai.chat.messages.AssistantMessage(content))));
+    }
+
     @Test
     void execute_shouldBuildGraphAndReturnFinalAnswer() {
         stubChat(fixedContent());
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         Goal goal = new Goal("g1", "调研竞品并输出报告");
         String reply = agent.execute(goal);
@@ -111,7 +118,7 @@ class MultiAgentGraphAgentTest {
     void execute_returnsNonEmptyForAggregate() {
         // 所有节点统一返回固定 content；lead 解析出 subtasks，聚合把该 content 作为最终回答
         stubChat(fixedContent());
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         String reply = agent.execute(new Goal("g2", "hello"));
 
@@ -123,7 +130,7 @@ class MultiAgentGraphAgentTest {
     @Test
     void executeStreamReactive_emitsProgressRowsAndContent() {
         stubChat(fixedContent());
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         Goal goal = new Goal("g3", "调研竞品并输出报告");
         java.util.List<String> rows = agent.executeStreamReactive(goal).collectList().block();
@@ -144,7 +151,7 @@ class MultiAgentGraphAgentTest {
     @Test
     void executeStreamReactive_streamsStageEventsInOrder() {
         stubChat(fixedContent());
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         java.util.List<String> rows = agent
                 .executeStreamReactive(new Goal("g4", "调研竞品并输出报告"))
@@ -199,7 +206,7 @@ class MultiAgentGraphAgentTest {
         // 覆盖聚合节点的 stream 内容：三段 token（含一个空片段，模拟真实流的空 token）
         when(streamSpec.content())
                 .thenReturn(Flux.just("最终回答", "", "第二段", "。"));
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         java.util.List<String> rows = agent
                 .executeStreamReactive(new Goal("g8", "调研竞品并输出报告"))
@@ -256,7 +263,7 @@ class MultiAgentGraphAgentTest {
         ChatClient analystClient = newStubbedClient("分析结果");
         when(clientRegistry.get(eq("qwen-plus"))).thenReturn(researcherClient);
         when(clientRegistry.get(eq("deepseek-chat"))).thenReturn(analystClient);
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         String reply = agent.execute(new Goal("g5", "调研竞品并统计销量"));
 
@@ -274,7 +281,7 @@ class MultiAgentGraphAgentTest {
     void execute_rejectsUnknownAgentAndFallsBackToDefault() {
         String leadJson = "{\"subtasks\":[{\"desc\":\"任务X\",\"agent\":\"hacker\"}]}";
         stubChat(leadJson);
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         String reply = agent.execute(new Goal("g6", "任务X"));
 
@@ -288,7 +295,7 @@ class MultiAgentGraphAgentTest {
     @Test
     void execute_withoutConfig_usesDefaultClientWithoutModelOption() {
         stubChat(fixedContent());
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         String reply = agent.execute(new Goal("g7", "hello"));
 
@@ -308,7 +315,7 @@ class MultiAgentGraphAgentTest {
         // 独立 stub：lead 的 call() 阻塞在闩锁上，模拟「调用进行中客户端断开」
         java.util.concurrent.CountDownLatch releaseLead = new java.util.concurrent.CountDownLatch(1);
         when(clientRegistry.get(any())).thenReturn(chatClient);
-        when(agentService.getAgentConfig(anyString())).thenReturn(java.util.Optional.empty());
+        when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
         lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
@@ -318,10 +325,10 @@ class MultiAgentGraphAgentTest {
             releaseLead.await(10, java.util.concurrent.TimeUnit.SECONDS);
             return responseSpec;
         });
-        lenient().when(responseSpec.content()).thenReturn(fixedContent());
+        lenient().when(responseSpec.chatResponse()).thenReturn(chatResponseOf(fixedContent()));
         lenient().when(requestSpec.stream()).thenReturn(streamSpec);
         lenient().when(streamSpec.content()).thenReturn(Flux.just(fixedContent()));
-        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         // subscribeOn 让图执行离开测试线程（否则同步图驱动会把 subscribe() 卡在 lead 阻塞上）
         reactor.core.Disposable disposable = agent

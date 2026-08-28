@@ -1,6 +1,7 @@
 package com.dark.javaHarness.service.impl;
 
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
+import com.dark.javaHarness.domain.LlmCallLog;
 import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.service.RouteJudge;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -41,9 +42,12 @@ public class LlmRouteJudge implements RouteJudge {
             + "- complex：需联网搜索、需执行代码、多步骤处理、需拆分为多个子任务（如调研竞品并输出报告、规划并执行一个完整项目）。";
 
     private final ChatClientRegistry clientRegistry;
+    /** LLM 调用观测记录器：judge 调用耗时/token 也落 llm_call_log（agent_name='route-judge'） */
+    private final LlmCallRecorder recorder;
 
-    public LlmRouteJudge(ChatClientRegistry clientRegistry) {
+    public LlmRouteJudge(ChatClientRegistry clientRegistry, LlmCallRecorder recorder) {
         this.clientRegistry = clientRegistry;
+        this.recorder = recorder;
     }
 
     @Override
@@ -52,19 +56,39 @@ public class LlmRouteJudge implements RouteJudge {
             log.info("[route] message为空 -> SIMPLE");
             return RouteDecision.SIMPLE;
         }
+        long start = System.currentTimeMillis();
         try {
             ChatClient client = clientRegistry.get(ROUTE_MODEL);
             String content = client.prompt()
                     .system(SYSTEM_PROMPT)
                     .user(message)
                     .call()
-                    .content();
+                    .chatResponse()
+                    .getResult()
+                    .getOutput()
+                    .getText();
+            record(start, true, null, message);
             return parse(content);
         } catch (Exception e) {
             // 判断失败不阻塞请求，兜底走简单路径
             log.warn("[route] 判断失败，兜底 SIMPLE：{}", safeMessage(e));
+            record(start, false, e, message);
             return RouteDecision.SIMPLE;
         }
+    }
+
+    /** judge 调用观测落库（无会话上下文，sessionId 为空；token 近似估算） */
+    private void record(long start, boolean ok, Exception e, String message) {
+        if (recorder == null) {
+            return;
+        }
+        int promptTokens = LlmCallRecorder.estimateTokens(SYSTEM_PROMPT)
+                + LlmCallRecorder.estimateTokens(message);
+        String msg = e == null ? null
+                : (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+        recorder.record(new LlmCallLog(null, "route-judge", ROUTE_MODEL, false, ok,
+                promptTokens, null, null, true,
+                System.currentTimeMillis() - start, msg));
     }
 
     /** 解析 LLM 返回内容中的 route 字段；非法/缺失一律兜底 SIMPLE。 */

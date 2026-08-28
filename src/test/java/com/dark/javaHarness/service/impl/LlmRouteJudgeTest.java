@@ -7,6 +7,7 @@ import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.RouteDecision;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -14,6 +15,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClient.CallResponseSpec;
 import org.springframework.ai.chat.client.ChatClient.ChatClientRequestSpec;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
 
 /**
  * LlmRouteJudge 单测：
@@ -34,15 +38,16 @@ class LlmRouteJudgeTest {
 
     private LlmRouteJudge judge;
 
-    /** 组装：registry.get(route-judge) 返回 mock client，prompt 链式 stub 到 content() */
+    /** 组装：registry.get(route-judge) 返回 mock client，prompt 链式 stub 到 chatResponse() */
     private void stubContent(String content) {
         when(clientRegistry.get(anyString())).thenReturn(chatClient);
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.call()).thenReturn(responseSpec);
-        when(responseSpec.content()).thenReturn(content);
-        judge = new LlmRouteJudge(clientRegistry);
+        when(responseSpec.chatResponse()).thenReturn(new ChatResponse(
+                List.of(new Generation(new AssistantMessage(content)))));
+        judge = new LlmRouteJudge(clientRegistry, null);
     }
 
     @Test
@@ -76,14 +81,14 @@ class LlmRouteJudgeTest {
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.call()).thenThrow(new IllegalStateException("llm down"));
-        judge = new LlmRouteJudge(clientRegistry);
+        judge = new LlmRouteJudge(clientRegistry, null);
 
         assertEquals(RouteDecision.SIMPLE, judge.judge("你好"), "调用异常应兜底 SIMPLE 而不抛出");
     }
 
     @Test
     void judge_whenMessageBlank_shouldReturnSimpleWithoutCall() {
-        judge = new LlmRouteJudge(clientRegistry);
+        judge = new LlmRouteJudge(clientRegistry, null);
         assertEquals(RouteDecision.SIMPLE, judge.judge("  "));
         assertEquals(RouteDecision.SIMPLE, judge.judge(null));
     }

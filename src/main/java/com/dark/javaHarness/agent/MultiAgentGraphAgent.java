@@ -11,6 +11,7 @@ import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentService;
+import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -63,6 +64,7 @@ public class MultiAgentGraphAgent implements Agent {
 
     /** 状态键 */
     private static final String K_OBJECTIVE = "objective";
+    private static final String K_SESSION_ID = "sessionId";
     private static final String K_SUBTASK_COUNT = "subtaskCount";
     private static final String K_SUBTASK_PREFIX = "subtask_";
     private static final String K_SUBTASK_AGENT_PREFIX = "subtaskAgent_";
@@ -94,9 +96,10 @@ public class MultiAgentGraphAgent implements Agent {
     public MultiAgentGraphAgent(String agentName,
                                 ChatClientRegistry clientRegistry,
                                 AgentService agentService,
-                                ToolAssignments toolAssignments) {
+                                ToolAssignments toolAssignments,
+                                LlmCallRecorder recorder) {
         this.agentName = agentName;
-        this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments);
+        this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments, recorder);
         try {
             this.stateGraph = buildStateGraph();
             // 同步执行用的常驻实例
@@ -117,6 +120,7 @@ public class MultiAgentGraphAgent implements Agent {
         log.info("[multi-agent] 开始编排复杂目标: {}", goal.objective());
         Map<String, Object> input = new HashMap<>();
         input.put(K_OBJECTIVE, goal.objective());
+        input.put(K_SESSION_ID, goal.sessionId());
 
         return graph.invoke(input)
                 .flatMap(s -> s.value(K_FINAL, String.class))
@@ -142,6 +146,7 @@ public class MultiAgentGraphAgent implements Agent {
     public Flux<String> executeStreamReactive(Goal goal) {
         Map<String, Object> input = new HashMap<>();
         input.put(K_OBJECTIVE, goal.objective());
+        input.put(K_SESSION_ID, goal.sessionId());
         AtomicBoolean contentSent = new AtomicBoolean(false);
         // 客户端断开（Reactor cancel）置位：后续 superstep 的节点短路，不再发起新的 LLM 调用
         AtomicBoolean cancelled = new AtomicBoolean(false);
@@ -305,7 +310,8 @@ public class MultiAgentGraphAgent implements Agent {
             return new HashMap<>();
         }
         String objective = state.value(K_OBJECTIVE, String.class).orElse("");
-        String content = predictLeadLogged(objective);
+        String sessionId = state.value(K_SESSION_ID, String.class).orElse(null);
+        String content = predictLeadLogged(sessionId, objective);
         List<Subtask> items = parseSubtasks(content);
         if (items.isEmpty()) {
             items.add(new Subtask(objective, null)); // 拆解失败：退化为单个子任务=objective
@@ -336,7 +342,8 @@ public class MultiAgentGraphAgent implements Agent {
             return new HashMap<>();
         }
         String expert = state.value(K_SUBTASK_AGENT_PREFIX + idx, String.class).orElse(null);
-        String result = predictSubtask(task, expert, toolEmitter);
+        String sessionId = state.value(K_SESSION_ID, String.class).orElse(null);
+        String result = predictSubtask(sessionId, task, expert, toolEmitter);
         Map<String, Object> updates = new HashMap<>();
         updates.put(K_RESULT_PREFIX + idx, result);
         log.info("[multi-agent][subtask-{}] 完成（专家={}），结果长度={}", idx, expert, result.length());
@@ -364,6 +371,7 @@ public class MultiAgentGraphAgent implements Agent {
             return skipped;
         }
         int n = state.value(K_SUBTASK_COUNT, Integer.class).orElse(0);
+        String sessionId = state.value(K_SESSION_ID, String.class).orElse(null);
         List<String> results = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             state.value(K_RESULT_PREFIX + i, String.class)
@@ -375,9 +383,9 @@ public class MultiAgentGraphAgent implements Agent {
             // 子任务全失败：兜底
             finalAnswer = state.value(K_FINAL, String.class).orElse("（未生成最终回答）");
         } else if (liveTokens == null) {
-            finalAnswer = predictAggregate(results);
+            finalAnswer = predictAggregate(sessionId, results);
         } else {
-            finalAnswer = predictAggregateStreaming(results, liveTokens, contentSent);
+            finalAnswer = predictAggregateStreaming(sessionId, results, liveTokens, contentSent);
         }
         Map<String, Object> updates = new HashMap<>();
         updates.put(K_FINAL, finalAnswer);
@@ -390,14 +398,15 @@ public class MultiAgentGraphAgent implements Agent {
      * 流式异常时回退阻塞调用——已推出过 token 则以已收内容为准（避免内容重复），
      * 一个 token 都没推过则整段回退（主干 toRows 会兜底发聚合进度+完整内容）。
      */
-    private String predictAggregateStreaming(List<String> results,
+    private String predictAggregateStreaming(String sessionId,
+                                             List<String> results,
                                              Sinks.Many<String> liveTokens,
                                              AtomicBoolean contentSent) {
         BranchProgressListener.tryEmitSerialized(liveTokens,
                 ProgressLine.encode("聚合", "汇总子任务结果，生成最终回答"));
         StringBuilder collected = new StringBuilder();
         try {
-            chatCaller.stream(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT,
+            chatCaller.stream(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT,
                     aggregateUserPrompt(results),
                     token -> {
                         if (token == null || token.isEmpty()) {
@@ -410,7 +419,7 @@ public class MultiAgentGraphAgent implements Agent {
             return collected.toString();
         } catch (Exception e) {
             log.warn("[multi-agent][aggregate] 流式聚合失败，回退阻塞调用：{}", safe(e));
-            return collected.length() > 0 ? collected.toString() : predictAggregate(results);
+            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results);
         }
     }
 
@@ -432,28 +441,28 @@ public class MultiAgentGraphAgent implements Agent {
             "你是聚合汇总的 AI 助手，依据多个子结果的最终回答可直接呈现给用户。";
 
     /** lead 拆解：按 agent 表 lead 行的提示词/模型执行（无配置时回退内置兜底） */
-    private String predictLead(String objective) {
-        return chatCaller.call(ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective);
+    private String predictLead(String sessionId, String objective) {
+        return chatCaller.call(sessionId, ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective);
     }
 
     /** lead 拆解前日志埋点便于诊断专家指派（raw 输出统一记审计） */
-    private String predictLeadLogged(String objective) {
-        String raw = predictLead(objective);
+    private String predictLeadLogged(String sessionId, String objective) {
+        String raw = predictLead(sessionId, objective);
         log.info("[multi-agent][lead] raw 拆解输出: {}", raw.length() > 300 ? raw.substring(0, 300) + "..." : raw);
         return raw;
     }
 
-    private String predictSubtask(String task, String expert,
+    private String predictSubtask(String sessionId, String task, String expert,
                                   java.util.function.Consumer<String> toolEmitter) {
         // 未指派（lead 输出旧格式或漏 agent 字段）→ 回退 general：通用兜底且持有全量工具
         String resolved = (expert == null || expert.isBlank())
                 ? AgentConstants.DEFAULT_AGENT : expert;
         String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。";
-        return chatCaller.call(resolved, persona, task, toolEmitter);
+        return chatCaller.call(sessionId, resolved, persona, task, toolEmitter);
     }
 
-    private String predictAggregate(List<String> results) {
-        return chatCaller.call(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, aggregateUserPrompt(results));
+    private String predictAggregate(String sessionId, List<String> results) {
+        return chatCaller.call(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, aggregateUserPrompt(results));
     }
 
     /** 聚合请求的 user 内容：各子任务结果顺序拼接（阻塞/流式两版共用） */

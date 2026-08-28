@@ -37,110 +37,87 @@
 
 # 一、未完成 TODO
 
-## P0 · 架构收尾（眼前优先）
+## 方向评估（2026-08-28）
 
-- [x] **补齐 agent 表配置**：`schema.sql` 种子数据新增 `agentName='multi-agent'` 行（qwen-max + 编排提示词），重启即生效（`INSERT IGNORE` 幂等），消除「使用默认配置」退回。
-- [x] **专家 agent 派遣**：lead 拆解 JSON 升级为对象数组 `{"subtasks":[{"desc":"..","agent":"专家名"}]}`，subtask 节点按专家名查 agent 表配置取对应客户端执行；白名单校验（researcher/coder/analyst/writer/general），非法回退默认；兼容旧纯字符串格式。测试见 `MultiAgentGraphAgentTest` 派遣与回退两用例。
-  - **专家清单（按现有流程 lead→并行子任务→聚合 设计，登记进 agent 表）**：
-    | agent\_name   | 职责                  | 建议 model      | system prompt 要点                              | 依赖工具（P1 工具库） |
-    | ------------- | ------------------- | ------------- | --------------------------------------------- | ------------ |
-    | `multi-agent` | 编排器本体（lead 拆解 + 聚合） | qwen-max      | 规划者：把复杂目标拆成 ≤4 条可独立执行、可判定完成度的子任务；聚合时忠实汇总不改写结论 | 无（纯规划）       |
-    | `researcher`  | 资料调研                | qwen-plus     | 检索信息、交叉核对来源、输出带出处的资料摘要                        | 网页搜索 + 抓取    |
-    | `coder`       | 代码编写/修复             | deepseek-chat | 读懂仓库上下文、给出可运行代码与修改说明、执行验证命令                   | 文件读写 + Shell |
-    | `analyst`     | 数据分析                | deepseek-chat | 结构化数据处理、指标计算、结论用数字说话                          | SQL 只读 + 计算  |
-    | `writer`      | 汇总撰写                | qwen-max      | 把多方结果整合成结构化报告（标题/要点/结论），忠实引用子任务产出             | 无            |
-    | `general`     | 通用兜底（已存在）           | 现配置           | 通用助手，未匹配到专家时由 lead 回退指派                       | 无            |
-  - 落地顺序：先插 `multi-agent` 行解 P0 配置退回 → 再建专家行（prompt 可先简配）→ 最后打通 lead 按 `agentId` 派遣；未识别的 agentId 一律回退 `general`。
-- [x] **Graph 内逐 token 流式**：聚合节点（最终回答）已改为流式调用——首个 token 前推「聚合」进度行，随后逐 token 经旁路 sink 实时发射，主干对已推送内容不再重复发射（contentSent 短路）；流式失败回退阻塞调用（已推部分 token 以已收内容为准，未推过则主干兜底发完整内容）。**权衡说明**：子任务节点保持阻塞调用——多子任务并行执行时 token 直推会交错乱序，用户体感关键在最终回答的打字机效果；子任务 token 分区渲染归入「CLI 输出优化」条目。lead 产出为 JSON 中间产物不推送。验证：单测新增多 token 时序用例全绿；真实 LLM 端到端——「聚合」进度后 139 个 token 片段逐段到达，meta SUCCEEDED。`AgentChatCaller` 拆出 buildSpec 供 call/stream 共用（新增 stream(forAgent, fallback, user, onToken)）。
-- [x] **并发断连的可观测处理**：多 Agent 并发执行期间若客户端断开（超时/退出），Tomcat 会报 `AsyncRequestNotUsableException`（Connection reset by peer）。根因（CLI 超时过短、伪流式等待）已修复，服务端已闭环「降噪 + 及时终止编排」：
-  - **降噪**：新增 `ClientAbortLogFilter`（logback TurboFilter，`LogNoiseConfig` 注册）——框架层 logger（`org.apache.catalina/coyote/tomcat`、`org.springframework.web`）且异常/消息命中断连特征（ClientAbortException / AsyncRequestNotUsableException / Connection reset / Broken pipe）的 ERROR 直接 DENY；业务 logger 与 warn 级不误杀，7 个判定用例覆盖（含 cause 链包装命中）。**补充**：断连异常还会经 `@RestControllerAdvice` 兜底（实测日志 logger 是 `GlobalExceptionHandler`）——新增专 handler（AsyncRequestNotUsableException）+ 兜底内 `isClientAbort`（IOException 断连消息，不直接依赖 Tomcat 类）均降级 warn 单行，普通异常仍 ERROR+堆栈（`GlobalExceptionHandlerTest` 3 用例，logback ListAppender 验证级别与无堆栈）
-  - **取消传播**：断连 → Reactor cancel → `ChatServiceImpl.doOnCancel` 记可观测 warn 单行（sid）→ `AgentServiceImpl.doOnCancel` 把 goal 落库为 FAILED（"客户端断开，编排已取消"），不再残留 RUNNING
-  - **编排终止**：`MultiAgentGraphAgent` 主干 `doFinally(CANCEL)` 置位 cancelled 标志 → lead/子任务/聚合节点执行前检查短路，不再发起新的 LLM 调用（进行中的调用等待自然结束，阻塞调用不可中断是已知限制）；路径 A（GeneralAssistantAgent）响应式 cancel 天然终止 WebClient 拉流，无需代码
-  - 测试：`executeStreamReactive_onCancel_marksFailedAndPersists`（cancel → goal FAILED + 落库 2 次）+ `executeStreamReactive_cancelDuringLead_skipsRemainingLlmCalls`（lead 阻塞中 dispose → 后续节点零调用，`atMost(1)` 时序兼容断言）；全量 98 用例通过
-- [ ] 为复杂路径注册 Checkpointer（可选，落库断点）——如需再评估。
+**现状盘点（已具备）**：两路径架构闭环（RouteJudge 分流 + StateGraph 多 Agent 编排）；沙箱容器级隔离 + 按专家分配工具权限（服务端硬边界）；进度全链路可视（编排/拆解/子任务/聚合/工具行）+ 断连优雅处理（降噪/取消传播/编排短路）；CLI 体验对标 Claude Code（流式 Markdown / spinner / 回合小结 / JLine 输入）；101 用例单测覆盖核心链路。单用户场景完整跑通。
 
-## P1 · 能力增强（核心扩展）
+**短板（按风险排序）**：
 
-- [ ] **RAG 知识库**：引入向量库（pgvector 优先，因其已在依赖管理中）+ Spring AI `VectorStore`
-  - 验收：能对本地文档做"知识库问答"
-- [ ] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，替换/扩展 `DemoTools`
-  - 与 Sandbox 衔接：agentscope-runtime 内置 MCP 桥接，接入时优先评估复用（见「Spring AI Alibaba Sandbox 接入」条目）
-  - 验收：模型可调用一个外部 MCP 工具完成真实任务
-- [x] **Agent 工具库扩充**：`tool` 包落地真实工具体系（对标 DeepSeek Harness 内置工具面），按专家分配、统一治理（宿主机自研工具后被 Sandbox 容器级隔离替代并退役，见下一条）：
-  - 现存自研工具：`WebTools`（fetchUrl 真实抓取，HTML→纯文本，仅 http/https，2MB/12k 字符上限）+ `DemoTools`（本地函数示例）；网页搜索待搜索服务商 API key 后补充
-  - 已退役（能力由 Sandbox 等价承接）：`ToolSandbox`/`FileTools`/`SearchTools`/`ShellTools` 连同其治理与测试一并移除
-  - `ToolAssignments`：按专家分配工具集，双通道注入（@Tool 对象走 `.tools()`、ToolCallback 走 `.toolCallbacks()`；`MultiAgentGraphAgent.call` 按子任务专家、`GeneralAssistantAgent` 按自身 agent 名；未指派子任务回退 general 全量）
-  - 剩余：web search 接入搜索 API key；交互式高危命令审批通道
-- [x] **Spring AI Alibaba Sandbox 接入**：引入 `spring-ai-alibaba-sandbox`（BOM 管理版本，传递 `agentscope-runtime-sandbox-core`），工具执行从进程内软隔离升级为容器级隔离。
-  **架构决策**：产品定位为通用助手（调研/报告/数据分析/跑代码），agent 不操作宿主机项目文件——模型生成的所有代码/命令只在容器内执行，宿主机零暴露；不做降级路径（沙箱是硬依赖，部署前提标注 Docker 必需，无 Docker 环境该功能整体不可用）。
-  - `SandboxToolProvider`：懒初始化（首次取用才拉起容器，双检锁只尝试一次），初始化失败降级为空工具面（warn 日志、不重试、不回退宿主机）；应用退出 `@PreDestroy` 释放 `SandboxService`（`close()` 随容器删除）
-  - 工具面三类：执行类（RunPythonCode/RunShellCommand）、只读文件类（ReadFile/ReadMultipleFiles/ListDirectory/DirectoryTree/SearchFiles/GetFileInfo）、写入类（WriteFile/EditFile/CreateDirectory/MoveFile）
-  - 重合即退役：`ShellTools`→`RunShellCommandTool`，`FileTools`/`SearchTools`/`ToolSandbox`→沙箱文件类工具；`WebTools`/`DemoTools` 保留（Sandbox 未覆盖）
-  - `ToolAssignments` 双通道：Sandbox 工具为 `ToolCallback` 形态走 `.toolCallbacks()`，自研 `@Tool` 对象走 `.tools()`，按专家分配不变
-  - Docker host 无需显式配置：默认 `localhost:2375` 失败后自动回退 Docker Desktop 标准 socket
-  - 验证：75/75 单测通过；Docker 29.7.2 下 JShell 真实验证容器拉起 + 容器内 Shell 执行（returncode=0）+ 退出容器自动删除；镜像 `runtime-sandbox-base:latest` 需预拉取（aliyun 新加坡 registry）
-- [x] **Sandbox 落地遗留跟进**（承接上一条，过程记录见 `docs/0828-沙箱接入与验证.md`）：
-  - 真实 LLM 端到端 ✅：流式接口发「Python 计算前 20 个素数和并运行验证」复杂任务——lead 按难度拆 1 个子任务指派 coder，`RunPythonCodeTool` 经容器 fastapi `run_ipython_cell` 端点执行，SSE 进度完整（编排→拆解→子任务→聚合）、`meta SUCCEEDED`、结果正确（素数和 639）；容器随首次工具调用创建（懒初始化），服务优雅停止时随 `@PreDestroy` 销毁（注意：强杀 `mvn spring-boot:run` 不触发优雅关闭会残留容器，需正常停服或 `docker rm -f`）
-  - 浏览器自动化 ✅：`SandboxToolProvider` 新增浏览器工具组（Navigate/Snapshot/Click/Type/Close，独立镜像 `runtime-sandbox-browser:latest` 需预拉取；独立懒初始化，失败只降级本组不影响执行/文件类）；分配给 researcher/general 补 JS 渲染页面抓取空缺；JShell 直连验证：`BrowserSandbox` navigate 到 `quotes.toscrape.com/js/`（纯 HTTP 抓取拿不到内容的 JS 渲染页）并 snapshot 取得 5381 字符无障碍快照（含 JS 加载的名言正文），关闭后容器删除零残留；`ToolAssignments` 分配表与测试同步更新，全量回归通过
+1. **可靠性弱**：LLM 调用失败即整体失败（无重试/降级/熔断）；无并发上限，多请求可打爆线程池与模型配额——demo 可跑，多人不可用
+2. **能力面窄**：无 web search（查资料仅 fetchUrl+浏览器硬抓）；无 RAG（不能知识库问答）；无 MCP（工具生态扩展受限）——「调研/报告」核心卖点被卡在信息获取第一步
+3. **编排智能化初级**：lead 一次性拆解、子任务纯并行无依赖、失败无重规划/反思——复杂任务成功率受限
+4. **可观测空白**：LLM 调用耗时 / token 成本 / 链路不可见，调优靠日志肉翻
+5. **部署与安全**：无容器化交付、无接口鉴权
+
+**扩展方向定调**：
+
+- **主线 = 能力扩展**（web search → RAG → MCP）：直接抬高「调研型助手」能力上限，产品价值最直观
+- **支线 = 可靠性收口**（重试/限流/并发控制/最小权限）：demo → 可服务的门槛，量小优先做（P0）
+- **中期 = 编排智能化**（失败重规划 / 子任务依赖）：能力面铺完后收益最大，agent 从「能跑」到「聪明」
+- **远期 = 工程化可观测 + 产品化**（监控/追踪/容器化/前端）：按需启动
+
+## P0 · 可靠性与安全收口（眼前优先，先做稳）
+
+- [ ] **模型调用重试/限流**：Spring Retry / Resilience4j，模型失败自动重试（指数退避，可重试错误与限流错误区分），接口限流防刷
+  - 验收：bad key 场景按策略重试后失败；限流返回 429
+- [ ] **并发 / 资源控制**：流式连接数限制、异步线程池隔离与参数化、模型调用超时兜底与熔断降级（COMPLEX 编排失败可降级为 SIMPLE 单模型重答）
+  - 验收：并发提交多个流式请求稳定，无连接/线程池耗尽
 - [ ] **工具分配最小权限化**：现状按「能力类别」粒度分配（`ToolAssignments` 给整组工具），存在权限漏洞：
-  - **`general` 全量过宽且是所有回退路径的落点**：路由兜底、未识别专家、lead 漏指派全部落 general——最宽权限（执行/容器写/网页）给了最不可控的场景，违背最小权限原则
+  - **`general`** **全量过宽且是所有回退路径的落点**：路由兜底、未识别专家、lead 漏指派全部落 general——最宽权限（执行/容器写/网页）给了最不可控的场景，违背最小权限原则
   - 改造项（沙箱语境下已简化：沙箱原生分执行/只读文件/写入三类，无需再拆类）：
-    - `general` 收敛为只读探索者（fetchUrl + 沙箱只读文件/检索），执行与写入类工具只留给 lead 明确指派的 `coder`/`analyst`
+    - `general` 收敛为只读探索者（fetchUrl + 沙箱只读文件/检索 + 浏览器），执行与写入类工具只留给 lead 明确指派的 `coder`/`analyst`
     - 重排 `ToolAssignments` 分配表并同步测试（专家派遣用例、`ToolAssignments` 相关断言）
   - 机制说明：权限边界是**服务端硬边界**——只注入已分配工具的 schema，模型看不见未分配的工具，伪造调用在服务端无执行注册（比提示词约束可靠）
-  - 权限模型即「哪些 agent 允许触发容器执行/容器写」
   - 验收：general/未指派子任务全链路无写与执行权限；coder 仍可完成「读文件→改文件→跑命令」闭环
 - [ ] **异步任务治理**：`CompletableFuture.runAsync` 改为 `@Async` + 自定义线程池，或加任务表支持失败重投
   - 验收：并发提交 10 个 Goal 稳定执行，无线程池耗尽
-- [ ] **数据库迁移工具**：Flyway 替代 `spring.sql.init` 管理 schema 演进
-  - 验收：新增表结构变更通过迁移脚本自动应用
-- [ ] **模型调用重试/限流**：Spring Retry / Resilience4j，模型失败自动重试，接口限流防刷
-  - 验收：bad key 场景按策略重试后失败，限流返回 429
-- [x] **CLI 输出优化（对标 Claude Code 的终端体验）**：
-  - 流式 Markdown 渲染：逐 token 渲染标题/列表/**粗体**/代码块语法高亮，而非纯文本直出
-  - 过程状态原位刷新：`编排/拆解/子任务/聚合` 等进度用 spinner + 已耗时在固定状态行刷新，完成后折叠归档成单行摘要（如 `✓ 子任务1 · researcher · 42s`），不随内容滚动刷屏
-  - 工具调用行：服务端新增 `ToolCallTracer` 装饰 ToolCallback（schema 原样透传，模型不可见），调用起止经旁路 sink 发 `tool`/`tool-done` 进度行（路径 A/B 通用，复用 ProgressLine→SSE 通道）；CLI 展示 `⏺ 工具名(参数摘要)` spinner，完成后归档 `✓ 耗时 · +N/-M 行`（连续多次调用天然折叠为单行紧凑列表）
-  - 变更 diff 展示：从工具入参 old/new 串行数近似计算 `+N/-M 行`，归档行内 +绿 / -红 着色（best-effort：键名候选匹配 path/content/old_string/new_string/text 等）
-  - 配色体系：过程/进度用弱化色（灰），正文正常色，关键结论加粗——层次感对齐 Claude Code
-  - 回合小结：回答结束后展示本回合统计（耗时、子任务数、token 近似量）
-  - 输入体验：引入 JLine 3——上下键翻阅输入历史（持久化 `~/.javaHarness_history`）、`/` 命令 Tab 补全菜单、多行粘贴（bracketed paste）；无 TTY 环境（exec:java 内嵌 JVM）自动降级行式读取
-  - 选型说明：**JLine 3 引入理由（不可替代性）**——Windows 控制台无纯 Java 的逐键 raw 输入，BufferedReader 行缓冲拿不到方向键事件，历史翻阅/补全菜单必须依赖终端库；JLine 3 是事实标准（Spring Shell 同款），uber jar 自带 jansi/jna/ffm 全部 Windows provider，仅 CLI 进程使用、服务端零依赖。启动方式升级：`mvn -s .mvn/settings.xml -Pcli compile exec:exec`（fork 独立进程接管真实终端，历史/补全可用）
-  - 验收 ✅：复杂任务全程可视（进度非刷屏式、过程可折叠）；最终回答以排版后的 Markdown 呈现；路径 A 逐 token 与路径 B 聚合逐 token 均有打字机效果；工具调用起止实时可见。测试：`ToolCallTracerTest`（15 用例：事件组装/装饰行为/失败重抛/schema 透传）+ `TerminalRendererTest` 工具行 2 用例，全量 107 用例通过
 
-## 侧重点 · 提升工程深度
+## P1 · 能力扩展主线（产品核心价值）
 
-> 避免项目被归为「API 调用 + CRUD 的套壳 Demo」；优先做「收益最大 × 认可度最高」且能讲清「为什么」的改造。
+- [ ] **Web Search 接入**：注册搜索服务商 API（博查/Tavily/SerpAPI 等任一），新增 `search` 工具归入 `WebTools`，分配给 researcher/general——补「调研」第一步空缺，浏览器组退居 JS 渲染兜底
+  - 验收：researcher 对「近期事件」类问题能返回带来源的检索结果
+- [ ] **RAG 知识库**：引入向量库（pgvector 优先，因其已在依赖管理中）+ Spring AI `VectorStore`；文档摄取管道（切分/嵌入/入库）+ 路径 A/B 检索增强
+  - 验收：能对本地文档做"知识库问答"，答案带出处
+- [ ] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，扩展工具生态（不再逐个自研）
+  - 与 Sandbox 衔接：agentscope-runtime 内置 MCP 桥接，接入时优先评估复用（见存档「Spring AI Alibaba Sandbox 接入」条目）
+  - 验收：模型可调用一个外部 MCP 工具完成真实任务
 
-- [ ] **并发 / 资源控制**：流式连接数限制、异步线程池隔离与参数化、模型调用超时兜底与熔断降级
-  - 验收：并发提交多个流式请求稳定，无连接/线程池耗尽
+## P2 · 编排智能化（中期，agent 从「能跑」到「聪明」）
 
-## P2 · 工程化与可观测性
+- [ ] **子任务失败重规划**：子任务失败/结果为空时，把失败上下文交 lead 反思一轮（重拆 or 换专家 or 降级放行），而非直接聚合残缺结果
+  - 验收：mock 某专家首次失败，端到端能看到重试/换人后的成功聚合
+- [ ] **子任务依赖编排**：lead 拆解支持声明依赖（如 `depends_on`），有依赖的子任务串行、无依赖的并行，替代当前纯并行
+  - 验收：「先调研 X 再基于结论写代码」类任务按依赖顺序执行
+- [ ] **复杂路径 Checkpointer（可选，落库断点）**：长编排可断点续跑——如需再评估
+
+## P3 · 工程化与产品化（按需启动）
 
 - [ ] **Actuator + 监控**：加 `spring-boot-starter-actuator`，暴露健康/指标端点，接 Prometheus + Grafana
   - 验收：`/actuator/health` 可用，指标可被 Prometheus 抓取
-- [ ] **链路追踪**：Micrometer Tracing / OpenTelemetry，记录 LLM 调用耗时与 token 消耗
-  - 验收：一次聊天请求的完整调用链在追踪系统可见
-- [ ] **API 文档**：springdoc-openapi 自动生成 Swagger UI
-  - 验收：`/swagger-ui.html` 可浏览所有接口
+- [ ] **完整链路追踪（Micrometer Tracing）**：接 Spring AI 原生 observation（micrometer-tracing + Zipkin exporter + Zipkin 容器），补齐 `llm_call_log`（成本账本）不具备的**单次请求耗时瀑布**——HTTP → 路由 → lead 拆解 → 各专家 → 聚合每段耗时与父子 span 关系；建议与「Actuator + 监控」同批实施（共享 Micrometer 基建）
+  - 验收：Zipkin UI 能看到一次聊天请求的完整瀑布图，观测埋点代码不重写（llm\_call\_log 与 Tracing 互补共存）
+- [x] **链路追踪**：记录 LLM 调用耗时与 token 消耗（自建轻量方案：`llm_call_log` 表 + `LlmCallRecorder` 异步落库，`GET /api/llm-calls` 查询；Micrometer Tracing / OpenTelemetry 完整链路留待按需升级）
+  - 验收：一次聊天请求的完整调用链在追踪系统可见（当前可经 `/api/llm-calls?sessionId=` 按会话查询每次调用的耗时/token/成败）
+- [x] **数据库迁移工具**：Flyway 替代 `spring.sql.init` 管理 schema 演进（V1 建表 / V2 goal 索引 / V3 llm\_call\_log；存量库经 baseline 无缝接入，`spring.sql.init` 已移除）
+  - 验收：新增表结构变更通过迁移脚本自动应用（新增 `db/migration/V*__*.sql` 即可，启动自动执行）
 - [ ] **会话缓存**：`spring-boot-starter-data-redis` 缓存会话快照，降低 MySQL 压力
   - 验收：会话上下文命中 Redis，DB 读次数下降
 - [ ] **Testcontainers 集成测试**：起真实 MySQL 环境跑集成测试
   - 验收：`mvn test` 在容器化 DB 上全绿
-- [ ] **Mockito 单测**：为 service 层补单元测试
-  - 验收：核心 service 方法均有单测覆盖
-
-## P3 · 按需（看产品方向再上）
-
-- [ ] **安全**：Spring Security + JWT 接口鉴权；API Key 走 KMS/Vault 管理
-  - 验收：未带 token 的请求被拒绝
-- [ ] **消息队列**：RabbitMQ / Kafka 异步派发 Goal，长任务解耦
-  - 验收：提交 Goal 后立即返回，执行与消费异步解耦
-- [ ] **前端 + EventSource**：Vue3/React 页面消费 SSE 实时展示，替代/补充 CLI
-  - 验收：浏览器能看到打字机式流式回复
+- [ ] **API 文档**：springdoc-openapi 自动生成 Swagger UI
+  - 验收：`/swagger-ui.html` 可浏览所有接口
 - [ ] **容器化交付**：Dockerfile + docker-compose（app + MySQL + Redis）一键启动
   - 验收：`docker compose up` 后完整可访问
 - [ ] **CI/CD**：GitHub Actions / Gitee Go：编译 → 测试 → 构建镜像
   - 验收：push 后流水线全绿并产出镜像
+- [ ] **前端 + EventSource**：Vue3/React 页面消费 SSE 实时展示，替代/补充 CLI
+  - 验收：浏览器能看到打字机式流式回复
+- [ ] **PDF 输出（报告导出）**：把最终回答/会话记录（Markdown）渲染为 PDF 供下载——flexmark（MD→HTML）+ openhtmltopdf（HTML→PDF，纯 Java 免外部依赖、无 AGPL 风险），中文字体内嵌资源目录（不依赖系统字体，避免容器/跨机乱码）；新增 `GET /api/export/pdf?sessionId=` 导出会话，CLI 加 `/export` 命令拉取保存
+  - 验收：一次多 Agent 任务完成后可导出排版正常的中文 PDF（标题/列表/代码块/表格不乱码、不缺字）
+- [ ] **消息队列**：RabbitMQ / Kafka 异步派发 Goal，长任务解耦
+  - 验收：提交 Goal 后立即返回，执行与消费异步解耦
+- [ ] **安全**：Spring Security + JWT 接口鉴权；API Key 走 KMS/Vault 管理
+  - 验收：未带 token 的请求被拒绝
 - [ ] **WebSocket**：如需全双工交互（如任务进度推送）可扩展
 
 ***
@@ -159,6 +136,40 @@
 - [x] **两条路径统一出口与记忆写回**：SSE 出口一致；会话记忆经 `writeBackContext` 回写（进度行不计入摘要）。
 - [x] **CLI 传输稳定性**：OkHttp readTimeout=15min / callTimeout=30min，长任务不再中途断连；接收端还原换行转义。
 - [x] **常量抽离 enums**：跨类共享常量归集至 `enums` 包（如 `AgentConstants`）。
+- [x] **补齐 agent 表配置**：`schema.sql` 种子数据新增 `agentName='multi-agent'` 行（编排提示词），重启即生效（`INSERT IGNORE` 幂等），消除「使用默认配置」退回。
+- [x] **专家 agent 派遣**：lead 拆解 JSON 升级为对象数组 `{"subtasks":[{"desc":"..","agent":"专家名"}]}`，subtask 节点按专家名查 agent 表配置取对应客户端执行；白名单校验（researcher/coder/analyst/writer/general），非法回退默认；兼容旧纯字符串格式。测试见 `MultiAgentGraphAgentTest` 派遣与回退两用例。
+  - 专家清单：`multi-agent`（编排器，lead 拆解+聚合）、`researcher`（资料调研）、`coder`（代码）、`analyst`（数据分析）、`writer`（汇总撰写）、`general`（通用兜底），均登记 agent 表。
+- [x] **Graph 内逐 token 流式**：聚合节点流式调用——首个 token 前推「聚合」进度行，逐 token 经旁路 sink 实时发射，主干 contentSent 短路防重复；流式失败回退阻塞调用。子任务节点保持阻塞（并行 token 会交错乱序）。`AgentChatCaller` 拆出 buildSpec 供 call/stream 共用。验证：真实 LLM 端到端 139 个 token 片段逐段到达。
+- [x] **并发断连的可观测处理**：闭环「降噪 + 及时终止编排」：
+  - 降噪：`ClientAbortLogFilter`（logback TurboFilter）DENY 框架 logger 的断连 ERROR；`GlobalExceptionHandler` 专 handler（AsyncRequestNotUsableException）+ 兜底 `isClientAbort` 均降级 warn 单行，业务异常不误杀
+  - 取消传播：`ChatServiceImpl.doOnCancel` warn 单行（sid）→ `AgentServiceImpl.doOnCancel` goal 落库 FAILED，不残留 RUNNING
+  - 编排终止：`MultiAgentGraphAgent` 主干 `doFinally(CANCEL)` 置位 cancelled → lead/子任务/聚合节点执行前短路，cancel 后零次新 LLM 调用（进行中阻塞调用自然结束是已知限制）；路径 A 响应式 cancel 天然终止
+  - 测试：`ClientAbortLogFilterTest` 7 用例 + `GlobalExceptionHandlerTest` 3 用例 + cancel 落库/编排短路守护用例
+
+## 工具与沙箱（2026-08 完成）
+
+- [x] **Agent 工具库扩充**：`tool` 包落地真实工具体系（对标 DeepSeek Harness 内置工具面），按专家分配、统一治理（宿主机自研工具后被 Sandbox 容器级隔离替代并退役）：
+  - 现存自研工具：`WebTools`（fetchUrl 真实抓取，HTML→纯文本，仅 http/https，2MB/12k 字符上限）+ `DemoTools`（本地函数示例）；网页搜索待搜索服务商 API key 后补充（已列入 P1「Web Search 接入」）
+  - 已退役（能力由 Sandbox 等价承接）：`ToolSandbox`/`FileTools`/`SearchTools`/`ShellTools` 连同其治理与测试一并移除
+  - `ToolAssignments`：按专家分配工具集，双通道注入（@Tool 对象走 `.tools()`、ToolCallback 走 `.toolCallbacks()`）；`MultiAgentGraphAgent.call` 按子任务专家、`GeneralAssistantAgent` 按自身 agent 名；未指派子任务回退 general（全量权限的收敛见 P0「工具分配最小权限化」）
+- [x] **Spring AI Alibaba Sandbox 接入**：引入 `spring-ai-alibaba-sandbox`（BOM 管理版本），工具执行从进程内软隔离升级为容器级隔离。
+  **架构决策**：产品定位为通用助手（调研/报告/数据分析/跑代码），agent 不操作宿主机项目文件——模型生成的所有代码/命令只在容器内执行，宿主机零暴露；不做降级路径（沙箱是硬依赖，无 Docker 环境该功能整体不可用）。
+  - `SandboxToolProvider`：懒初始化（双检锁只尝试一次），失败降级空工具面（warn、不重试、不回退宿主机）；`@PreDestroy` 释放容器
+  - 工具面三类：执行类（RunPythonCode/RunShellCommand）、只读文件类、写入类；浏览器组独立镜像独立初始化，失败只降级本组
+  - 重合即退役：`ShellTools`/`FileTools`/`SearchTools`/`ToolSandbox` → 沙箱等价工具；`WebTools`/`DemoTools` 保留（Sandbox 未覆盖）
+  - 验证：JShell 直连验证容器拉起 + Shell 执行 + 退出自动删除；浏览器组 `quotes.toscrape.com/js/`（JS 渲染页）snapshot 取得 5381 字符内容；过程记录见 `docs/0828-沙箱接入与验证.md`
+- [x] **Sandbox 真实 LLM 端到端** ✅：「Python 计算前 20 个素数和并运行验证」——lead 拆 1 个子任务指派 coder，`RunPythonCodeTool` 经容器 fastapi 执行，SSE 进度完整、`meta SUCCEEDED`、结果正确（素数和 639）；容器随首次工具调用懒创建、优雅停服随 `@PreDestroy` 销毁（注意：强杀 `mvn spring-boot:run` 不触发优雅关闭会残留容器）
+
+## CLI 体验（2026-08 完成）
+
+- [x] **CLI 输出优化（对标 Claude Code 的终端体验）**：
+  - 流式 Markdown 渲染：逐 token 渲染标题/列表/**粗体**/代码块语法高亮
+  - 过程状态原位刷新：进度 spinner + 已耗时固定状态行刷新，完成后折叠归档灰色 ✓ 摘要行，不刷屏
+  - 工具调用行：服务端 `ToolCallTracer` 装饰 ToolCallback（schema 原样透传），起止经旁路 sink 发 `tool`/`tool-done` 进度行（路径 A/B 通用）；CLI 展示 `⏺ 工具名(参数摘要)` → `✓ 耗时 · +N/-M 行`（diff 近似着色）
+  - 回合小结：耗时 / 子任务数 / token 近似量
+  - 输入体验：JLine 3——历史持久化、`/` 命令 Tab 补全、多行粘贴；无 TTY 自动降级。**JLine 3 不可替代性**：Windows 控制台无纯 Java 逐键 raw 输入；启动方式 `mvn -s .mvn/settings.xml -Pcli compile exec:exec`（fork 独立进程接管真实终端）
+  - 乱码修复：CLI 输出统一收敛到 JLine `terminal.writer()` 宽字符通道（WriterBridge），GBK/65001 代码页均正常
+  - 验收 ✅：全量 101 用例通过；文档 `docs/0828-CLI输出优化工具调用行与输入体验.md`
 
 ## 项目基础（Roadmap P0 及能力项）
 

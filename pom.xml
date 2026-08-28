@@ -112,6 +112,16 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- Flyway：schema 版本化迁移（替代 spring.sql.init），MySQL 8.4 需 flyway-mysql 方言模块 -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-mysql</artifactId>
+        </dependency>
+
         <!-- MyBatis-Plus（Spring Boot 3 专用 starter） -->
         <dependency>
             <groupId>com.baomidou</groupId>

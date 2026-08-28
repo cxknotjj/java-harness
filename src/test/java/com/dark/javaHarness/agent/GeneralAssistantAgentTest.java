@@ -49,7 +49,7 @@ class GeneralAssistantAgentTest {
 
     @BeforeEach
     void setUp() {
-        agent = new GeneralAssistantAgent("general", clientRegistry, memoryStore, agentService, toolAssignments);
+        agent = new GeneralAssistantAgent("general", clientRegistry, memoryStore, agentService, toolAssignments, null);
         when(agentService.getAgentConfig("general")).thenReturn(java.util.Optional.empty());
         lenient().when(toolAssignments.forAgent(any())).thenReturn(com.dark.javaHarness.tool.ToolAssignments.ToolSet.EMPTY);
         when(clientRegistry.get(isNull())).thenReturn(chatClient);

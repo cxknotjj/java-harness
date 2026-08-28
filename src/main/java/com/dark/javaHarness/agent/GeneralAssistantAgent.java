@@ -4,8 +4,10 @@ import com.dark.javaHarness.advisor.ContextAssemblingAdvisor;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.domain.LlmCallLog;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
+import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
 import com.dark.javaHarness.tool.ToolCallTracer;
 import java.util.ArrayList;
@@ -20,6 +22,7 @@ import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
+import reactor.core.publisher.SignalType;
 
 /**
  * 通用 ChatModel 驱动 Agent：使用 Spring AI ChatClient 调用大模型来完成目标。
@@ -47,17 +50,21 @@ public class GeneralAssistantAgent implements Agent {
     private final AgentService agentService;
     /** 工具分配表：general 注入全量工具（deepseek 等其他实例未登记则仅默认工具） */
     private final ToolAssignments toolAssignments;
+    /** LLM 调用观测记录器（可 null：无观测场景下直通） */
+    private final LlmCallRecorder recorder;
 
     public GeneralAssistantAgent(String agentName,
                                  ChatClientRegistry clientRegistry,
                                  SessionService memoryStore,
                                  AgentService agentService,
-                                 ToolAssignments toolAssignments) {
+                                 ToolAssignments toolAssignments,
+                                 LlmCallRecorder recorder) {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.memoryStore = memoryStore;
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
+        this.recorder = recorder;
     }
 
     /** 返回 Agent 名称（用于注册与路由） */
@@ -70,10 +77,23 @@ public class GeneralAssistantAgent implements Agent {
     @Override
     public String execute(Goal goal) {
         log.info("AI agent '{}' 开始处理目标: {}", name(), goal.objective());
-        String reply = buildChatRequestSpec(goal.sessionId(), goal.objective()).call().content();
-        log.info("AI agent '{}' 得到回复: {}", name(), reply);
-        // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
-        return reply;
+        long start = System.currentTimeMillis();
+        try {
+            org.springframework.ai.chat.model.ChatResponse resp =
+                    buildChatRequestSpec(goal.sessionId(), goal.objective()).call().chatResponse();
+            String reply = resp == null || resp.getResult() == null
+                    || resp.getResult().getOutput() == null
+                    ? null : resp.getResult().getOutput().getText();
+            recordCall(goal.sessionId(), false, true,
+                    resp == null || resp.getMetadata() == null ? null : resp.getMetadata().getUsage(),
+                    null, start, null);
+            log.info("AI agent '{}' 得到回复: {}", name(), reply);
+            // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
+            return reply;
+        } catch (RuntimeException e) {
+            recordCall(goal.sessionId(), false, false, null, null, start, e);
+            throw e;
+        }
     }
 
     /**
@@ -85,18 +105,27 @@ public class GeneralAssistantAgent implements Agent {
     @Override
     public void executeStream(Goal goal, Consumer<String> onToken) {
         log.info("AI agent '{}' 开始流式处理目标: {}", name(), goal.objective());
+        long start = System.currentTimeMillis();
+        StringBuilder collected = new StringBuilder();
 
         Flux<String> flux = buildChatRequestSpec(goal.sessionId(), goal.objective())
                 .stream()
                 .content();
         // 真正逐 token 推送：订阅流，每来一个 token 立即回调，阻塞等待流结束
-        flux.doOnNext(token -> {
-                    if (onToken != null) {
-                        onToken.accept(token);
-                    }
-                })
-                .then()
-                .block();
+        try {
+            flux.doOnNext(token -> {
+                        if (onToken != null) {
+                            onToken.accept(token);
+                        }
+                    })
+                    .doOnNext(collected::append)
+                    .then()
+                    .block();
+        } catch (RuntimeException e) {
+            recordCall(goal.sessionId(), true, false, null, collected, start, e);
+            throw e;
+        }
+        recordCall(goal.sessionId(), true, true, null, collected, start, null);
         log.info("AI agent '{}' 流式输出完成", name());
     }
 
@@ -110,13 +139,51 @@ public class GeneralAssistantAgent implements Agent {
     public Flux<String> executeStreamReactive(Goal goal) {
         log.info("AI agent '{}' 开始响应式流式处理目标: {}", name(), goal.objective());
         Sinks.Many<String> toolEvents = Sinks.many().unicast().onBackpressureBuffer();
+        long start = System.currentTimeMillis();
+        StringBuilder collected = new StringBuilder();
         // 关闸挂 merge 之前的主干段（多 Agent 侧同款死锁教训：关闸在 merge 后会循环等待）
         Flux<String> content = buildChatRequestSpec(goal.sessionId(), goal.objective(),
                         row -> BranchProgressListener.tryEmitSerialized(toolEvents, row))
                 .stream()
                 .content()
-                .doFinally(sig -> BranchProgressListener.tryCompleteSerialized(toolEvents));
+                .doOnNext(collected::append)
+                .doFinally(sig -> {
+                    // 终结（含 cancel/error）时记录本次调用观测：流式无 usage，按已收文本估算
+                    recordCall(goal.sessionId(), true, sig != SignalType.CANCEL && sig != SignalType.ON_ERROR,
+                            null, collected, start,
+                            sig == SignalType.ON_ERROR ? new IllegalStateException("流式异常终止") : null);
+                    BranchProgressListener.tryCompleteSerialized(toolEvents);
+                });
         return content.mergeWith(toolEvents.asFlux());
+    }
+
+    /**
+     * 观测记录：调用结束（成功/失败/cancel）异步落 llm_call_log。
+     * 阻塞调用 usage 非 null 时记真实 token；流式（usage=null）按已收输出文本近似估算。
+     */
+    private void recordCall(String sessionId, boolean stream, boolean ok,
+                            org.springframework.ai.chat.metadata.Usage usage,
+                            StringBuilder collected, long start, Exception error) {
+        if (recorder == null) {
+            return;
+        }
+        Integer prompt = usage == null ? null : usage.getPromptTokens();
+        Integer completion = usage == null ? null : usage.getCompletionTokens();
+        Integer totalVal = usage == null ? null : usage.getTotalTokens();
+        Integer completionVal = completion;
+        boolean estimated = false;
+        if (stream && completionVal == null) {
+            // 流式无 usage 回包：估算输出 token（与 ContextAssemblingAdvisor 同口径）
+            completionVal = LlmCallRecorder.estimateTokens(collected == null ? "" : collected.toString());
+            totalVal = completionVal;
+            estimated = true;
+        }
+        String msg = error == null ? null
+                : (error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
+        recorder.record(new LlmCallLog(sessionId, agentName,
+                agentService.getAgentConfig(agentName).map(AgentConfig::model).orElse(null),
+                stream, ok, prompt, completionVal, totalVal, estimated,
+                System.currentTimeMillis() - start, msg));
     }
 
     /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪 */
