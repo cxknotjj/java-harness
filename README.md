@@ -28,7 +28,8 @@ src/main/java/com/dark/javaHarness/
 ├── JavaHarnessApplication.java   # Spring Boot 启动类（@MapperScan 指向 com.dark.javaHarness.mapper）
 ├── controller/                   # 表现层：REST 接口 + SSE 流式
 │   ├── ChatController.java       # 聊天接口（/api/chat、/api/chat/stream）
-│   └── HarnessController.java    # 管理接口（agents / submit / goals）
+│   ├── HarnessController.java    # 管理接口（agents / submit / goals）
+│   └── LlmCallController.java    # LLM 调用观测查询（/api/llm-calls）
 ├── service/                      # 业务层（接口）
 │   ├── AgentService.java         # Agent 编排：路由、执行目标、回写状态
 │   ├── GoalService.java          # 目标生命周期管理
@@ -36,7 +37,7 @@ src/main/java/com/dark/javaHarness/
 │   ├── ChatService.java          # 聊天用例编排（同步 / 流式 / SSE / 进度事件转换）
 │   ├── RouteJudge.java           # 主 Agent 路由判断（SIMPLE / COMPLEX 分流）
 │   ├── AgentConfigProvider.java  # 从 agent 表读取运行配置（路由映射）
-│   └── impl/                     # 业务实现（AgentServiceImpl / ChatServiceImpl / LlmRouteJudge 等）
+│   └── impl/                     # 业务实现（AgentServiceImpl / ChatServiceImpl / LlmRouteJudge / LlmCallRecorder 观测落库 等）
 ├── advisor/                      # Spring AI Advisor 拦截器（Agent 流程横切管理）
 │   └── ContextAssemblingAdvisor.java  # 上下文组装：过滤/截断/role 归一化（token 预算）
 ├── config/                       # 配置与装配
@@ -45,17 +46,18 @@ src/main/java/com/dark/javaHarness/
 │       ├── ChatClientFactory.java    # 按服务商构建 OpenAI 兼容 ChatClient（Registry 模式）
 │       └── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（从 model_provider 表加载）
 ├── mapper/                       # 数据访问层：MyBatis-Plus Mapper
-│   ├── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper / ModelProviderMapper
+│   ├── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper / ModelProviderMapper / LlmCallLogMapper
 ├── domain/                       # 领域模型（父包）
 │   ├── Goal.java                 # 目标 + 状态（PENDING/RUNNING/SUCCEEDED/FAILED）
 │   ├── AgentConfig.java          # Agent 运行配置（model + prompt），来自 agent 表
 │   ├── RouteDecision.java        # 路由决策枚举（SIMPLE / COMPLEX）
+│   ├── LlmCallLog.java           # 一次 LLM 调用的观测记录（耗时/token/成败，LlmCallRecorder 落库）
 │   ├── dto/                      # 传输对象（请求/响应体）
 │   │   ├── ChatRequest / ChatResponse / ErrorResponse / SseMeta
 │   │   ├── AgentsView / GoalView / GoalsView / SubmitView
 │   │   └── PageResult / SessionPageView（分页）
-│   └── entity/                   # 数据库实体（对应 agent / goal / session / model_provider 表）
-│       ├── AgentEntity / GoalEntity / SessionEntity / SessionMessageEntity / ModelProviderEntity
+│   └── entity/                   # 数据库实体（对应 agent / goal / session / model_provider / llm_call_log 表）
+│       ├── AgentEntity / GoalEntity / SessionEntity / SessionMessageEntity / ModelProviderEntity / LlmCallLogEntity
 ├── enums/                        # 枚举与共享常量：GoalStatus、AgentConstants
 ├── exception/                    # 全局异常处理（@RestControllerAdvice）
 ├── agent/                        # Agent 抽象与实现
@@ -84,7 +86,7 @@ src/main/java/com/dark/javaHarness/
 
 - JDK 17+
 - Maven 3.8+（项目使用项目内仓库，无需全局安装额外配置）
-- MySQL（`harness` 库，见 `application.yaml` 与 `sql/schema.sql`）
+- MySQL（`harness` 库，连接配置见 `application.yaml`；schema 由 Flyway 管理，启动自动执行 `src/main/resources/db/migration/` 迁移脚本，无需手动建表）
 - Docker Desktop（**沙箱工具硬依赖**：模型生成的 Python/命令与浏览器操作在容器内执行，宿主机零暴露；两个镜像需预拉取，见 `TECH_STACK.md` 注意事项。无 Docker 时沙箱类工具整体不可用，应用其余功能不受影响）
 - （可选）API Key：DashScope（通义千问）/ DeepSeek。不配置也能启动，但调用模型会返回 `invalid_api_key`。
 
@@ -172,6 +174,7 @@ $env:QWEN_API = "sk-你的key"
 | GET | `/api/harness/goals/{id}` | 查询单个目标状态 |
 | POST | `/api/harness/submit?agent=general&objective=...` | 提交一个异步目标 |
 | POST | `/api/harness/sessions` | 新建会话（可选 `name`，默认「新会话」），返回 sessionId/name |
+| GET | `/api/llm-calls?sessionId=&limit=` | LLM 调用观测：每次调用的耗时/token/成败（按会话过滤，默认 50 条） |
 | POST | `/api/chat` | 同步聊天：`{"message":"你好","agentId":1}` |
 | POST | `/api/chat/stream` | 流式聊天（SSE）：同请求体，逐 token 推送 |
 

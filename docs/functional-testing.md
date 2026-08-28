@@ -2,7 +2,7 @@
 
 > 本文档介绍 Harness 各模块的功能测试内容：每个模块测什么、怎么测、边界在哪。
 > 测试代码位于 `src/test/java`，与业务代码同步演进；本文以实际编码为准。
-> 更新日期：2026-08-27。
+> 更新日期：2026-08-28。
 
 ***
 
@@ -11,17 +11,26 @@
 | 测试类 | 覆盖功能域 | 用例数 |
 | --- | --- | --- |
 | `ChatControllerTest` | 入口层 SSE HTTP 输出契约 | 2 |
-| `ChatServiceImplTest` | 聊天用例编排（会话/记忆/SSE/路由/进度） | 12 |
-| `AgentServiceImplTest` | Agent 执行路由与 Goal 生命周期 | 4 |
+| `HarnessControllerTest` | 管理接口（新建会话等） | 1 |
+| `ChatServiceImplTest` | 聊天用例编排（会话/记忆/SSE/路由/进度） | 13 |
+| `AgentServiceImplTest` | Agent 执行路由与 Goal 生命周期 | 5 |
 | `LlmRouteJudgeTest` | 主 Agent 前置判断（LLM 分流） | 6 |
-| `MultiAgentGraphAgentTest` | 路径 B 多 Agent 编排 + 流式进度 | 4 |
+| `LlmCallRecorderTest` | LLM 调用观测（token 估算/异步落库/失败隔离） | 3 |
+| `MultiAgentGraphAgentTest` | 路径 B 多 Agent 编排 + 流式进度 | 9 |
+| `GeneralAssistantAgentTest` | 路径 A 真·逐 token 透传契约 | 1 |
 | `ProgressLineTest` | 进度行线协议编解码 | 4 |
+| `TerminalRendererTest` | CLI 渲染（spinner/Markdown/工具行/小结） | 11 |
 | `ContextAssemblingAdvisorTest` | 上下文组装（过滤/归一化/token 预算） | 6 |
 | `AgentConfigProviderTest` | agent 表配置读取 | 6 |
 | `ChatClientRegistryTest` | 多服务商模型注册表 | 3 |
+| `ToolAssignmentsTest` | 工具分配表（双通道/最小权限） | 5 |
+| `ToolCallTracerTest` | 工具调用事件追踪（装饰/schema 透传） | 15 |
+| `WebToolsTest` | 网页抓取工具 | 3 |
+| `ClientAbortLogFilterTest` | 断连日志降噪过滤器 | 7 |
+| `GlobalExceptionHandlerTest` | 全局异常响应结构 | 3 |
 | `JavaHarnessApplicationTests` | Spring 容器冒烟（contextLoads） | 1 |
 
-**合计：10 个测试类 / 48 个用例，`mvnw test` 全部通过（surefire 报告为准）。**
+**合计：19 个测试类 / 104 个用例，`mvnw test` 全部通过（surefire 报告为准）。**
 
 ***
 
@@ -163,6 +172,16 @@ mock `ChatClientRegistry` / `ChatClient` 固定 content（lead 固定返回两�
 
 `contextLoads()`：Spring 容器全量装配通过（含 MySQL 连接、MyBatis Mapper、各配置 Bean），是最基本的一票否决项。
 
+### 10. `LlmCallRecorderTest` —— LLM 调用观测落库
+
+验证观测旁路的三条契约：估算口径、异步落库、失败隔离。
+
+| 用例 | 验证点 |
+| --- | --- |
+| `estimateTokens_mixedText_followsAdvisorConvention` | 中英文混合 token 估算与 `ContextAssemblingAdvisor` 同口径（中文 1 token、其它 (长度+3)/4） |
+| `record_insertsEntityAsynchronously` | record 后异步落库，字段映射正确（SYNC/OK/total/estimated/duration） |
+| `record_mapperFailure_neverThrowsToCaller` | Mapper 抛异常不影响调用方（观测失败永不阻塞主链路） |
+
 ***
 
 ## 四、测试基建约定
@@ -185,3 +204,4 @@ mock `ChatClientRegistry` / `ChatClient` 固定 content（lead 固定返回两�
 | SSE 对外契约（token/DONE/meta/error 按序） | `ChatServiceImplTest.streamReactive_*`、`ChatControllerTest` |
 | 多 Agent 显式指定与回退 | `AgentServiceImplTest` |
 | agent/model 双表配置驱动 | `AgentConfigProviderTest`、`ChatClientRegistryTest` |
+| LLM 调用观测（耗时/token 账本） | `LlmCallRecorderTest` |

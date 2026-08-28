@@ -7,7 +7,7 @@
 ## 一、项目现状
 
 - **定位**：两路径 AI Agent 编排框架 —— 主 Agent（`RouteJudge` LLM 决策）按复杂度分流：简单请求走单次调用（路径 A），复杂请求走 StateGraph 多 Agent 编排（路径 B）；执行目标（Goal）全生命周期（PENDING → RUNNING → SUCCEEDED/FAILED）落库可追溯。
-- **入口**：REST API（`/api/chat`、`/api/chat/stream`、`/api/harness/*`）+ CLI 聊天客户端（`mvn exec:java`）。
+- **入口**：REST API（`/api/chat`、`/api/chat/stream`、`/api/harness/*`、`/api/llm-calls`）+ CLI 聊天客户端（`mvn exec:java`）。
 - **会话记忆**：MySQL 两张表（`session` + `session_messages`，一对一），`session_messages.content` 以 JSON 快照存储完整上下文。
 - **目标存储**：`Goal` 持久化到 MySQL `goal` 表，重启不丢，可追溯历史。
 - **执行反馈**：路径 A 逐 token 流式；路径 B 各阶段进度经生命周期钩子实时推送（`event: progress` SSE）。
@@ -28,29 +28,31 @@
 | Web      | Spring MVC                 | 随 Boot | REST + 响应式 SSE（Controller 返回 `Flux<String>`，`text/event-stream`）+ 全局异常处理 |
 | ORM      | MyBatis-Plus               | 3.5.7  | `mybatis-plus-spring-boot3-starter`，goal / session / session\_messages / agent 表的 CRUD |
 | 数据库      | MySQL                      | 9.2.0  | `mysql-connector-j`（runtime），连接池 HikariCP                                      |
+| Schema 迁移 | Flyway                     | 随 Boot | `flyway-core` + `flyway-mysql`，版本化迁移（`db/migration/V*__*.sql`），存量库经 baseline 接入；替代 `spring.sql.init` |
 | 参数校验     | Jakarta Validation         | 随 Boot | `spring-boot-starter-validation` + `@Valid` 注解校验                               |
 | HTTP 客户端 | OkHttp                     | 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`）                                   |
 | 序列化      | Jackson                    | 随 Boot | DTO 序列化 / SSE meta 解析                                                          |
 | 代码生成     | Lombok                     | -      | 实体类简化                                                                          |
-| 测试       | JUnit 5 / Mockito          | 随 Boot | 11 个测试类 / 75 用例（不依赖真实 DB/网络，见 docs/functional-testing.md）                     |
+| 测试       | JUnit 5 / Mockito          | 随 Boot | 19 个测试类 / 104 用例（不依赖真实 DB/网络，见 docs/functional-testing.md）                    |
 | 日志       | SLF4J + Logback            | 随 Boot | Agent 执行状态日志                                                                   |
-| 初始化 SQL  | schema.sql                 | -      | 启动时 `spring.sql.init` 建表                                                       |
+| 初始化 SQL  | ~~schema.sql~~ 已移除         | -      | 由 Flyway 迁移脚本接管（见上）                                                            |
 
 ### 架构分层
 
 ```
-controller（REST + SSE 流式 + 全局异常处理）
+controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测查询）
   └─ service（接口 + impl：AgentService / ChatService / GoalService / SessionService
              ├─ RouteJudge + LlmRouteJudge（主 Agent 分流判定）
-             └─ AgentConfigProvider（agent 表运行配置）
+             ├─ AgentConfigProvider（agent 表运行配置）
+             └─ LlmCallRecorder（LLM 调用观测异步落库）
         ├─ agent（Agent 抽象 + GeneralAssistantAgent 路径A + MultiAgentGraphAgent 路径B
-        │     + AgentChatCaller 调用封装 + BranchProgressListener 钩子旁路）
+        │     + AgentChatCaller 调用封装（含观测埋点） + BranchProgressListener 钩子旁路）
         │     └─ ProgressLine（进度行线协议，服务端↔CLI 共用）
         ├─ advisor（ContextAssemblingAdvisor：上下文组装/token 裁剪）
         ├─ tool（WebTools 网页抓取 / DemoTools 示例 / SandboxToolProvider 容器沙箱 / ToolAssignments 工具分配）
         ├─ cli（ChatCli 交互端） + cli/api（ChatApiClient：OkHttp + SSE 解析）
-        ├─ domain（领域模型父包，含 dto 与 entity；RouteDecision 分流决策枚举）
-        ├─ mapper（Agent / Goal / Session / SessionMessage / ModelProvider）
+        ├─ domain（领域模型父包，含 dto 与 entity；RouteDecision 分流决策枚举 / LlmCallLog 观测记录）
+        ├─ mapper（Agent / Goal / Session / SessionMessage / ModelProvider / LlmCallLog）
         ├─ enums（GoalStatus / AgentConstants）
         └─ 配置（application.yaml + config/agent：ChatAgentConfig、ChatClientFactory、ChatClientRegistry）
 ```
@@ -65,6 +67,7 @@ controller（REST + SSE 流式 + 全局异常处理）
 - **会话写回统一**：同步 / 流式路径都在 `ChatServiceImpl` 统一写回会话记忆（进度行不计入摘要）。
 - **工具调用（容器级沙箱）**：`SandboxToolProvider` 懒初始化 agentscope 沙箱（base 容器：Python/Shell/文件读写检索；browser 容器：导航/快照/点击/输入，独立镜像、独立初始化失败只降级本组），宿主机零暴露；`ToolAssignments` 按专家双通道注入（@Tool 对象走 `.tools()`、ToolCallback 走 `.toolCallbacks()`），未分配的工具对模型不可见（服务端硬边界）。researcher/general 拥有浏览器组，补 JS 渲染页面抓取空缺。
 - **统一异常响应**：`GlobalExceptionHandler` 把所有异常转成 `{code, message}` 结构（400/404/500），非法请求返回统一 400 错误体。
+- **LLM 调用观测（成本账本）**：每次 LLM 调用（路由判断 / lead 拆解 / 专家子任务 / 聚合 / 路径 A）结束经 `LlmCallRecorder` 异步写 `llm_call_log` 表——会话、角色、模型、SYNC/STREAM、成败、token（流式按输出文本近似估算）、耗时、错误；观测失败不影响主链路。`GET /api/llm-calls?sessionId=` 查询。完整链路追踪（Micrometer Tracing）见 TODO。
 
 ***
 
@@ -84,7 +87,7 @@ controller（REST + SSE 流式 + 全局异常处理）
 
 | 建议                    | 说明                                                |
 | --------------------- | ------------------------------------------------- |
-| **数据库迁移工具**           | Flyway / Liquibase 替代 `schema.sql`，管理 schema 演进   |
+| ~~数据库迁移工具~~ 已实现        | Flyway 已接入（`db/migration` 版本化迁移，存量库经 baseline 无缝过渡） |
 | PostgreSQL + pgvector | 若做 RAG，pgvector 是现成方案                             |
 | 缓存                    | `spring-boot-starter-data-redis`：会话快照缓存、限流计数、热点数据 |
 
@@ -93,7 +96,7 @@ controller（REST + SSE 流式 + 全局异常处理）
 | 建议                | 说明                                                                |
 | ----------------- | ----------------------------------------------------------------- |
 | **Actuator + 监控** | `spring-boot-starter-actuator`：健康检查、指标；可接 Prometheus + Grafana    |
-| 可观测性              | Micrometer Tracing / OpenTelemetry：链路追踪（LLM 调用耗时、token 消耗）        |
+| 可观测性              | **已实现**：LLM 调用观测自建账本（`llm_call_log` + `/api/llm-calls`）；**待做**：Micrometer Tracing / OpenTelemetry 完整链路追踪（单次请求耗时瀑布，见 TODO「完整链路追踪」）        |
 | 重试与熔断             | Spring Retry / Resilience4j：模型调用失败重试、限流熔断                         |
 | 消息队列              | RabbitMQ / Kafka：异步 Goal 派发、长任务解耦、失败重投                            |
 | 异步任务治理            | 当前 `CompletableFuture.runAsync` 无线程池管理，可换 `@Async` + 自定义线程池 / 任务表 |
@@ -135,7 +138,7 @@ controller（REST + SSE 流式 + 全局异常处理）
 
 - **版本约束**：Spring Boot 必须为 3.5.14（与 Spring AI 1.1.4 兼容），升级需整体评估 Spring AI 兼容性。
 - **模型名**：`application.yaml` 中 `model: qwen3.7-plus`，如需切换模型请同步核对 DashScope 可用模型。
-- **DB 迁移**：`goal` 表结构升级过，若在更旧库上运行需先 `DROP TABLE goal` 让 schema.sql 重建。
+- **DB 迁移**：schema 由 Flyway 管理（`db/migration/V1/V2/V3`）。存量库首次接入自动 baseline（V1 跳过、增量执行）；全新库从 V1 全量建表。新增表结构变更只需追加 `V4__xxx.sql`，启动自动应用。
 - **Docker 硬依赖**：沙箱工具依赖本机 Docker；两个镜像需预拉取（aliyun 新加坡 registry）：`runtime-sandbox-base:latest`（约 1.4GB）与 `runtime-sandbox-browser:latest`（约 2GB），否则首个工具调用会现场拉镜像拖慢执行。无 Docker 时沙箱工具组为空（warn 日志），其余功能不受影响。过程记录见 [docs/0828-沙箱接入与验证.md](./docs/0828-沙箱接入与验证.md)。
 - **容器生命周期**：容器随首次工具调用懒创建、服务优雅停止时随 `@PreDestroy` 销毁；强杀 `mvn spring-boot:run` 不触发优雅关闭会残留容器，需正常停服或 `docker rm -f` 清理。
 

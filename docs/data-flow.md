@@ -25,6 +25,9 @@
         └─ COMPLEX → 路径 B：多 Agent 编排（MultiAgentGraphAgent + StateGraph）
         │
 ④ 统一出口：会话记忆写回 + 同步/SSE 响应（对外契约一致）
+
+旁路：每次 LLM 调用（路由判断 / lead / 专家子任务 / 聚合 / 路径 A）结束
+      → LlmCallRecorder 异步落库 llm_call_log（耗时 / token / 成败，见 5d 节）
 ```
 
 ***
@@ -280,6 +283,40 @@ CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spin
 
 ***
 
+## 5d. LLM 调用观测数据流（成本账本）
+
+> 每次真实 LLM 调用结束后，把「耗时 / token / 成败」异步写 `llm_call_log` 表——账本性质，与主链路解耦：观测失败绝不影响调用本身。
+
+```
+LLM 调用出口（五类调用点统一收敛）
+│  ① LlmRouteJudge.judge()          路由判断（sessionId=null，token 为近似估算）
+│  ② MultiAgentGraphAgent.lead()    lead 拆解（经 AgentChatCaller.call）
+│  ③ MultiAgentGraphAgent 子任务     专家执行（经 AgentChatCaller.call，工具调用不单独记账）
+│  ④ MultiAgentGraphAgent 聚合      AgentChatCaller.stream（逐 token 收集后估算）
+│  ⑤ GeneralAssistantAgent          路径 A 同步 call() / 流式 stream()
+│
+▼ AgentChatCaller / GeneralAssistantAgent / LlmRouteJudge 埋点
+   调用前记 start；成功解析 Usage（真实 token）/ 失败取异常消息
+        │
+        ▼ LlmCallRecorder.record(LlmCallLog)          ← 旁路，boundedElastic 异步
+   落库 llm_call_log：session_id / agent_name / model /
+   call_kind(SYNC|STREAM) / status(OK|ERROR) /
+   prompt_tokens / completion_tokens / total_tokens /
+   tokens_estimated(1=流式无 usage 回包，按输出文本近似) /
+   duration_ms / error_msg / created_at
+   （落库失败仅 warn，不重试不阻塞主链路）
+        │
+        ▼ 查询：GET /api/llm-calls?sessionId=&limit=（LlmCallController，按 id 倒序）
+```
+
+**关键点**：① 全部调用点收敛埋点（路径 A/B + 路由判断全覆盖）；② 异步旁路（主链路零等待）；③ token 两个口径——阻塞调用取响应 `Usage` 真实值，流式无 usage 回包按输出文本近似估算（中文 1 token、其它 (长度+3)/4，与 `ContextAssemblingAdvisor` 同口径）并置 `tokens_estimated=1`；④ 每次调用只查一次 agent 表（观测的 model 与请求组装共用）。
+
+**与 Micrometer Tracing 的关系**：本表是成本账本（SQL 可聚合按角色/会话统计花费）；Tracing 是性能显微镜（单次请求耗时瀑布），互补不互替（Tracing 见 TODO「完整链路追踪」）。
+
+**测试**：`LlmCallRecorderTest`（估算口径 / 异步落库 / 落库失败不影响调用方）。
+
+***
+
 ## 6. 错误处理
 
 | 环节             | 处理                                        |
@@ -291,6 +328,7 @@ CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spin
 | lead 拆解失败      | 退化单任务；子任务失败留空，聚合跳过                        |
 | 沙箱初始化失败（无 Docker） | 空工具面 + warn（不重试、不回退宿主机），其余功能不受影响        |
 | 工具执行失败         | 包装为模型可读文本回传 LLM，由模型调整重试                    |
+| 观测落库失败         | warn 单行、不重试、不影响主链路（观测旁路永不阻塞调用）              |
 
 ## 6a. 客户端断连（cancel）传播链路
 
@@ -331,6 +369,7 @@ CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spin
 | 统一出口       | `ChatController` 同步 + SSE                            |
 | 兜底         | `AgentService` → general                             |
 | 沙箱工具面      | `SandboxToolProvider`（agentscope-runtime 容器）+ `ToolAssignments`（专家分配） |
+| LLM 调用观测   | `LlmCallRecorder`（异步落库）+ `LlmCallController`（`/api/llm-calls` 查询）   |
 
 > 更新日期：2026-08-28。
 
