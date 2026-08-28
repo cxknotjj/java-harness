@@ -217,6 +217,58 @@ CLI 解析到 `event: progress` 打印 `[阶段] 描述`，实时看到编排/�
 
 ***
 
+## 5c. 沙箱工具调用数据流（容器级隔离）
+
+> 模型生成的代码/命令**只在 Docker 容器内执行，宿主机零暴露**（自研宿主机工具 FileTools/SearchTools/ShellTools 已「重合即退役」，无降级路径）。工具面由 `SandboxToolProvider`（agentscope-runtime）提供，`ToolAssignments` 按专家硬性分配。
+
+```
+专家子任务执行（coder / analyst / general / researcher）
+│
+① 工具注入（请求组装期）
+   MultiAgentGraphAgent.call() / GeneralAssistantAgent
+   → ToolAssignments.forAgent(专家名) → ToolSet{annotated(@Tool), callbacks(ToolCallback)}
+   → spec.tools(annotated.toArray()) + spec.toolCallbacks(callbacks)
+   ⚠️ 服务端硬边界：未分配的工具 schema 不出服务端，模型不可见也无执行注册
+│
+② 工具面来源（SandboxToolProvider，懒初始化仅一次）
+   首次取用 → 双检锁 → SandboxService.start() + BaseSandbox
+   → Docker 拉起容器（镜像 runtime-sandbox-base，容器 :80 → 宿主随机端口）
+   → ToolkitInit 把容器能力包装为 12 个 ToolCallback，按安全类别三组：
+       执行类×2（RunPythonCode / RunShellCommand）
+       只读文件类×6（Read / ReadMultiple / ListDir / DirectoryTree / Search / FileInfo）
+       写入类×4（Write / Edit / CreateDir / Move）
+   （初始化失败 → 空工具面，warn 不重试，绝不回退宿主机执行）
+│
+③④ 模型侧循环（LLM tool-calling）
+   请求（工具 schema + 任务描述）──────────▶ LLM
+   ◀────────── tool_call {name, arguments} ─┐
+   │                                         │
+   ▼ ④ 服务端执行（Spring AI 框架）           │
+   解析 tool_call → 匹配 ToolCallback → 调用   │
+   → agentscope-runtime SDK ──HTTP──▶ 容器内 fastapi
+                                       └─ 容器内执行 Python/Shell/文件操作（隔离文件系统）
+   ◀── stdout / returncode / 文件内容 ──────┘
+   → 执行结果作为 tool 消息回传 LLM（含失败也以模型可读文本回传）
+│
+⑤ 循环 ③④，直至 LLM 不再发起 tool_call → 产出最终回答
+```
+
+**专家分配表**（`ToolAssignments`，最小权限）：
+
+| 专家 | @Tool 对象 | Sandbox ToolCallback |
+| --- | --- | --- |
+| researcher | WebTools（轻量网页抓取，沙箱未覆盖） | 只读文件类 |
+| coder | — | 执行类 + 写入类（读→改→跑验证闭环） |
+| analyst | — | 执行类 + 只读类 |
+| general | WebTools | 全量 |
+| writer / 未登记（含 lead、aggregator、multi-agent） | — | 空集（不触发沙箱初始化） |
+
+**关键点**：① 模型生成的代码/命令只落容器，宿主机零暴露；② 空集专家完全不触碰 Docker；③ 容器随 `@PreDestroy` 释放（`SandboxService.close()`），宿主机无残留；④ 执行失败包装为模型可读文本回传，由模型自行调整重试。
+
+**测试**：`ToolAssignmentsTest`（双通道分配语义、EMPTY 不触发沙箱初始化）+ JShell 直连真实验证（容器拉起 → 容器内 Shell returncode=0 → 退出自动删容器，见 `docs/0828-沙箱接入与验证.md`）。
+
+***
+
 ## 6. 错误处理
 
 | 环节             | 处理                                        |
@@ -226,6 +278,8 @@ CLI 解析到 `event: progress` 打印 `[阶段] 描述`，实时看到编排/�
 | Agent 执行失败（流式） | SSE `event:error`，末尾 `meta.status=FAILED` |
 | 未知 agentId     | 兜底 `general`                              |
 | lead 拆解失败      | 退化单任务；子任务失败留空，聚合跳过                        |
+| 沙箱初始化失败（无 Docker） | 空工具面 + warn（不重试、不回退宿主机），其余功能不受影响        |
+| 工具执行失败         | 包装为模型可读文本回传 LLM，由模型调整重试                    |
 
 ***
 
@@ -241,6 +295,7 @@ CLI 解析到 `event: progress` 打印 `[阶段] 描述`，实时看到编排/�
 | 路径 B（复杂）   | `MultiAgentGraphAgent`（StateGraph：lead→并行→aggregate） |
 | 统一出口       | `ChatController` 同步 + SSE                            |
 | 兜底         | `AgentService` → general                             |
+| 沙箱工具面      | `SandboxToolProvider`（agentscope-runtime 容器）+ `ToolAssignments`（专家分配） |
 
-> 更新日期：2026-08-27。
+> 更新日期：2026-08-28。
 

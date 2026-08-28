@@ -2,15 +2,12 @@ package com.dark.javaHarness.agent;
 
 import com.alibaba.cloud.ai.graph.CompileConfig;
 import com.alibaba.cloud.ai.graph.CompiledGraph;
-import com.alibaba.cloud.ai.graph.GraphLifecycleListener;
 import com.alibaba.cloud.ai.graph.NodeOutput;
 import com.alibaba.cloud.ai.graph.OverAllState;
-import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.StateGraph;
 import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
 import com.alibaba.cloud.ai.graph.exception.GraphStateException;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
-import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentService;
@@ -22,12 +19,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.openai.OpenAiChatOptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
 
@@ -55,12 +49,8 @@ public class MultiAgentGraphAgent implements Agent {
     private static final Logger log = LoggerFactory.getLogger(MultiAgentGraphAgent.class);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    /** 默认系统提示词（这里作为兜底；模型名取 agent 表 multi-agent 行，无则默认） */
-    private static final String DEFAULT_SYSTEM_PROMPT =
-            "你是一个执行任务的通用 AI 助手，请直接给出简洁、可执行的完成结果。";
-
     /** 单个总任务拆解的子任务数上限，避免滚雪球 */
-    public static final int MAX_SUBTASKS = 4;
+    private static final int MAX_SUBTASKS = 4;
 
     /** 节点名常量 */
     private static final String NODE_LEAD = "lead";
@@ -94,10 +84,8 @@ public class MultiAgentGraphAgent implements Agent {
     }
 
     private final String agentName;
-    private final ChatClientRegistry clientRegistry;
-    private final AgentService agentService;
-    /** 专家工具分配表：subtask 按指派的专家注入请求级工具 */
-    private final ToolAssignments toolAssignments;
+    /** 编排环节 LLM 调用器：封装查表配置 / 客户端获取 / 请求组装 / 工具注入 */
+    private final AgentChatCaller chatCaller;
     /** 图拓扑（构建一次）：同步执行缓存编译 {@link #graph}；流式执行每次带监听器重新编译 */
     private final StateGraph stateGraph;
     private final CompiledGraph graph;
@@ -107,9 +95,7 @@ public class MultiAgentGraphAgent implements Agent {
                                 AgentService agentService,
                                 ToolAssignments toolAssignments) {
         this.agentName = agentName;
-        this.clientRegistry = clientRegistry;
-        this.agentService = agentService;
-        this.toolAssignments = toolAssignments;
+        this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments);
         try {
             this.stateGraph = buildStateGraph();
             // 同步执行用的常驻实例
@@ -155,7 +141,8 @@ public class MultiAgentGraphAgent implements Agent {
         CompiledGraph streamingGraph;
         try {
             streamingGraph = stateGraph.compile(CompileConfig.builder()
-                    .withLifecycleListener(new BranchProgressListener(branchEvents))
+                    .withLifecycleListener(new BranchProgressListener(
+                            branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX))
                     .build());
         } catch (GraphStateException e) {
             throw new IllegalStateException("编译带监听器的 StateGraph 失败", e);
@@ -164,7 +151,7 @@ public class MultiAgentGraphAgent implements Agent {
         // 关闸在 merge 之前（见死锁说明）；complete 与 next 共用同一把锁，防迟到事件竞争
         Flux<String> mainLine = streamingGraph.stream(input)
                 .concatMap(out -> toRows(out, goal.objective(), contentSent))
-                .doFinally(sig -> tryCompleteSerialized(branchEvents));
+                .doFinally(sig -> BranchProgressListener.tryCompleteSerialized(branchEvents));
 
         return mainLine.mergeWith(branchEvents.asFlux())
                 .onErrorResume(e -> {
@@ -210,71 +197,11 @@ public class MultiAgentGraphAgent implements Agent {
         return Flux.empty(); // subtask 等其它 superstep 合并帧：由钩子旁路负责
     }
 
-    /* ---------------- 流式旁路监听器 ---------------- */
-
-    /**
-     * 并行分支进度监听器：before/after 配对过滤 lead 未布置的短路槽位
-     * （进入节点的输入态必含已布置的 subtask_i，空槽位执行即短路返回空 map），
-     * 仅对真实执行的子任务经旁路 Sink 播报「完成」，避免向 CLI 推虚假进度。
-     */
-    static final class BranchProgressListener implements GraphLifecycleListener {
-
-        private final Sinks.Many<String> events;
-        /** before 登记已布置槽位，after 消费：不在集合中即静默 */
-        private final Set<Integer> scheduled = ConcurrentHashMap.newKeySet();
-
-        BranchProgressListener(Sinks.Many<String> events) {
-            this.events = events;
-        }
-
-        @Override
-        public void before(String node, Map<String, Object> state,
-                           RunnableConfig config, Long costMillis) {
-            Integer idx = subtaskIndexIfAny(node);
-            if (idx != null && state != null) {
-                Object task = state.get(K_SUBTASK_PREFIX + idx);
-                if (task instanceof String s && !s.isBlank()) {
-                    scheduled.add(idx);
-                }
-            }
-        }
-
-        @Override
-        public void after(String node, Map<String, Object> state,
-                          RunnableConfig config, Long costMillis) {
-            Integer idx = subtaskIndexIfAny(node);
-            if (idx == null || !scheduled.remove(idx)) {
-                return; // 非子任务帧或短路槽位：静默
-            }
-            log.info("[multi-agent][hook] subtask-{} 完成", idx);
-            tryEmitSerialized(events,
-                    ProgressLine.encode("子任务", "第 " + (idx + 1) + " 个子任务完成"));
-        }
-    }
-
     /* ---------------- 工具方法 ---------------- */
 
     /** 子任务节点名 */
     private String subtaskName(int i) {
         return SUBTASK_NODE_PREFIX + i;
-    }
-
-    /** 节点名为 "subtask-{i}" 时返回索引 i，否则返回 null（供生命周期钩子判定是否子任务帧）。 */
-    private static Integer subtaskIndexIfAny(String nodeName) {
-        if (nodeName == null || !nodeName.startsWith(SUBTASK_NODE_PREFIX)) {
-            return null;
-        }
-        int idx = parseSubtaskIndex(nodeName);
-        return idx >= 0 ? idx : null;
-    }
-
-    /** 从 "subtask-{i}" 解析索引，非法返回 -1。 */
-    private static int parseSubtaskIndex(String nodeName) {
-        try {
-            return Integer.parseInt(nodeName.substring(SUBTASK_NODE_PREFIX.length()));
-        } catch (NumberFormatException e) {
-            return -1;
-        }
     }
 
     /* ---------------- StateGraph 构建 ---------------- */
@@ -391,10 +318,10 @@ public class MultiAgentGraphAgent implements Agent {
 
     /** lead 拆解：按 agent 表 lead 行的提示词/模型执行（无配置时回退内置兜底） */
     private String predictLead(String objective) {
-        return call(ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective);
+        return chatCaller.call(ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective);
     }
 
-    /** 子任务执行前日志埋点便于诊断专家指派（predictSubtask 包装处统一记审计） */
+    /** lead 拆解前日志埋点便于诊断专家指派（raw 输出统一记审计） */
     private String predictLeadLogged(String objective) {
         String raw = predictLead(objective);
         log.info("[multi-agent][lead] raw 拆解输出: {}", raw.length() > 300 ? raw.substring(0, 300) + "..." : raw);
@@ -406,7 +333,7 @@ public class MultiAgentGraphAgent implements Agent {
         String resolved = (expert == null || expert.isBlank())
                 ? AgentConstants.DEFAULT_AGENT : expert;
         String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。";
-        return call(resolved, persona, task);
+        return chatCaller.call(resolved, persona, task);
     }
 
     private String predictAggregate(List<String> results) {
@@ -414,47 +341,7 @@ public class MultiAgentGraphAgent implements Agent {
         for (int i = 0; i < results.size(); i++) {
             sb.append("【子任务").append(i + 1).append("】\n").append(results.get(i)).append("\n\n");
         }
-        return call(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, sb.toString());
-    }
-
-    /**
-     * 单次 ChatClient 调用：按 agentName 查 agent 表运行配置（model/prompt），再从注册表取客户端。
-     *
-     * <p>提示词优先级：agent 表该角色行的 prompt &gt; 调用方传入的兜底角色指令 {@code system}
-     * &gt; 内置 {@link #DEFAULT_SYSTEM_PROMPT}。表配置存在时以其为 system、
-     * {@code user} 不再重复拼接角色指令；无表配置时回退内置默认 system 并拼接兜底指令。
-     *
-     * @param forAgent 用于查配置的 agent 名（null = 用编排器自身配置）；各环节传角色/专家名
-     */
-    private String call(String forAgent, String system, String user) {
-        String configName = forAgent != null ? forAgent : agentName;
-        AgentConfig config = agentService == null ? null
-                : agentService.getAgentConfig(configName).orElse(null);
-        String model = config != null ? config.model() : null;
-        ChatClient client = clientRegistry.get(model);
-        boolean hasTablePrompt = config != null && config.prompt() != null && !config.prompt().isBlank();
-        String sysText = hasTablePrompt ? config.prompt() : DEFAULT_SYSTEM_PROMPT;
-        String userText = hasTablePrompt ? user : system + "\n" + user;
-        ChatClient.ChatClientRequestSpec spec = client.prompt()
-                .system(sysText)
-                .user(userText);
-        if (model != null && !model.isBlank()) {
-            // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
-            spec.options(OpenAiChatOptions.builder().model(model).build());
-        }
-        // 专家工具分配：按指派的专家注入请求级工具（与客户端 defaultTools 合并）
-        ToolAssignments.ToolSet toolSet = toolAssignments == null
-                ? ToolAssignments.ToolSet.EMPTY
-                : toolAssignments.forAgent(configName);
-        if (!toolSet.annotated().isEmpty()) {
-            // 必须 toArray 走 varargs Object... 重载（@Tool 对象解析）；传 List 会匹配
-            // List<ToolCallback> 重载导致「No @Tool annotated methods found」异常
-            spec.tools(toolSet.annotated().toArray());
-        }
-        if (!toolSet.callbacks().isEmpty()) {
-            spec.toolCallbacks(toolSet.callbacks().toArray(new org.springframework.ai.tool.ToolCallback[0]));
-        }
-        return spec.call().content();
+        return chatCaller.call(ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, sb.toString());
     }
 
     /**
@@ -496,19 +383,5 @@ public class MultiAgentGraphAgent implements Agent {
 
     private static String safe(Throwable t) {
         return t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
-    }
-
-    /** 串行化向旁路 Sink 发射一条事件（并行钩子线程可能同时回调，Reactor 单播 Sink 拒绝并发发射）。 */
-    private static void tryEmitSerialized(Sinks.Many<String> sink, String line) {
-        synchronized (sink) {
-            sink.tryEmitNext(line);
-        }
-    }
-
-    /** 串行化关闸：与 {@link #tryEmitSerialized} 共用同一把锁，防止迟到发射与 complete 竞争。 */
-    private static void tryCompleteSerialized(Sinks.Many<String> sink) {
-        synchronized (sink) {
-            sink.tryEmitComplete();
-        }
     }
 }
