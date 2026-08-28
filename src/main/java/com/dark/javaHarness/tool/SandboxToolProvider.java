@@ -2,6 +2,7 @@ package com.dark.javaHarness.tool;
 
 import com.alibaba.cloud.ai.sandbox.ToolkitInit;
 import io.agentscope.runtime.sandbox.box.BaseSandbox;
+import io.agentscope.runtime.sandbox.box.BrowserSandbox;
 import io.agentscope.runtime.sandbox.box.Sandbox;
 import io.agentscope.runtime.sandbox.manager.ManagerConfig;
 import io.agentscope.runtime.sandbox.manager.SandboxService;
@@ -15,14 +16,18 @@ import org.springframework.stereotype.Component;
 /**
  * 容器级沙箱工具提供者（spring-ai-alibaba-sandbox / agentscope-runtime）。
  *
- * <p>职责：把 agentscope 沙箱里的 ToolCallback（Python 执行 / Shell / 文件读写检索）
- * 按安全类别暴露给 {@link ToolAssignments}，替代已退役的宿主机工具
+ * <p>职责：把 agentscope 沙箱里的 ToolCallback（Python 执行 / Shell / 文件读写检索 /
+ * 浏览器导航与快照）按安全类别暴露给 {@link ToolAssignments}，替代已退役的宿主机工具
  * （FileTools/SearchTools/ShellTools——模型生成的代码与命令只在容器内执行，宿主机零暴露）。
+ *
+ * <p>容器拓扑：同一个 {@link SandboxService} 管理两个容器（同 user/session，不同镜像类型）：
+ * base 容器（Python/Shell/文件）与 browser 容器（Chromium 浏览器，独立镜像）。
  *
  * <p>初始化策略（架构决策：沙箱是硬依赖、不做宿主机降级）：
  * 懒初始化（首次取用才拉起 Docker 容器），失败时记录 warn 并返回空工具面、
  * 进程内不再重试——即无 Docker 环境下沙箱类能力整体不可用，但应用其余功能不受影响；
  * 绝不回退到宿主机执行（文件/Shell 工具已删除，无退路可走）。
+ * base 与 browser 两组初始化相互独立：浏览器镜像缺失只降级浏览器工具，不影响执行/文件类。
  */
 @Component
 public class SandboxToolProvider {
@@ -36,30 +41,44 @@ public class SandboxToolProvider {
     private final Object lock = new Object();
     private volatile boolean initialized;
 
+    /** 浏览器组独立初始化锁：与 base 组互不阻塞、互不牵连 */
+    private final Object browserLock = new Object();
+    private volatile boolean browserInitialized;
+
     private volatile List<ToolCallback> base = List.of();
     private volatile List<ToolCallback> readOnly = List.of();
     private volatile List<ToolCallback> write = List.of();
+    private volatile List<ToolCallback> browser = List.of();
     private volatile SandboxService service;
 
-    /** 执行类：Python 代码执行 + Shell 命令（容器内） */
+    /** 执行类：Python 代码执行 + Shell 命令（base 容器内） */
     public List<ToolCallback> baseTools() {
         ensure();
         return base;
     }
 
-    /** 只读文件类：读文件/批量读/列目录/目录树/搜索/文件信息（容器内文件系统） */
+    /** 只读文件类：读文件/批量读/列目录/目录树/搜索/文件信息（base 容器内文件系统） */
     public List<ToolCallback> readOnlyFileTools() {
         ensure();
         return readOnly;
     }
 
-    /** 写入类：写文件/编辑替换/建目录/移动（容器内文件系统） */
+    /** 写入类：写文件/编辑替换/建目录/移动（base 容器内文件系统） */
     public List<ToolCallback> writeTools() {
         ensure();
         return write;
     }
 
-    /** 懒初始化：双检锁保证只尝试一次；任何失败都降级为空工具面（宿主机零暴露，不重试） */
+    /**
+     * 浏览器类：页面导航 / 无障碍快照（抓 JS 渲染后正文）/ 点击 / 输入 / 关闭
+     * （browser 容器，独立镜像 runtime-sandbox-browser，缺失时本组为空）
+     */
+    public List<ToolCallback> browserTools() {
+        ensureBrowser();
+        return browser;
+    }
+
+    /** 懒初始化 base 组：双检锁保证只尝试一次；失败降级为空工具面（宿主机零暴露，不重试） */
     private void ensure() {
         if (initialized) {
             return;
@@ -75,6 +94,38 @@ public class SandboxToolProvider {
                         t.toString());
             }
             initialized = true;
+        }
+    }
+
+    /** 懒初始化 browser 组：与 base 组共用 SandboxService（close 时一起释放），失败只降级本组 */
+    private void ensureBrowser() {
+        ensure(); // browser 容器复用同一 SandboxService，先确保服务已启动
+        if (browserInitialized) {
+            return;
+        }
+        synchronized (browserLock) {
+            if (browserInitialized) {
+                return;
+            }
+            try {
+                SandboxService svc = service;
+                if (svc == null) {
+                    log.warn("[sandbox] 沙箱服务不可用，浏览器工具组为空");
+                } else {
+                    Sandbox browserBox = new BrowserSandbox(svc, SANDBOX_USER, SANDBOX_SESSION);
+                    this.browser = List.of(
+                            ToolkitInit.BrowserNavigateTool(browserBox),
+                            ToolkitInit.BrowserSnapshotTool(browserBox),
+                            ToolkitInit.BrowserClickTool(browserBox),
+                            ToolkitInit.BrowserTypeTool(browserBox),
+                            ToolkitInit.BrowserCloseTool(browserBox));
+                    log.info("[sandbox] 浏览器沙箱就绪: 浏览器类={}", browser.size());
+                }
+            } catch (Throwable t) {
+                log.warn("[sandbox] 浏览器沙箱初始化失败（runtime-sandbox-browser 镜像？），"
+                        + "浏览器工具组为空，其余沙箱工具不受影响: {}", t.toString());
+            }
+            browserInitialized = true;
         }
     }
 
@@ -103,7 +154,7 @@ public class SandboxToolProvider {
                 base.size(), readOnly.size(), write.size());
     }
 
-    /** 应用退出时释放沙箱服务与容器 */
+    /** 应用退出时释放沙箱服务与全部容器（base + browser） */
     @PreDestroy
     public void shutdown() {
         try {

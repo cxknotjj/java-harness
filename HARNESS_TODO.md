@@ -75,11 +75,9 @@
   - `ToolAssignments` 双通道：Sandbox 工具为 `ToolCallback` 形态走 `.toolCallbacks()`，自研 `@Tool` 对象走 `.tools()`，按专家分配不变
   - Docker host 无需显式配置：默认 `localhost:2375` 失败后自动回退 Docker Desktop 标准 socket
   - 验证：75/75 单测通过；Docker 29.7.2 下 JShell 真实验证容器拉起 + 容器内 Shell 执行（returncode=0）+ 退出容器自动删除；镜像 `runtime-sandbox-base:latest` 需预拉取（aliyun 新加坡 registry）
-- [ ] **Sandbox 落地遗留跟进**（承接上一条，过程记录见 `docs/0828-沙箱接入与验证.md`）：
-  - 真实 LLM 端到端：模型生成 Python/Shell 落容器执行，重启服务 + CLI 复杂任务验证（当前仅验证 Java→Docker 链路）
-    - 验收：coder 子任务的代码/命令在容器内执行并返回结果，容器随会话创建与销毁可见
-  - 浏览器自动化（`BrowserNavigateTool`）：补 web search 空缺，供 researcher/general 抓取动态渲染页面
-    - 验收：researcher 能通过浏览器工具获取一个 JS 渲染页面的正文
+- [x] **Sandbox 落地遗留跟进**（承接上一条，过程记录见 `docs/0828-沙箱接入与验证.md`）：
+  - 真实 LLM 端到端 ✅：流式接口发「Python 计算前 20 个素数和并运行验证」复杂任务——lead 按难度拆 1 个子任务指派 coder，`RunPythonCodeTool` 经容器 fastapi `run_ipython_cell` 端点执行，SSE 进度完整（编排→拆解→子任务→聚合）、`meta SUCCEEDED`、结果正确（素数和 639）；容器随首次工具调用创建（懒初始化），服务优雅停止时随 `@PreDestroy` 销毁（注意：强杀 `mvn spring-boot:run` 不触发优雅关闭会残留容器，需正常停服或 `docker rm -f`）
+  - 浏览器自动化 ✅：`SandboxToolProvider` 新增浏览器工具组（Navigate/Snapshot/Click/Type/Close，独立镜像 `runtime-sandbox-browser:latest` 需预拉取；独立懒初始化，失败只降级本组不影响执行/文件类）；分配给 researcher/general 补 JS 渲染页面抓取空缺；JShell 直连验证：`BrowserSandbox` navigate 到 `quotes.toscrape.com/js/`（纯 HTTP 抓取拿不到内容的 JS 渲染页）并 snapshot 取得 5381 字符无障碍快照（含 JS 加载的名言正文），关闭后容器删除零残留；`ToolAssignments` 分配表与测试同步更新，全量回归通过
 - [ ] **工具分配最小权限化**：现状按「能力类别」粒度分配（`ToolAssignments` 给整组工具），存在权限漏洞：
   - **`general` 全量过宽且是所有回退路径的落点**：路由兜底、未识别专家、lead 漏指派全部落 general——最宽权限（执行/容器写/网页）给了最不可控的场景，违背最小权限原则
   - 改造项（沙箱语境下已简化：沙箱原生分执行/只读文件/写入三类，无需再拆类）：

@@ -9,6 +9,7 @@
 | 框架 | Spring Boot 3.5.14 | 应用骨架、依赖注入、REST、自动配置 |
 | AI 模型接入 | Spring AI 1.1.4 + `spring-ai-starter-model-openai` | 通过 OpenAI 兼容协议接入多个服务商（DashScope / DeepSeek），`Registry` 模式按 model 路由 |
 | Graph 编排 | `spring-ai-alibaba-graph-core`（BOM 1.1.2.2） | 复杂任务多 Agent 编排：StateGraph「lead 拆解 → 并行子任务 → 聚合」+ 生命周期钩子进度推送 |
+| 沙箱工具 | `spring-ai-alibaba-sandbox`（BOM 1.1.2.2） | 容器级工具执行隔离（agentscope-runtime）：Python/Shell/文件 + 浏览器导航快照，宿主机零暴露（需本机 Docker） |
 | 大模型 | 多模型（qwen-plus/max/turbo、gpt-4o、deepseek-chat 等） | 由 `model_provider` 表 + `agent` 表共同决定 |
 | 命令行交互 | `ChatCli`（自研循环） | 交互式终端：直接输入文本对话；`/agent <id>` 切换专家、`/agent off` 关闭手动指定恢复智能分流 |
 | HTTP | OkHttp 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`） |
@@ -61,12 +62,17 @@ src/main/java/com/dark/javaHarness/
 │   ├── Agent.java                # Agent 接口：name() / execute() / executeStreamReactive()
 │   ├── GeneralAssistantAgent.java  # 路径 A：单次调用大模型（同步 call() / 真·逐 token stream()）
 │   ├── MultiAgentGraphAgent.java   # 路径 B：StateGraph 多 Agent 编排（lead→并行子任务→聚合）+ 钩子进度旁路
+│   ├── AgentChatCaller.java        # LLM 单次调用封装（查 agent 表配置 → 取客户端 → 组装 → 工具注入）
+│   ├── BranchProgressListener.java # graph-core 生命周期钩子旁路（并行分支完成事件串行发射）
 │   └── ProgressLine.java           # 进度行线协议（MARK+stage+SEP+detail）编解码，服务端↔CLI 共用
 ├── cli/
 │   ├── ChatCli.java              # 命令行聊天客户端（独立进程，纯 HTTP 连 8080）
 │   └── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE)
 └── tool/
-    └── DemoTools.java            # 示例工具集（时间 / 计算 / 天气）
+    ├── WebTools.java             # 网页抓取工具（fetchUrl：HTML→纯文本，仅 http/https，限长）
+    ├── DemoTools.java            # 示例工具集（时间 / 计算 / 天气）
+    ├── SandboxToolProvider.java  # 容器级沙箱工具（agentscope：Python/Shell/文件 + 浏览器，懒初始化、失败降级空工具面）
+    └── ToolAssignments.java      # 工具分配表：按专家分配工具集（@Tool 对象 + ToolCallback 双通道，最小权限）
 ```
 
 > 分层职责：
@@ -79,13 +85,14 @@ src/main/java/com/dark/javaHarness/
 - JDK 17+
 - Maven 3.8+（项目使用项目内仓库，无需全局安装额外配置）
 - MySQL（`harness` 库，见 `application.yaml` 与 `sql/schema.sql`）
+- Docker Desktop（**沙箱工具硬依赖**：模型生成的 Python/命令与浏览器操作在容器内执行，宿主机零暴露；两个镜像需预拉取，见 `TECH_STACK.md` 注意事项。无 Docker 时沙箱类工具整体不可用，应用其余功能不受影响）
 - （可选）API Key：DashScope（通义千问）/ DeepSeek。不配置也能启动，但调用模型会返回 `invalid_api_key`。
 
 ## 多模型与多服务商（Registry 模式）
 
 项目支持**多 Agent + 多模型服务商**，接入手性完全由数据库驱动：
 
-- **Agent**（`agent` 表）：每行定义一个 Agent（`agent_name`/`model`/`prompt`），对应一个已在 [ChatAgentConfig](src/main/java/com/dark/javaHarness/config/ChatAgentConfig.java) 注册的 bean 实例（general / deepseek）。
+- **Agent**（`agent` 表）：每行定义一个 Agent（`agent_name`/`model`/`prompt`），对应一个已在 [ChatAgentConfig](src/main/java/com/dark/javaHarness/config/ChatAgentConfig.java) 注册的 bean 实例。种子行：`general`/`deepseek`（聊天）、`multi-agent`（编排器）、`lead`（子任务拆解器）、`aggregator`（结果聚合器）、`researcher`/`coder`/`analyst`/`writer`（专家，供 lead 按子任务指派）。
 - **模型映射**（`model_provider` 表）：每行定义 `model → (provider, api_url, status)`。
   - 新增模型/服务商 = 表里加一行（`status=1` 启用），重启即加载；无需改代码。
   - `status=0` 禁用 → 该模型回退到默认 DashScope 客户端。

@@ -39,6 +39,7 @@ class ToolAssignmentsTest {
         lenient().when(sandbox.baseTools()).thenReturn(List.of(cb));
         lenient().when(sandbox.readOnlyFileTools()).thenReturn(List.of(cb, cb));
         lenient().when(sandbox.writeTools()).thenReturn(List.of(cb, cb, cb));
+        lenient().when(sandbox.browserTools()).thenReturn(List.of(cb, cb));
         assignments = new ToolAssignments(webTools, sandbox);
     }
 
@@ -46,7 +47,7 @@ class ToolAssignmentsTest {
     void researcher_getsWebAndReadOnlySandboxTools() {
         ToolAssignments.ToolSet set = assignments.forAgent("researcher");
         assertEquals(List.of(webTools), set.annotated(), "researcher 注入网页抓取");
-        assertEquals(2, set.callbacks().size(), "researcher 只有只读文件/检索沙箱工具");
+        assertEquals(4, set.callbacks().size(), "researcher = 只读文件(2) + 浏览器(2)");
         verify(sandbox, never()).baseTools();
         verify(sandbox, never()).writeTools();
     }
@@ -57,6 +58,7 @@ class ToolAssignmentsTest {
         assertTrue(set.annotated().isEmpty(), "coder 无 @Tool 注解工具");
         assertEquals(4, set.callbacks().size(), "coder = 执行类(1) + 写入类(3)");
         verify(sandbox, never()).readOnlyFileTools();
+        verify(sandbox, never()).browserTools();
     }
 
     @Test
@@ -64,13 +66,14 @@ class ToolAssignmentsTest {
         ToolAssignments.ToolSet set = assignments.forAgent("analyst");
         assertEquals(3, set.callbacks().size(), "analyst = 执行类(1) + 只读类(2)");
         verify(sandbox, never()).writeTools();
+        verify(sandbox, never()).browserTools();
     }
 
     @Test
     void general_getsFullToolset() {
         ToolAssignments.ToolSet set = assignments.forAgent("general");
         assertEquals(List.of(webTools), set.annotated());
-        assertEquals(6, set.callbacks().size(), "general = 执行(1) + 只读(2) + 写入(3) 全量");
+        assertEquals(8, set.callbacks().size(), "general = 执行(1) + 只读(2) + 写入(3) + 浏览器(2) 全量");
     }
 
     @Test
@@ -83,5 +86,6 @@ class ToolAssignmentsTest {
         verify(sandbox, never()).baseTools();
         verify(sandbox, never()).readOnlyFileTools();
         verify(sandbox, never()).writeTools();
+        verify(sandbox, never()).browserTools();
     }
 }
