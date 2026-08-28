@@ -17,4 +17,18 @@ public final class AgentConstants {
 
     /** 复杂路径 Agent 名称（多 Agent 编排：MultiAgentGraphAgent）。 */
     public static final String MULTI_AGENT = "multi-agent";
+
+    /* ------- 专家 Agent 名称（agent 表专家行；lead 拆解时可指派给子任务） ------- */
+
+    /** 资料调研专家。 */
+    public static final String EXPERT_RESEARCHER = "researcher";
+
+    /** 代码编写/修复专家。 */
+    public static final String EXPERT_CODER = "coder";
+
+    /** 数据分析专家。 */
+    public static final String EXPERT_ANALYST = "analyst";
+
+    /** 汇总撰写专家。 */
+    public static final String EXPERT_WRITER = "writer";
 }

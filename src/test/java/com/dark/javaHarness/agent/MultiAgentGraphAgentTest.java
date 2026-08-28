@@ -6,6 +6,10 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
@@ -165,5 +169,69 @@ class MultiAgentGraphAgentTest {
             }
         }
         return -1;
+    }
+
+    /* ---------------- 专家 agent 派遣 ---------------- */
+
+    /** 构建一个独立的、完整 stub 链的 ChatClient mock（各专家客户端互不干扰）。 */
+    private ChatClient newStubbedClient(String content) {
+        ChatClient client = mock(ChatClient.class);
+        ChatClientRequestSpec req = mock(ChatClientRequestSpec.class);
+        CallResponseSpec resp = mock(CallResponseSpec.class);
+        when(client.prompt()).thenReturn(req);
+        when(req.system(anyString())).thenReturn(req);
+        when(req.user(anyString())).thenReturn(req);
+        when(req.options(any())).thenReturn(req);
+        when(req.call()).thenReturn(resp);
+        when(resp.content()).thenReturn(content);
+        return client;
+    }
+
+    /** lead 返回新格式（对象数组带 agent 指派），专家行登记了 model 配置。 */
+    private void stubExpertDispatch() {
+        String leadJson =
+                "{\"subtasks\":[{\"desc\":\"调研竞品\",\"agent\":\"researcher\"},"
+                        + "{\"desc\":\"统计销量\",\"agent\":\"analyst\"}]}";
+        stubChat(leadJson); // 默认客户端：lead + 聚合（get(any()) 兜底）
+        // 专家行有配置 → 子任务按专家 model 取对应客户端
+        when(agentService.getAgentConfig(eq("researcher")))
+                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig("qwen-plus", "调研提示词")));
+        when(agentService.getAgentConfig(eq("analyst")))
+                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig("deepseek-chat", "分析提示词")));
+        // 先建好独立 stub 的专家客户端，再注册（避免在 when() 求值内嵌套 stubbing 触发 UnfinishedStubbing）
+        ChatClient researcherClient = newStubbedClient("调研结果");
+        ChatClient analystClient = newStubbedClient("分析结果");
+        when(clientRegistry.get(eq("qwen-plus"))).thenReturn(researcherClient);
+        when(clientRegistry.get(eq("deepseek-chat"))).thenReturn(analystClient);
+    }
+
+    @Test
+    void execute_dispatchesSubtasksToExpertClients() {
+        stubExpertDispatch();
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService);
+
+        String reply = agent.execute(new Goal("g5", "调研竞品并统计销量"));
+
+        assertNotNull(reply);
+        assertFalse(reply.isBlank(), "专家派遣后仍应产出聚合最终回答");
+        // 子任务按指派查询专家配置并取对应模型客户端
+        verify(agentService).getAgentConfig("researcher");
+        verify(agentService).getAgentConfig("analyst");
+        verify(clientRegistry).get("qwen-plus");
+        verify(clientRegistry).get("deepseek-chat");
+    }
+
+    @Test
+    void execute_rejectsUnknownAgentAndFallsBackToDefault() {
+        String leadJson = "{\"subtasks\":[{\"desc\":\"任务X\",\"agent\":\"hacker\"}]}";
+        stubChat(leadJson);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService);
+
+        String reply = agent.execute(new Goal("g6", "任务X"));
+
+        assertNotNull(reply);
+        // 白名单拒绝：绝不以非法名查配置/取客户端
+        verify(agentService, never()).getAgentConfig("hacker");
+        verify(clientRegistry, never()).get("hacker");
     }
 }

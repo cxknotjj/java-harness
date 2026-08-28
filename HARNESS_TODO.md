@@ -39,8 +39,20 @@
 
 ## P0 · 架构收尾（眼前优先）
 
-- [ ] **补齐 agent 表配置**：新增 `agentName='multi-agent'` 记录并指定模型，消除「使用默认配置」退回（现状：编排全节点挤在默认客户端+兜底 prompt 上）。
-- [ ] **专家 agent 派遣**：让 lead 在拆解 JSON 里为每条子任务输出 `agentId`，subtask 节点按此从 `ChatClientRegistry` 取对应专家客户端执行。改动点在 lead 的拆解提示词和 `MultiAgentGraphAgent` 子任务节点的取客户端逻辑，属于下一个迭代量级。
+- [x] **补齐 agent 表配置**：`schema.sql` 种子数据新增 `agentName='multi-agent'` 行（qwen-max + 编排提示词），重启即生效（`INSERT IGNORE` 幂等），消除「使用默认配置」退回。
+- [x] **专家 agent 派遣**：lead 拆解 JSON 升级为对象数组 `{"subtasks":[{"desc":"..","agent":"专家名"}]}`，subtask 节点按专家名查 agent 表配置取对应客户端执行；白名单校验（researcher/coder/analyst/writer/general），非法回退默认；兼容旧纯字符串格式。测试见 `MultiAgentGraphAgentTest` 派遣与回退两用例。
+  - **专家清单（按现有流程 lead→并行子任务→聚合 设计，登记进 agent 表）**：
+
+    | agent_name | 职责 | 建议 model | system prompt 要点 | 依赖工具（P1 工具库） |
+    |---|---|---|---|---|
+    | `multi-agent` | 编排器本体（lead 拆解 + 聚合） | qwen-max | 规划者：把复杂目标拆成 ≤4 条可独立执行、可判定完成度的子任务；聚合时忠实汇总不改写结论 | 无（纯规划） |
+    | `researcher` | 资料调研 | qwen-plus | 检索信息、交叉核对来源、输出带出处的资料摘要 | 网页搜索 + 抓取 |
+    | `coder` | 代码编写/修复 | deepseek-chat | 读懂仓库上下文、给出可运行代码与修改说明、执行验证命令 | 文件读写 + Shell |
+    | `analyst` | 数据分析 | deepseek-chat | 结构化数据处理、指标计算、结论用数字说话 | SQL 只读 + 计算 |
+    | `writer` | 汇总撰写 | qwen-max | 把多方结果整合成结构化报告（标题/要点/结论），忠实引用子任务产出 | 无 |
+    | `general` | 通用兜底（已存在） | 现配置 | 通用助手，未匹配到专家时由 lead 回退指派 | 无 |
+
+  - 落地顺序：先插 `multi-agent` 行解 P0 配置退回 → 再建专家行（prompt 可先简配）→ 最后打通 lead 按 `agentId` 派遣；未识别的 agentId 一律回退 `general`。
 - [ ] **Graph 内逐 token 流式**：复杂路径当前只做到「阶段进度实时推送 + 聚合结果一次性输出」，子任务节点仍是阻塞单次调用；演进为 Graph 各节点产出逐 token 流。
 - [ ] **并发断连的可观测处理**：多 Agent 并发执行期间若客户端断开（超时/退出），Tomcat 会报 `AsyncRequestNotUsableException`（Connection reset by peer）。根因（CLI 超时过短、伪流式等待）已修复，服务端还需把「下游断开」降噪为 warn 并及时终止编排，避免无谓消耗。
 - [ ] 为复杂路径注册 Checkpointer（可选，落库断点）——如需再评估。

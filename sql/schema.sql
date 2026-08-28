@@ -81,11 +81,18 @@ CREATE TABLE IF NOT EXISTS `agent` (
 -- 每个 agent_name 对应一个已实例化的 Agent：
 --   general 走 DashScope（spring.ai.openai，模型由本表 model 决定）
 --   deepseek 走独立端点（app.deepseek，模型由配置决定，本表 model 仅作展示）
+-- multi-agent 为复杂路径编排器；researcher/coder/analyst/writer 为
+-- lead 拆解时可指派的专家子任务 Agent（见 MultiAgentGraphAgent 白名单）。
 -- INSERT IGNORE 利用唯一键保证幂等。
 -- ============================================================
 INSERT IGNORE INTO `agent` (agent_name, description, model, prompt, status) VALUES
-('general', '通用 AI 助手（默认）', 'qwen-plus', '你是一个执行任务的 AI 助手，请直接给出简洁、可执行的完成结果。能结合会话历史。', 1),
-('deepseek','深度推理助手（独立端点 DeepSeek）', 'deepseek-chat', '你是 DeepSeek 驱动的助手，给出生动且高质量的回复。', 1);
+('general', '通用 AI 助手（默认）', 'qwen3.7-plus', '你是一个执行任务的 AI 助手，请直接给出简洁、可执行的完成结果。能结合会话历史。', 1),
+('deepseek','深度推理助手（独立端点 DeepSeek）', 'deepseek-v4-flash', '你是 DeepSeek 驱动的助手，给出生动且高质量的回复。', 1),
+('multi-agent', '复杂路径编排器（lead 拆解 + 聚合）', 'qwen3.7-plus', '你是多 Agent 编排的规划者：把复杂目标拆解为至多 4 条可独立执行、可判定完成度的子任务，并为每条指派专家；聚合时忠实汇总各子任务结果，不改写结论。', 1),
+('researcher', '专家：资料调研', 'qwen3.7-plus', '你是资料调研专家：检索相关信息、交叉核对来源，输出带出处的资料摘要。', 1),
+('coder', '专家：代码编写与修复', 'qwen3.7-plus', '你是代码专家：读懂上下文，给出可运行的代码与修改说明，必要时说明验证方式。', 1),
+('analyst', '专家：数据分析', 'qwen3.7-plus', '你是数据分析专家：处理结构化数据、计算指标，结论用数字说话。', 1),
+('writer', '专家：汇总撰写', 'qwen3.7-plus', '你是撰写专家：把多方结果整合成结构化报告（标题/要点/结论），忠实引用原始产出。', 1);
 
 -- ============================================================
 -- 模型-服务商映射表：驱动 ChatClientRegistry 动态注册。

@@ -12,6 +12,7 @@ import com.alibaba.cloud.ai.graph.exception.GraphStateException;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
+import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -25,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.openai.OpenAiChatOptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
 
@@ -33,8 +35,9 @@ import reactor.core.publisher.Sinks;
  *
  * <p>基于 {@link StateGraph} 编排「Lead 拆解 → 并行子任务 → 聚合」三阶段，
  * 每个阶段都是一次独立的 ChatClient 单次调用（复用 {@link ChatClientRegistry} 的客户端）：
- * - lead 节点：把复杂目标拆成至多 {@link #MAX_SUBTASKS} 条子任务（JSON 解析）
- * - subtask-i 节点：并行执行，各自调用模型产出该子任务结果
+ * - lead 节点：把复杂目标拆成至多 {@link #MAX_SUBTASKS} 条子任务（JSON 解析），
+ *   并为每条子任务指派专家（researcher/coder/analyst/writer/general，白名单校验，非法回退）
+ * - subtask-i 节点：并行执行，按指派的专家名查 agent 表配置取对应 ChatClient 产出该子任务结果
  * - aggregate 节点：收集各子任务结果，调用模型汇总成最终回答
  *
  * <p>与路径 A 的 {@link GeneralAssistantAgent} 对 Key 契约一致：
@@ -65,11 +68,24 @@ public class MultiAgentGraphAgent implements Agent {
     private static final String K_OBJECTIVE = "objective";
     private static final String K_SUBTASK_COUNT = "subtaskCount";
     private static final String K_SUBTASK_PREFIX = "subtask_";
+    private static final String K_SUBTASK_AGENT_PREFIX = "subtaskAgent_";
     private static final String K_RESULT_PREFIX = "result_";
     private static final String K_FINAL = "final";
 
     /** 子任务节点名前缀 */
     private static final String SUBTASK_NODE_PREFIX = "subtask-";
+
+    /** lead 拆解可指派的专家白名单：不在名单中的 agent 名一律回退默认（general 语义） */
+    private static final Set<String> EXPERT_WHITELIST = Set.of(
+            AgentConstants.EXPERT_RESEARCHER,
+            AgentConstants.EXPERT_CODER,
+            AgentConstants.EXPERT_ANALYST,
+            AgentConstants.EXPERT_WRITER,
+            AgentConstants.DEFAULT_AGENT);
+
+    /** lead 拆解产物：子任务描述 + 指派专家（agent 可为 null = 未指派，执行时回退默认） */
+    record Subtask(String desc, String agent) {
+    }
 
     private final String agentName;
     private final ChatClientRegistry clientRegistry;
@@ -286,34 +302,41 @@ public class MultiAgentGraphAgent implements Agent {
 
     /* ------------ 节点实现（同步 NodeAction，返回状态更新 Map） ------------ */
 
-    /** lead：把 objective 拆解为 N 条子任务，写 subtask_0..subtask_{n-1} 与 subtaskCount。 */
+    /**
+     * lead：把 objective 拆解为 N 条子任务（可带专家指派），
+     * 写 subtask_0..n-1、subtaskAgent_0..n-1 与 subtaskCount。
+     */
     private Map<String, Object> lead(OverAllState state) {
         String objective = state.value(K_OBJECTIVE, String.class).orElse("");
         String content = predictLead(objective);
-        List<String> items = parseSubtasks(content);
+        List<Subtask> items = parseSubtasks(content);
         if (items.isEmpty()) {
-            items.add(objective); // 拆解失败：退化为单个子任务=objective
+            items.add(new Subtask(objective, null)); // 拆解失败：退化为单个子任务=objective
         }
         Map<String, Object> updates = new HashMap<>();
         int n = Math.min(items.size(), MAX_SUBTASKS);
         updates.put(K_SUBTASK_COUNT, n);
         for (int i = 0; i < n; i++) {
-            updates.put(K_SUBTASK_PREFIX + i, items.get(i));
+            Subtask item = items.get(i);
+            updates.put(K_SUBTASK_PREFIX + i, item.desc());
+            updates.put(K_SUBTASK_AGENT_PREFIX + i, item.agent());
         }
-        log.info("[multi-agent][lead] 拆解为 {} 个子任务", n);
+        log.info("[multi-agent][lead] 拆解为 {} 个子任务，指派：{}", n,
+                items.subList(0, n).stream().map(Subtask::agent).toList());
         return updates;
     }
 
-    /** 子任务节点：读 subtask_i，若存在则调用 ChatClient 生成 result_i。 */
+    /** 子任务节点：读 subtask_i 与指派的 subtaskAgent_i，若存在则调用对应专家 ChatClient 生成 result_i。 */
     private Map<String, Object> subtask(OverAllState state, int idx) {
         String task = state.value(K_SUBTASK_PREFIX + idx, String.class).orElse(null);
         if (task == null || task.isBlank()) {
             return new HashMap<>(); // lead 未设置该子任务 → 快速短路
         }
-        String result = predictSubtask(task);
+        String expert = state.value(K_SUBTASK_AGENT_PREFIX + idx, String.class).orElse(null);
+        String result = predictSubtask(task, expert);
         Map<String, Object> updates = new HashMap<>();
         updates.put(K_RESULT_PREFIX + idx, result);
-        log.info("[multi-agent][subtask-{}] 完成，结果长度={}", idx, result.length());
+        log.info("[multi-agent][subtask-{}] 完成（专家={}），结果长度={}", idx, expert, result.length());
         return updates;
     }
 
@@ -342,13 +365,19 @@ public class MultiAgentGraphAgent implements Agent {
     /* ---------- ChatClient 单次调用 ---------- */
 
     private String predictLead(String objective) {
-        String sys = "你是多 Agent 的 Lead 拆解器。把用户复杂目标拆解为若干条可并行执行的子任务。"
-                + "只输出一行 JSON，格式：{\"subtasks\":[\"子任务1\",\"子任务2\",...]}，不要任何解释。";
-        return call(sys, "拆解目标：" + objective);
+        String sys = "你是多 Agent 的 Lead 拆解器。把用户复杂目标拆解为若干条可并行执行的子任务，"
+                + "并为每条子任务指派最合适的专家执行。可选专家（只能用这些名字）："
+                + "researcher（资料调研）、coder（代码编写/修复）、analyst（数据分析）、writer（汇总撰写）、general（通用兜底）。"
+                + "只输出一行 JSON，格式："
+                + "{\"subtasks\":[{\"desc\":\"子任务描述\",\"agent\":\"专家名\"}]}，不要任何解释。";
+        return call(null, sys, "拆解目标：" + objective);
     }
 
-    private String predictSubtask(String task) {
-        return call("你是执行子任务的 AI 助手，直接给出该子任务的完成结果。", task);
+    private String predictSubtask(String task, String expert) {
+        String persona = expert == null
+                ? "你是执行子任务的 AI 助手，直接给出该子任务的完成结果。"
+                : "你是「" + expert + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。";
+        return call(expert, persona, task);
     }
 
     private String predictAggregate(List<String> results) {
@@ -356,38 +385,65 @@ public class MultiAgentGraphAgent implements Agent {
         for (int i = 0; i < results.size(); i++) {
             sb.append("【子任务").append(i + 1).append("】\n").append(results.get(i)).append("\n\n");
         }
-        return call("你是聚合汇总的 AI 助手，依据多个子结果的最终回答可直接呈现给用户。", sb.toString());
+        return call(null, "你是聚合汇总的 AI 助手，依据多个子结果的最终回答可直接呈现给用户。", sb.toString());
     }
 
-    /** 单次 ChatClient 调用：按 model 从注册表取客户端，system+user 一次调用返回 content。 */
-    private String call(String system, String user) {
+    /**
+     * 单次 ChatClient 调用：按 agentName 查 agent 表运行配置（model/prompt），再从注册表取客户端。
+     *
+     * @param forAgent 用于查配置的 agent 名（null = 用编排器自身配置）；专家子任务传专家名
+     */
+    private String call(String forAgent, String system, String user) {
+        String configName = forAgent != null ? forAgent : agentName;
         AgentConfig config = agentService == null ? null
-                : agentService.getAgentConfig(agentName).orElse(null);
+                : agentService.getAgentConfig(configName).orElse(null);
         String model = config != null ? config.model() : null;
         ChatClient client = clientRegistry.get(model);
-        return client.prompt()
+        ChatClient.ChatClientRequestSpec spec = client.prompt()
                 .system(config != null && config.prompt() != null ? config.prompt() : DEFAULT_SYSTEM_PROMPT)
-                .user(system + "\n" + user)
-                .call()
-                .content();
+                .user(system + "\n" + user);
+        if (model != null && !model.isBlank()) {
+            // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
+            spec.options(OpenAiChatOptions.builder().model(model).build());
+        }
+        return spec.call().content();
     }
 
-    /** 解析 lead 拆解返回的 JSON 子任务列表；非法返回空表。 */
-    private List<String> parseSubtasks(String content) {
+    /**
+     * 解析 lead 拆解返回的 JSON 子任务列表；非法返回空表。
+     * 兼容两种格式：新格式 {@code {"subtasks":[{"desc":"..","agent":"researcher"}]}}，
+     * 旧格式 {@code {"subtasks":[".."]}}（无指派，agent=null）；agent 名不在白名单一律回退 null。
+     */
+    private List<Subtask> parseSubtasks(String content) {
         if (content == null || content.isBlank()) {
             return new ArrayList<>();
         }
         try {
             JsonNode node = OBJECT_MAPPER.readTree(content);
-            List<String> out = new ArrayList<>();
+            List<Subtask> out = new ArrayList<>();
             for (JsonNode s : node.path("subtasks")) {
-                out.add(s.asText());
+                if (s.isTextual()) {
+                    out.add(new Subtask(s.asText(), null)); // 旧格式：纯字符串
+                } else {
+                    String desc = s.path("desc").asText("");
+                    String agent = normalizeAgent(s.path("agent").asText(null));
+                    out.add(new Subtask(desc, agent));
+                }
             }
             return out;
         } catch (Exception e) {
             log.warn("[multi-agent] 拆解返回非法 JSON，回退处理：{}", safe(e));
             return new ArrayList<>();
         }
+    }
+
+    /** 专家名归一化：空白视为未指派；不在白名单的回退 null（执行时走默认客户端）。 */
+    private static String normalizeAgent(String agent) {
+        if (agent == null || agent.isBlank()) {
+            return null;
+        }
+        String name = agent.trim();
+        return EXPERT_WHITELIST.contains(name) ? name : null;
     }
 
     private static String safe(Throwable t) {
