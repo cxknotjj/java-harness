@@ -6,6 +6,7 @@ import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
+import com.dark.javaHarness.tool.ToolAssignments;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,15 +40,19 @@ public class GeneralAssistantAgent implements Agent {
     private final ChatClientRegistry clientRegistry;
     private final SessionService memoryStore;
     private final AgentService agentService;
+    /** 工具分配表：general 注入全量工具（deepseek 等其他实例未登记则仅默认工具） */
+    private final ToolAssignments toolAssignments;
 
     public GeneralAssistantAgent(String agentName,
                                  ChatClientRegistry clientRegistry,
                                  SessionService memoryStore,
-                                 AgentService agentService) {
+                                 AgentService agentService,
+                                 ToolAssignments toolAssignments) {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.memoryStore = memoryStore;
         this.agentService = agentService;
+        this.toolAssignments = toolAssignments;
     }
 
     /** 返回 Agent 名称（用于注册与路由） */
@@ -120,6 +125,18 @@ public class GeneralAssistantAgent implements Agent {
                 .advisors(new ContextAssemblingAdvisor())
                 .system(config.prompt() != null ? config.prompt() : DEFAULT_SYSTEM_PROMPT)
                 .user(objective);
+        // 请求级工具注入（本 agent 名分配到的工具集，general=全量；与客户端 defaultTools 合并）
+        ToolAssignments.ToolSet toolSet = toolAssignments == null
+                ? ToolAssignments.ToolSet.EMPTY
+                : toolAssignments.forAgent(agentName);
+        if (!toolSet.annotated().isEmpty()) {
+            // 必须 toArray 走 varargs Object... 重载（@Tool 对象解析）；传 List 会匹配
+            // List<ToolCallback> 重载导致「No @Tool annotated methods found」异常
+            spec.tools(toolSet.annotated().toArray());
+        }
+        if (!toolSet.callbacks().isEmpty()) {
+            spec.toolCallbacks(toolSet.callbacks().toArray(new org.springframework.ai.tool.ToolCallback[0]));
+        }
         if (model != null && !model.isBlank()) {
             spec.options(OpenAiChatOptions.builder().model(model).build());
         }

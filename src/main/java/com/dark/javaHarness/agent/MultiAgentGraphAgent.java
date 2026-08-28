@@ -14,6 +14,7 @@ import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentService;
+import com.dark.javaHarness.tool.ToolAssignments;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
@@ -90,16 +91,20 @@ public class MultiAgentGraphAgent implements Agent {
     private final String agentName;
     private final ChatClientRegistry clientRegistry;
     private final AgentService agentService;
+    /** 专家工具分配表：subtask 按指派的专家注入请求级工具 */
+    private final ToolAssignments toolAssignments;
     /** 图拓扑（构建一次）：同步执行缓存编译 {@link #graph}；流式执行每次带监听器重新编译 */
     private final StateGraph stateGraph;
     private final CompiledGraph graph;
 
     public MultiAgentGraphAgent(String agentName,
                                 ChatClientRegistry clientRegistry,
-                                AgentService agentService) {
+                                AgentService agentService,
+                                ToolAssignments toolAssignments) {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.agentService = agentService;
+        this.toolAssignments = toolAssignments;
         try {
             this.stateGraph = buildStateGraph();
             // 同步执行用的常驻实例
@@ -308,7 +313,7 @@ public class MultiAgentGraphAgent implements Agent {
      */
     private Map<String, Object> lead(OverAllState state) {
         String objective = state.value(K_OBJECTIVE, String.class).orElse("");
-        String content = predictLead(objective);
+        String content = predictLeadLogged(objective);
         List<Subtask> items = parseSubtasks(content);
         if (items.isEmpty()) {
             items.add(new Subtask(objective, null)); // 拆解失败：退化为单个子任务=objective
@@ -373,11 +378,19 @@ public class MultiAgentGraphAgent implements Agent {
         return call(null, sys, "拆解目标：" + objective);
     }
 
+    /** 子任务执行前日志埋点便于诊断专家指派（predictSubtask 包装处统一记审计） */
+    private String predictLeadLogged(String objective) {
+        String raw = predictLead(objective);
+        log.info("[multi-agent][lead] raw 拆解输出: {}", raw.length() > 300 ? raw.substring(0, 300) + "..." : raw);
+        return raw;
+    }
+
     private String predictSubtask(String task, String expert) {
-        String persona = expert == null
-                ? "你是执行子任务的 AI 助手，直接给出该子任务的完成结果。"
-                : "你是「" + expert + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。";
-        return call(expert, persona, task);
+        // 未指派（lead 输出旧格式或漏 agent 字段）→ 回退 general：通用兜底且持有全量工具
+        String resolved = (expert == null || expert.isBlank())
+                ? AgentConstants.DEFAULT_AGENT : expert;
+        String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。";
+        return call(resolved, persona, task);
     }
 
     private String predictAggregate(List<String> results) {
@@ -405,6 +418,18 @@ public class MultiAgentGraphAgent implements Agent {
         if (model != null && !model.isBlank()) {
             // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
             spec.options(OpenAiChatOptions.builder().model(model).build());
+        }
+        // 专家工具分配：按指派的专家注入请求级工具（与客户端 defaultTools 合并）
+        ToolAssignments.ToolSet toolSet = toolAssignments == null
+                ? ToolAssignments.ToolSet.EMPTY
+                : toolAssignments.forAgent(configName);
+        if (!toolSet.annotated().isEmpty()) {
+            // 必须 toArray 走 varargs Object... 重载（@Tool 对象解析）；传 List 会匹配
+            // List<ToolCallback> 重载导致「No @Tool annotated methods found」异常
+            spec.tools(toolSet.annotated().toArray());
+        }
+        if (!toolSet.callbacks().isEmpty()) {
+            spec.toolCallbacks(toolSet.callbacks().toArray(new org.springframework.ai.tool.ToolCallback[0]));
         }
         return spec.call().content();
     }

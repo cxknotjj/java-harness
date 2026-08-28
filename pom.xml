@@ -77,6 +77,12 @@
             <artifactId>spring-ai-alibaba-graph-core</artifactId>
         </dependency>
 
+        <!-- Spring AI Alibaba：Sandbox 容器级沙箱（agentscope-runtime，Docker 后端；版本由 BOM 管理） -->
+        <dependency>
+            <groupId>com.alibaba.cloud.ai</groupId>
+            <artifactId>spring-ai-alibaba-sandbox</artifactId>
+        </dependency>
+
         <!-- OkHttp：CLI 网络请求 -->
         <dependency>
             <groupId>com.squareup.okhttp3</groupId>

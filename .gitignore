@@ -7,6 +7,8 @@ target/
 .mvn-repo/
 # CLI 运行历史文件
 .cli-history
+# Sandbox 容器会话挂载目录（agentscope-runtime 运行时自动创建）
+sessions_mount_dir/
 
 ### STS ###
 .apt_generated

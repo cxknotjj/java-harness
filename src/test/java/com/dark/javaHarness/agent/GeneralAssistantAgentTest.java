@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
@@ -36,6 +37,8 @@ class GeneralAssistantAgentTest {
     @Mock
     private AgentService agentService;
     @Mock
+    private com.dark.javaHarness.tool.ToolAssignments toolAssignments;
+    @Mock
     private ChatClient chatClient;
     @Mock
     private ChatClient.ChatClientRequestSpec requestSpec;
@@ -46,8 +49,9 @@ class GeneralAssistantAgentTest {
 
     @BeforeEach
     void setUp() {
-        agent = new GeneralAssistantAgent("general", clientRegistry, memoryStore, agentService);
+        agent = new GeneralAssistantAgent("general", clientRegistry, memoryStore, agentService, toolAssignments);
         when(agentService.getAgentConfig("general")).thenReturn(java.util.Optional.empty());
+        lenient().when(toolAssignments.forAgent(any())).thenReturn(com.dark.javaHarness.tool.ToolAssignments.ToolSet.EMPTY);
         when(clientRegistry.get(isNull())).thenReturn(chatClient);
         when(chatClient.prompt()).thenReturn(requestSpec);
     }

@@ -1,0 +1,4 @@
+event: progress
+data: {"stage":"编排","detail":"开始拆解复杂目标…"}
+event: progress
+data: {"stage":"拆解","detail":"2 个子任务已就绪"}

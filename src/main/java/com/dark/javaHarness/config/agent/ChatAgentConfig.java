@@ -5,6 +5,7 @@ import com.dark.javaHarness.agent.MultiAgentGraphAgent;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
+import com.dark.javaHarness.tool.ToolAssignments;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
@@ -25,21 +26,24 @@ public class ChatAgentConfig {
     @Bean
     public GeneralAssistantAgent generalAgent(ChatClientRegistry registry,
                                               SessionService memoryStore,
-                                              @Lazy AgentService agentService) {
-        return new GeneralAssistantAgent("general", registry, memoryStore, agentService);
+                                              @Lazy AgentService agentService,
+                                              ToolAssignments toolAssignments) {
+        return new GeneralAssistantAgent("general", registry, memoryStore, agentService, toolAssignments);
     }
 
     @Bean
     public GeneralAssistantAgent deepseekAgent(ChatClientRegistry registry,
                                                SessionService memoryStore,
-                                               @Lazy AgentService agentService) {
-        return new GeneralAssistantAgent("deepseek", registry, memoryStore, agentService);
+                                               @Lazy AgentService agentService,
+                                               ToolAssignments toolAssignments) {
+        return new GeneralAssistantAgent("deepseek", registry, memoryStore, agentService, toolAssignments);
     }
 
     /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合）。 */
     @Bean
     public MultiAgentGraphAgent multiAgent(ChatClientRegistry registry,
-                                           @Lazy AgentService agentService) {
-        return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService);
+                                           @Lazy AgentService agentService,
+                                           ToolAssignments toolAssignments) {
+        return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService, toolAssignments);
     }
 }
