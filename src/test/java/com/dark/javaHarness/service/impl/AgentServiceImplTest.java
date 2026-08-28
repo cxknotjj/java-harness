@@ -2,6 +2,7 @@ package com.dark.javaHarness.service.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -129,5 +130,27 @@ class AgentServiceImplTest {
 
         assertEquals(GoalStatus.FAILED, goal.status());
         assertEquals("boom", goal.summary());
+    }
+
+    /** 客户端断开 → Reactor cancel：goal 应落地为 FAILED（客户端断开），不再残留 RUNNING */
+    @Test
+    void executeStreamReactive_onCancel_marksFailedAndPersists() throws Exception {
+        Agent agent = mock(Agent.class);
+        when(agent.name()).thenReturn("general");
+        // 永不完成的流 + 订阅建立闩锁：确保 dispose 发生在链建立之后（否则 cancel 不达 doOnCancel）
+        java.util.concurrent.CountDownLatch subscribed = new java.util.concurrent.CountDownLatch(1);
+        when(agent.executeStreamReactive(any()))
+                .thenReturn(Flux.<String>never().doOnSubscribe(s -> subscribed.countDown()));
+        agentService = new AgentServiceImpl(goalService, agentConfigProvider, List.of(agent));
+        Goal goal = stubGoal("general", null);
+
+        reactor.core.Disposable disposable =
+                agentService.executeStreamReactive("general", "hi", null).subscribe();
+        assertTrue(subscribed.await(5, java.util.concurrent.TimeUnit.SECONDS), "上游应已订阅");
+        disposable.dispose();
+
+        assertEquals(GoalStatus.FAILED, goal.status(), "断连取消后 goal 应标记 FAILED");
+        assertEquals("客户端断开，编排已取消", goal.summary());
+        org.mockito.Mockito.verify(goalService, org.mockito.Mockito.times(2)).update(goal);
     }
 }

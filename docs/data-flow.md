@@ -292,6 +292,30 @@ CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spin
 | 沙箱初始化失败（无 Docker） | 空工具面 + warn（不重试、不回退宿主机），其余功能不受影响        |
 | 工具执行失败         | 包装为模型可读文本回传 LLM，由模型调整重试                    |
 
+## 6a. 客户端断连（cancel）传播链路
+
+多 Agent 执行期间客户端断开（CLI 超时/退出）→ Tomcat 连接重置（`AsyncRequestNotUsableException` /
+`ClientAbortException`）→ MVC 异步管道向 Reactor 下发 **cancel** 信号（complete/error 均不触发）：
+
+```
+客户端断开
+  → Tomcat 报连接重置（框架层 ERROR 堆栈被 ClientAbortLogFilter DENY 降噪）
+  → Reactor cancel 沿链传播
+      ├─ ChatServiceImpl.doOnCancel        → warn 单行（sid），可观测
+      ├─ AgentServiceImpl.doOnCancel       → goal.fail("客户端断开，编排已取消") + 落库（不残留 RUNNING）
+      └─ MultiAgentGraphAgent 主干 doFinally(CANCEL)
+            ├─ 置位 cancelled 标志 + warn
+            ├─ 三个旁路 sink 关闸（branchEvents/liveTokens/toolEvents）
+            └─ lead / subtask-i / aggregate 节点执行前检查 cancelled → 短路，不再发起新的 LLM 调用
+```
+
+边界说明：
+- **进行中的阻塞 LLM 调用无法中断**（ChatClient 阻塞调用不响应 interrupt），只能等其自然结束；
+  短路保证的是「cancel 之后零次新调用」，最多浪费当前 superstep。
+- 路径 A（`GeneralAssistantAgent`）为纯响应式流，cancel 直达 WebClient 终止拉流，无需额外处理。
+- 降噪范围收窄：仅框架 logger（`org.apache.catalina/coyote/tomcat`、`org.springframework.web`）
+  的 ERROR + 断连特征命中才 DENY；业务代码中的连接类异常保留全量堆栈。
+
 ***
 
 ## 7. 组件映射

@@ -24,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
+import reactor.core.publisher.SignalType;
 
 /**
  * 多 Agent 编排器：路径 B（复杂请求）的执行体。
@@ -142,6 +143,8 @@ public class MultiAgentGraphAgent implements Agent {
         Map<String, Object> input = new HashMap<>();
         input.put(K_OBJECTIVE, goal.objective());
         AtomicBoolean contentSent = new AtomicBoolean(false);
+        // 客户端断开（Reactor cancel）置位：后续 superstep 的节点短路，不再发起新的 LLM 调用
+        AtomicBoolean cancelled = new AtomicBoolean(false);
 
         Sinks.Many<String> branchEvents = Sinks.many().unicast().onBackpressureBuffer();
         Sinks.Many<String> liveTokens = Sinks.many().unicast().onBackpressureBuffer();
@@ -150,7 +153,7 @@ public class MultiAgentGraphAgent implements Agent {
         CompiledGraph streamingGraph;
         try {
             // 流式拓扑每次执行独立构建（聚合节点绑定本次执行的 token 旁路，保证并发安全）
-            streamingGraph = buildStateGraph(liveTokens, contentSent, toolEvents)
+            streamingGraph = buildStateGraph(liveTokens, contentSent, toolEvents, cancelled)
                     .compile(CompileConfig.builder()
                             .withLifecycleListener(new BranchProgressListener(
                                     branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX))
@@ -163,6 +166,11 @@ public class MultiAgentGraphAgent implements Agent {
         Flux<String> mainLine = streamingGraph.stream(input)
                 .concatMap(out -> toRows(out, goal.objective(), contentSent))
                 .doFinally(sig -> {
+                    // 下游断开 → cancel 信号在此收敛：置位短路标志 + 关闸旁路 sink，编排不再消耗 LLM
+                    if (sig == SignalType.CANCEL) {
+                        cancelled.set(true);
+                        log.warn("[multi-agent] 客户端已断开，终止编排：不再发起新的 LLM 调用（进行中的调用等待自然结束）");
+                    }
                     BranchProgressListener.tryCompleteSerialized(branchEvents);
                     BranchProgressListener.tryCompleteSerialized(liveTokens);
                     BranchProgressListener.tryCompleteSerialized(toolEvents);
@@ -229,7 +237,7 @@ public class MultiAgentGraphAgent implements Agent {
     /* ---------------- StateGraph 构建 ---------------- */
 
     private StateGraph buildStateGraph() throws GraphStateException {
-        return buildStateGraph(null, null, null);
+        return buildStateGraph(null, null, null, null);
     }
 
     /**
@@ -239,26 +247,28 @@ public class MultiAgentGraphAgent implements Agent {
      *                    null 时聚合节点阻塞调用（同步 execute 路径）
      * @param contentSent 流式模式的内容已发射标志（与主干 {@link #toRows} 共享，防重复发射）；可为 null
      * @param toolEvents  非 null 时子任务节点注入追踪版工具（执行起止经该 sink 发进度行，供 CLI 工具调用行）
+     * @param cancelled   非 null 时节点执行前检查该标志：客户端已断开则短路（不再发起新的 LLM 调用）
      */
     private StateGraph buildStateGraph(Sinks.Many<String> liveTokens,
                                        AtomicBoolean contentSent,
-                                       Sinks.Many<String> toolEvents) throws GraphStateException {
+                                       Sinks.Many<String> toolEvents,
+                                       AtomicBoolean cancelled) throws GraphStateException {
         StateGraph g = new StateGraph();
         // 子任务工具事件发射器：并行节点可能同时回调，经 Sink 锁串行化
         java.util.function.Consumer<String> toolEmitter = toolEvents == null ? null
                 : row -> BranchProgressListener.tryEmitSerialized(toolEvents, row);
 
         // lead：拆解复杂目标为多条子任务
-        g.addNode(NODE_LEAD, AsyncNodeAction.node_async(this::lead));
+        g.addNode(NODE_LEAD, AsyncNodeAction.node_async(state -> lead(state, cancelled)));
         // 子任务池：固定 MAX_SUBTASKS 个并行节点
         for (int i = 0; i < MAX_SUBTASKS; i++) {
             final int idx = i;
             g.addNode(subtaskName(idx),
-                    AsyncNodeAction.node_async(state -> subtask(state, idx, toolEmitter)));
+                    AsyncNodeAction.node_async(state -> subtask(state, idx, toolEmitter, cancelled)));
         }
         // 聚合：收集各子任务结果生成最终回答（流式模式逐 token 旁路推送）
         g.addNode(NODE_AGGREGATE,
-                AsyncNodeAction.node_async(state -> aggregate(state, liveTokens, contentSent)));
+                AsyncNodeAction.node_async(state -> aggregate(state, liveTokens, contentSent, cancelled)));
 
         // 并联：lead → 同时派发到所有子任务节点（addEdge(from, List) 并行扇出）
         List<String> subtasks = new ArrayList<>();
@@ -280,11 +290,20 @@ public class MultiAgentGraphAgent implements Agent {
 
     /* ------------ 节点实现（同步 NodeAction，返回状态更新 Map） ------------ */
 
+    /** 客户端已断开则跳过本节点的 LLM 调用（同步路径 cancelled 为 null，恒不短路） */
+    private static boolean isCancelled(AtomicBoolean cancelled) {
+        return cancelled != null && cancelled.get();
+    }
+
     /**
      * lead：把 objective 拆解为 N 条子任务（可带专家指派），
      * 写 subtask_0..n-1、subtaskAgent_0..n-1 与 subtaskCount。
      */
-    private Map<String, Object> lead(OverAllState state) {
+    private Map<String, Object> lead(OverAllState state, AtomicBoolean cancelled) {
+        if (isCancelled(cancelled)) {
+            log.info("[multi-agent][lead] 客户端已断开，跳过拆解");
+            return new HashMap<>();
+        }
         String objective = state.value(K_OBJECTIVE, String.class).orElse("");
         String content = predictLeadLogged(objective);
         List<Subtask> items = parseSubtasks(content);
@@ -306,10 +325,15 @@ public class MultiAgentGraphAgent implements Agent {
 
     /** 子任务节点：读 subtask_i 与指派的 subtaskAgent_i，若存在则调用对应专家 ChatClient 生成 result_i。 */
     private Map<String, Object> subtask(OverAllState state, int idx,
-                                        java.util.function.Consumer<String> toolEmitter) {
+                                        java.util.function.Consumer<String> toolEmitter,
+                                        AtomicBoolean cancelled) {
         String task = state.value(K_SUBTASK_PREFIX + idx, String.class).orElse(null);
         if (task == null || task.isBlank()) {
             return new HashMap<>(); // lead 未设置该子任务 → 快速短路
+        }
+        if (isCancelled(cancelled)) {
+            log.info("[multi-agent][subtask-{}] 客户端已断开，跳过专家调用", idx);
+            return new HashMap<>();
         }
         String expert = state.value(K_SUBTASK_AGENT_PREFIX + idx, String.class).orElse(null);
         String result = predictSubtask(task, expert, toolEmitter);
@@ -321,16 +345,24 @@ public class MultiAgentGraphAgent implements Agent {
 
     /** 聚合：读 result_0..result_{n-1}（按 subtaskCount），调用 ChatClient 汇总为 final。 */
     private Map<String, Object> aggregate(OverAllState state) {
-        return aggregate(state, null, null);
+        return aggregate(state, null, null, null);
     }
 
     /**
      * 聚合节点实现：非流式（liveTokens=null）阻塞调用；流式时逐 token 旁路发射，
      * 首个内容 token 前先发「聚合」进度行，失败回退阻塞调用（未推过 token 时主干兜底发完整内容）。
+     * cancelled 非 null 且已置位时短路：不再调 LLM，占位收尾。
      */
     private Map<String, Object> aggregate(OverAllState state,
                                           Sinks.Many<String> liveTokens,
-                                          AtomicBoolean contentSent) {
+                                          AtomicBoolean contentSent,
+                                          AtomicBoolean cancelled) {
+        if (isCancelled(cancelled)) {
+            log.info("[multi-agent][aggregate] 客户端已断开，跳过聚合调用");
+            Map<String, Object> skipped = new HashMap<>();
+            skipped.put(K_FINAL, "（客户端已断开，编排已终止）");
+            return skipped;
+        }
         int n = state.value(K_SUBTASK_COUNT, Integer.class).orElse(0);
         List<String> results = new ArrayList<>();
         for (int i = 0; i < n; i++) {

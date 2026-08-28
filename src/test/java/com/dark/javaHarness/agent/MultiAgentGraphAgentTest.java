@@ -297,4 +297,45 @@ class MultiAgentGraphAgentTest {
         verify(clientRegistry, org.mockito.Mockito.times(4)).get(isNull());
         verify(requestSpec, never()).options(any());
     }
+
+    /**
+     * 客户端断连（cancel）→ doFinally 置位短路标志 → 后续节点不再发起新的 LLM 调用：
+     * lead 调用阻塞期间 dispose，释放后除 lead 外不应有任何新调用（子任务/聚合全部短路）。
+     * subscribeOn 模拟 AgentServiceImpl 的真实订阅方式（图执行与 cancel 分属不同线程）。
+     */
+    @Test
+    void executeStreamReactive_cancelDuringLead_skipsRemainingLlmCalls() throws Exception {
+        // 独立 stub：lead 的 call() 阻塞在闩锁上，模拟「调用进行中客户端断开」
+        java.util.concurrent.CountDownLatch releaseLead = new java.util.concurrent.CountDownLatch(1);
+        when(clientRegistry.get(any())).thenReturn(chatClient);
+        when(agentService.getAgentConfig(anyString())).thenReturn(java.util.Optional.empty());
+        lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
+        when(chatClient.prompt()).thenReturn(requestSpec);
+        when(requestSpec.system(anyString())).thenReturn(requestSpec);
+        when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        // lenient：短路生效时 lead 可能一次都不调用（UnnecessaryStubbing 免检）
+        lenient().when(requestSpec.call()).thenAnswer(inv -> {
+            releaseLead.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            return responseSpec;
+        });
+        lenient().when(responseSpec.content()).thenReturn(fixedContent());
+        lenient().when(requestSpec.stream()).thenReturn(streamSpec);
+        lenient().when(streamSpec.content()).thenReturn(Flux.just(fixedContent()));
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments);
+
+        // subscribeOn 让图执行离开测试线程（否则同步图驱动会把 subscribe() 卡在 lead 阻塞上）
+        reactor.core.Disposable disposable = agent
+                .executeStreamReactive(new Goal("g9", "调研竞品并输出报告"))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                .subscribe();
+        Thread.sleep(300);                    // 等图启动、lead 进入 call() 阻塞
+
+        disposable.dispose();                 // 模拟客户端断开 → cancel → 置位短路标志
+        releaseLead.countDown();              // 进行中的 lead 调用自然结束
+        Thread.sleep(500);                    // 给「短路失效则子任务会发起新调用」留暴露窗口
+
+        // 时序兼容：lead 或在置位前已发起调用（1 次）、或被更早短路（0 次），但绝不能再多
+        verify(requestSpec, org.mockito.Mockito.atMost(1)).call();
+        verify(requestSpec, never()).stream(); // 聚合流式调用也不应发起
+    }
 }

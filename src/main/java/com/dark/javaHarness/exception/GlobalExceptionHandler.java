@@ -1,6 +1,7 @@
 package com.dark.javaHarness.exception;
 
 import com.dark.javaHarness.domain.dto.ErrorResponse;
+import java.io.IOException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -10,16 +11,25 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
  * 全局异常处理：把异常统一转换为 {code, message} 响应体，
  * code 为 HTTP 状态码，message 为可读错误信息（不暴露内部细节）。
+ *
+ * <p>「客户端断连」（AsyncRequestNotUsableException / Connection reset / Broken pipe）
+ * 是预期场景（CLI 超时/退出），降级为 warn 单行——不刷 ERROR 堆栈；响应体此时已无法送达客户端。
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    /** 断连特征消息片段（覆盖 Tomcat 包装的 ClientAbortException 等 IOException 形态） */
+    private static final String[] ABORT_MESSAGE_HINTS = {
+            "Connection reset", "connection reset", "Broken pipe", "broken pipe",
+    };
 
     /** 业务/参数错误：参数非法、资源不存在等 */
     @ExceptionHandler(IllegalArgumentException.class)
@@ -60,11 +70,41 @@ public class GlobalExceptionHandler {
         return ErrorResponse.of(HttpStatus.NOT_FOUND.value(), "资源不存在");
     }
 
+    /** 客户端断连（SSE/异步流式场景的预期事件）：warn 单行可观测，不刷 ERROR 堆栈 */
+    @ExceptionHandler(AsyncRequestNotUsableException.class)
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public ErrorResponse handleClientDisconnect(AsyncRequestNotUsableException e) {
+        log.warn("客户端断开，停止本次响应推送：{}", e.getMessage());
+        return ErrorResponse.of(HttpStatus.INTERNAL_SERVER_ERROR.value(), "客户端已断开");
+    }
+
     /** 未捕获异常兜底 */
     @ExceptionHandler(Exception.class)
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
     public ErrorResponse handleException(Exception e) {
+        // 断连以 IOException 形态漏网（如 Tomcat ClientAbortException）同样降级 warn 单行
+        if (isClientAbort(e)) {
+            log.warn("客户端断开（{}），停止本次响应推送", e.getMessage());
+            return ErrorResponse.of(HttpStatus.INTERNAL_SERVER_ERROR.value(), "客户端已断开");
+        }
         log.error("未处理异常", e);
         return ErrorResponse.of(HttpStatus.INTERNAL_SERVER_ERROR.value(), "服务器内部错误");
+    }
+
+    /** 异常链中含断连特征的 IOException（不直接依赖 Tomcat 类，容器无关） */
+    private static boolean isClientAbort(Throwable e) {
+        for (Throwable cur = e; cur != null; cur = cur.getCause()) {
+            if (cur instanceof IOException io && io.getMessage() != null) {
+                for (String hint : ABORT_MESSAGE_HINTS) {
+                    if (io.getMessage().contains(hint)) {
+                        return true;
+                    }
+                }
+            }
+            if (cur.getCause() == cur) {
+                break; // 自引用环防护
+            }
+        }
+        return false;
     }
 }

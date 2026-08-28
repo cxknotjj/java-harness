@@ -118,6 +118,9 @@ public class ChatServiceImpl implements ChatService {
                     .concatWithValues("data: " + SseProtocol.DONE_MARKER)
                     .concatWith(metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.SUCCEEDED.name(), null))
                     .doOnComplete(() -> writeBackContext(ctx.sid(), request.message(), full.toString()))
+                    // 客户端断开（Tomcat 报 AsyncRequestNotUsableException/Connection reset）：
+                    // 框架层 ERROR 堆栈由 ClientAbortLogFilter 降噪，此处统一记可观测 warn 单行
+                    .doOnCancel(() -> log.warn("[stream] 客户端断开，取消推送与编排：sid={}", ctx.sid()))
                     .onErrorResume(ex -> {
                         String err = safeMessage(ex);
                         return Flux.concat(

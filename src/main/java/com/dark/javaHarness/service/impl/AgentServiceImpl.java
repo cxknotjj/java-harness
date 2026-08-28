@@ -97,6 +97,13 @@ public class AgentServiceImpl implements AgentService {
                     goal.fail(reason);
                     goalService.update(goal);
                 })
+                // 客户端断开（超时/退出）→ Reactor cancel：complete/error 均不触发，在此兜底回写 goal，
+                // 避免状态残留 RUNNING（单次 update 直写：cancel 回调频率=断连次数，量小可同步）
+                .doOnCancel(() -> {
+                    log.warn("[{}] goal '{}' 取消：客户端断开，停止推送并终止编排", goal.id(), goal.objective());
+                    goal.fail("客户端断开，编排已取消");
+                    goalService.update(goal);
+                })
                 // 阻塞 DB 操作（create/markRunning/update）与 Agent 执行切到 boundedElastic，避免阻塞调用方
                 .subscribeOn(Schedulers.boundedElastic());
     }

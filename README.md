@@ -262,3 +262,13 @@ mvn -s .mvn/settings.xml test
 | `WebToolsTest` | 网页抓取：HTML→纯文本、协议白名单（http/https） |
 
 > 注意：`JavaHarnessApplicationTests` 是 `@SpringBootTest`，会尝试连接本机 MySQL；在无数据库环境运行该单个类可能因连接失败而报错（其余业务测试不受影响）。
+
+## 参考与致谢
+
+本项目的设计在以下优秀开源项目/产品的启发下完成，特此致谢：
+
+| 参考 | 对应借鉴 |
+|---|---|
+| [Deer-Flow](https://github.com/bytedance/deer-flow)（字节跳动） | 多 Agent 编排范式：「Coordinator → Planner 拆解 → 专家并行执行 → Reporter 汇总」的整体架构，以及 researcher / coder / analyst / writer 专家角色划分，直接启发了本项目的 StateGraph「lead 拆解 → 并行子任务 → 聚合」编排与专家 Agent 体系 |
+| [Claude Code](https://github.com/anthropics/claude-code)（Anthropic） | CLI 终端体验：spinner 进度原位刷新 + 完成折叠归档、工具调用行（`⏺ 工具名(参数)` → `✓ 耗时`）、diff `+绿/-红` 着色、回合小结等交互设计，均对标 Claude Code 的渲染风格实现（`TerminalRenderer`） |
+| [DeepSeek](https://github.com/deepseek-ai)（deepseek-ai） | Agent 工具库设计：网页抓取（fetchUrl）、文件/命令类工具的能力面划分，以及按 Agent 分配工具的最小权限思路，参考了 DeepSeek 的工具设计实践 |
