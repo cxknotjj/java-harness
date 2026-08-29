@@ -12,12 +12,13 @@ import org.springframework.stereotype.Component;
  * - 自研 {@link WebTools}（轻量网页抓取，Sandbox 未覆盖）
  * - {@link SandboxToolProvider} 容器级沙箱工具（Python/Shell 执行 + 文件读写检索 +
  *   浏览器导航/快照，已替代退役的宿主机 FileTools/SearchTools/ShellTools——「重合即退役」）
+ * - {@link McpToolProvider} 外部 MCP Server 工具（当前 researcher 与 general 分配，扩展工具生态）
  *
  * <p>分配语义与退役前一致（同类能力等价替换），浏览器组补 web search 空缺（JS 渲染页面）：
- * - researcher：网页抓取 + 沙箱只读文件/检索 + 浏览器（探索者，无执行与写入）
+ * - researcher：网页抓取 + 沙箱只读文件/检索 + 浏览器 + MCP 外部工具（探索者，无执行与写入）
  * - coder：沙箱执行 + 文件写入（读文件→改文件→跑命令验证闭环）
  * - analyst：沙箱执行 + 只读文件/检索
- * - general：全量（执行 + 读写 + 检索 + 网页 + 浏览器）
+ * - general：全量（执行 + 读写 + 检索 + 网页 + 浏览器 + MCP 工具）
  * - writer / 未登记（含 multi-agent 编排器）：无工具
  *
  * <p>权限边界是服务端硬边界：只把分配到的工具 schema 发给模型，
@@ -38,18 +39,20 @@ public class ToolAssignments {
 
     private final WebTools webTools;
     private final SandboxToolProvider sandbox;
+    private final McpToolProvider mcp;
 
-    public ToolAssignments(WebTools webTools, SandboxToolProvider sandbox) {
+    public ToolAssignments(WebTools webTools, SandboxToolProvider sandbox, McpToolProvider mcp) {
         this.webTools = webTools;
         this.sandbox = sandbox;
+        this.mcp = mcp;
     }
 
-    /** 取某专家的工具集；未登记的专家（含 multi-agent 编排器）返回空集 */
+    /** 取某专家的工具；未登记的专家（含 multi-agent 编排器）返回空集 */
     public ToolSet forAgent(String agentName) {
         return switch (agentName == null ? "" : agentName) {
             case "researcher" -> new ToolSet(
                     List.of(webTools),
-                    concat(sandbox.readOnlyFileTools(), sandbox.browserTools()));
+                    concat(sandbox.readOnlyFileTools(), sandbox.browserTools(), mcp.toolCallbacks()));
             case "coder" -> new ToolSet(
                     List.of(),
                     concat(sandbox.baseTools(), sandbox.writeTools()));
@@ -59,7 +62,7 @@ public class ToolAssignments {
             case "general" -> new ToolSet(
                     List.of(webTools),
                     concat(sandbox.baseTools(), sandbox.readOnlyFileTools(), sandbox.writeTools(),
-                            sandbox.browserTools()));
+                            sandbox.browserTools(), mcp.toolCallbacks()));
             default -> ToolSet.EMPTY;
         };
     }

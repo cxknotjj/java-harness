@@ -28,11 +28,15 @@ class ToolAssignmentsTest {
     @Mock
     private SandboxToolProvider sandbox;
 
+    @Mock
+    private McpToolProvider mcp;
+
     private final WebTools webTools = new WebTools();
 
     private ToolAssignments assignments;
 
     private final ToolCallback cb = mock(ToolCallback.class);
+    private final ToolCallback mcpCb = mock(ToolCallback.class);
 
     @BeforeEach
     void setUp() {
@@ -40,16 +44,30 @@ class ToolAssignmentsTest {
         lenient().when(sandbox.readOnlyFileTools()).thenReturn(List.of(cb, cb));
         lenient().when(sandbox.writeTools()).thenReturn(List.of(cb, cb, cb));
         lenient().when(sandbox.browserTools()).thenReturn(List.of(cb, cb));
-        assignments = new ToolAssignments(webTools, sandbox);
+        lenient().when(mcp.toolCallbacks()).thenReturn(List.of(mcpCb));
+        assignments = new ToolAssignments(webTools, sandbox, mcp);
     }
 
     @Test
     void researcher_getsWebAndReadOnlySandboxTools() {
         ToolAssignments.ToolSet set = assignments.forAgent("researcher");
         assertEquals(List.of(webTools), set.annotated(), "researcher 注入网页抓取");
-        assertEquals(4, set.callbacks().size(), "researcher = 只读文件(2) + 浏览器(2)");
+        assertEquals(5, set.callbacks().size(), "researcher = 只读文件(2) + 浏览器(2) + MCP(1)");
         verify(sandbox, never()).baseTools();
         verify(sandbox, never()).writeTools();
+    }
+
+    @Test
+    void researcherAndGeneral_getsMcpTools_butNoOtherAgentDoes() {
+        // MCP 外部工具（扩展工具生态）分配给 researcher 与 general（full-access 也含扩展工具）
+        assertTrue(assignments.forAgent("researcher").callbacks().contains(mcpCb),
+                "researcher 应能看见 MCP 工具");
+        assertTrue(assignments.forAgent("general").callbacks().contains(mcpCb),
+                "general 应能看见 MCP 工具");
+        assertFalse(assignments.forAgent("coder").callbacks().contains(mcpCb),
+                "coder 不应看见 MCP 工具");
+        assertFalse(assignments.forAgent("analyst").callbacks().contains(mcpCb),
+                "analyst 不应看见 MCP 工具");
     }
 
     @Test
@@ -73,7 +91,7 @@ class ToolAssignmentsTest {
     void general_getsFullToolset() {
         ToolAssignments.ToolSet set = assignments.forAgent("general");
         assertEquals(List.of(webTools), set.annotated());
-        assertEquals(8, set.callbacks().size(), "general = 执行(1) + 只读(2) + 写入(3) + 浏览器(2) 全量");
+        assertEquals(9, set.callbacks().size(), "general = 执行(1) + 只读(2) + 写入(3) + 浏览器(2) + MCP(1) 全量");
     }
 
     @Test

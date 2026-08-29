@@ -269,13 +269,13 @@ CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spin
 
 **专家分配表**（`ToolAssignments`，最小权限）：
 
-| 专家 | @Tool 对象 | Sandbox ToolCallback |
-| --- | --- | --- |
-| researcher | WebTools（轻量网页抓取，沙箱未覆盖） | 只读文件类 |
-| coder | — | 执行类 + 写入类（读→改→跑验证闭环） |
-| analyst | — | 执行类 + 只读类 |
-| general | WebTools | 全量 |
-| writer / 未登记（含 lead、aggregator、multi-agent） | — | 空集（不触发沙箱初始化） |
+| 专家 | @Tool 对象 | Sandbox ToolCallback | MCP ToolCallback |
+| --- | --- | --- | --- |
+| researcher | WebTool（轻量抓取，沙箱未覆盖） | 只读文件类 | 是（见 5e 节，扩展工具生态） |
+| coder | — | 执行类 + 写入类（读→改→跑验证闭环） | — |
+| analyst | — | 执行类 + 只读类 | — |
+| general | WebTool | 全量 | 是（见 5e 节） |
+| writer / 未登记（含 lead、aggregator、multi-agent） | — | 空集（不触发沙箱初始化） | — |
 
 **关键点**：① 模型生成的代码/命令只落容器，宿主机零暴露；② 空集专家完全不触碰 Docker；③ 容器随 `@PreDestroy` 释放（`SandboxService.close()`），宿主机无残留；④ 执行失败包装为模型可读文本回传，由模型自行调整重试。
 
@@ -314,6 +314,59 @@ LLM 调用出口（五类调用点统一收敛）
 **与 Micrometer Tracing 的关系**：本表是成本账本（SQL 可聚合按角色/会话统计花费）；Tracing 是性能显微镜（单次请求耗时瀑布），互补不互替（Tracing 见 TODO「完整链路追踪」）。
 
 **测试**：`LlmCallRecorderTest`（估算口径 / 异步落库 / 落库失败不影响调用方）。
+
+***
+
+## 5e. MCP 工具接入数据流（进程内 server ↔ client 闭环）
+
+> 通过 Model Context Protocol（MCP）把工具标准化注入 tool-calling 生态。当前为「自建 + 同进程闭环」架构：
+> 本应用既作为 **MCP Server**（`McpServerTools` 暴露工具至 `/mcp` 端点），也作为 **MCP Client**
+> （`McpToolProvider` 经 `/mcp` 发现工具），全流程 HTTP/Streamable 传输，无需外部服务。
+
+```
+① MCP Server（本进程，Streamable-HTTP 传输）
+   McpServerTools（@Component，3 个 @Tool 演示工具：sum / greet / today）
+     └─ 内嵌 @Configuration 声明 ToolCallbackProvider bean（mcpServerToolsProvider）
+           → 把 @Tool 方法转成 MCP tool 规范
+     └─ spring.ai.mcp.server.protocol=STREAMABLE + streamable-http.mcp-endpoint=/mcp
+        → McpServerAutoConfiguration 注册端点：tools/list 列出 3 个工具，
+          tools/call 由 bean 分派执行并回传结果（日志 "Registered tools: 3"）
+        （protocol 若为默认 SSE，端点不在 /mcp → 客户端连不上，必须显式置 STREAMABLE）
+
+② MCP Client（懒连接 + 失败降级，架构与 SandboxToolProvider 同源）
+   McpToolProvider.toolCallbacks()
+     ├─ 已缓存 → 直接返回（单例，只连一次）
+     ├─ server-url 为空 → warn + 返回空工具面（不发起连接）
+     └─ 首次取用 → 双检锁 → HttpClientStreamableHttpTransport(url)
+          → McpSyncClient（request/initialization 超时）→ SyncMcpToolCallbackProvider
+          → 4 端内建 /mcp 工具（连接/发现失败 → warn + 空工具面，绝不抛异常拖垮应用）
+   ⚠️ client 与 server 同进程：须待 Spring 启动完成 /mcp 才可达，懒连接天然规避启动死锁
+
+③ 分配（ToolAssignments，硬边界）
+   only researcher: mcp.toolCallbacks() 注入其 ToolSet.callbacks
+   其他专家/编写者（含 lead、aggregator、multi-agent）不注入 MCP 工具 schema，
+   未分配工具模型不可见、服务端也无执行注册
+
+④ 模型侧循环（与 5c③④ 完全同构，由 Spring AI tool-calling 统一驱动）
+   请求（含 MCP 工具 schema）──▶ LLM
+   ◀── tool_call {name, arguments} ┐
+   ▼ 执行：解析 tool_call → 匹配 MCP ToolCallback → McpClient 调 /mcp → tools/call
+   ◀── 工具结果 ──┘ 转为 tool 消息回传 LLM → 循环直至产出最终回答
+```
+
+**专家分配表**（`ToolAssignments`，最小权限）：
+
+| 专家 | 是否注入 MCP 工具 | 说明 |
+| --- | --- | --- |
+| researcher | 是 | 探索者，MCP 工具并入其工具面 |
+| general | 是 | 全量（执行 + 读写 + 检索 + 网页 + 浏览器 + MCP 工具） |
+| coder | 否 | — |
+| analyst | 否 | — |
+| writer / 未登记（multi-agent） | 否 | 空集 |
+
+**关键点**：① server 与 client 同进程，端点 `/mcp` 由 STREAMABLE 协议提供；② client 懒连接 + 失败降级，未配置/连不上返回空工具面，不影响主链路启动；③ 单例缓存一次连接，后续取用零重复握手；④ 由 `ToolAssignments` 硬性分配（当前 researcher 与 general），未分配 agent 不可见不可调。
+
+**测试**：`McpToolProviderTest`（未配置→空 / 空白→空 / 不可达→空且不抛错 / 连上运行中 `/mcp`→发现 3 工具 sum/greet/today）+ `ToolAssignmentsTest`（researcher/general 得 MCP 工具，其余 agent 不得）+ 手动 HTTP 验证（initialize → tools/list → tools/call sum(3,5) 得 sum=8）。
 
 ***
 
@@ -369,7 +422,8 @@ LLM 调用出口（五类调用点统一收敛）
 | 统一出口       | `ChatController` 同步 + SSE                            |
 | 兜底         | `AgentService` → general                             |
 | 沙箱工具面      | `SandboxToolProvider`（agentscope-runtime 容器）+ `ToolAssignments`（专家分配） |
+| MCP 工具        | `McpServerTools`（Server，3 工具→/mcp）+ `McpToolProvider`（Client，懒连接发现）+ `ToolAssignments` |
 | LLM 调用观测   | `LlmCallRecorder`（异步落库）+ `LlmCallController`（`/api/llm-calls` 查询）   |
 
-> 更新日期：2026-08-28。
+> 更新日期：2026-08-28 / 5e MCP 接入、分配表与组件映射更新：2026-08-29。
 

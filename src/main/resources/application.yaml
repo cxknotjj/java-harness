@@ -13,6 +13,21 @@ spring:
           # 可选 qwen-turbo / qwen-plus / qwen-max
           model: qwen3.7-plus
           temperature: 0.7
+    mcp:
+      # 自建 MCP Server（Streamable-HTTP，WebMVC 传输）：protocol 必须显式置为 STREAMABLE
+      # 才会注册 /mcp 端点（默认是 SSE，端点不在 /mcp）。暴露 McpServerTools 的 3 个演示工具。
+      server:
+        enabled: true
+        protocol: STREAMABLE
+        streamable-http:
+          mcp-endpoint: /mcp
+      # 客户端：默认关闭 autoconfig 的 MCP client 自动装配，避免启动时强连外部 MCP Server
+      # （连接失败会拖垮整个应用启动）。MCP client 由 McpToolProvider 懒连接 + 失败降级，
+      # 首次被 agent 取用工具时才连接（server 与 client 同进程，启动完成后 /mcp 端点即可达）。
+      client:
+        enabled: false
+        # 懒连接时的 server 地址，由 McpToolProvider 读取
+        server-url: http://localhost:${server.port:8080}/mcp
   datasource:
     url: jdbc:mysql://localhost:3306/harness?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false
     username: root

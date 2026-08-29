@@ -56,6 +56,24 @@
                 <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
                 <version>${mybatis-plus.version}</version>
             </dependency>
+            <!-- MCP SDK 版本对齐：spring-ai-alibaba-graph-core 传递依赖把 io.modelcontextprotocol.sdk:mcp 锁到 0.14.0，
+                 而 spring-ai-mcp 1.1.4 需要 0.17.0（版本错配会导致 McpSyncClient.initialize 运行期失败）。
+                 这里显式锁定到 0.17.0，与 mcp-json/mcp-json-jackson2 的 0.17.0 对齐。 -->
+            <dependency>
+                <groupId>io.modelcontextprotocol.sdk</groupId>
+                <artifactId>mcp</artifactId>
+                <version>0.17.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.modelcontextprotocol.sdk</groupId>
+                <artifactId>mcp-core</artifactId>
+                <version>0.17.0</version>
+            </dependency>
+            <dependency>
+                <groupId>io.modelcontextprotocol.sdk</groupId>
+                <artifactId>mcp-json</artifactId>
+                <version>0.17.0</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
     <dependencies>
@@ -81,6 +99,20 @@
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-sandbox</artifactId>
+        </dependency>
+
+        <!-- Model Context Protocol 客户端：把外部 MCP Server（STDIO / HTTP / SSE）暴露的工具注册为
+             Spring AI ToolCallback，供专家 agent 按权限调用（扩展工具生态，不再逐个自研）。版本由 BOM 管理 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-client</artifactId>
+        </dependency>
+
+        <!-- MCP 服务端（本项目自建，HTTP/Streamable transport，暴露演示工具供客户端连接，
+             与上面 mcp-client 形成进程内闭环演示）。版本由 BOM 管理 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
         </dependency>
 
         <!-- OkHttp：CLI 网络请求 -->
