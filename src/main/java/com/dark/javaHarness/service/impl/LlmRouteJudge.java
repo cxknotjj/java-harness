@@ -41,40 +41,51 @@ public class LlmRouteJudge implements RouteJudge {
             + "- simple：无需工具、无需拆分子任务，单次回答即可（如问候、闲聊、简短问答、讲笑话、简单解释）。\n"
             + "- complex：需联网搜索、需执行代码、多步骤处理、需拆分为多个子任务（如调研竞品并输出报告、规划并执行一个完整项目）。";
 
-    private final ChatClientRegistry clientRegistry;
+private final ChatClientRegistry clientRegistry;
     /** LLM 调用观测记录器：judge 调用耗时/token 也落 llm_call_log（agent_name='route-judge'） */
     private final LlmCallRecorder recorder;
+    /** 模型调用重试策略（最多执行 3 次、指数退避；重试耗尽或不可重试的解析错误才兜底 SIMPLE） */
+    private final com.dark.javaHarness.agent.LlmRetry retry;
 
     public LlmRouteJudge(ChatClientRegistry clientRegistry, LlmCallRecorder recorder) {
         this.clientRegistry = clientRegistry;
         this.recorder = recorder;
+        this.retry = new com.dark.javaHarness.agent.LlmRetry();
     }
 
     @Override
     public RouteDecision judge(String message) {
         if (message == null || message.isBlank()) {
-            log.info("[route] message为空 -> SIMPLE");
+            log.info("[route] message 为空 -> SIMPLE");
             return RouteDecision.SIMPLE;
         }
         long start = System.currentTimeMillis();
         try {
-            ChatClient client = clientRegistry.get(ROUTE_MODEL);
-            String content = client.prompt()
-                    .system(SYSTEM_PROMPT)
-                    .user(message)
-                    .call()
-                    .chatResponse()
-                    .getResult()
-                    .getOutput()
-                    .getText();
+            // 重试只针对「单次 LLM 调用」：可重试错误自动重试，重试耗尽或不可重试抛出。
+            // 解析在 LLM 调用成功之后进行（解析失败属业务逻辑错误，不可重试）。
+            String content = retry.executeWithRetry(() -> doCall(message));
+            RouteDecision decision = parse(content);
             record(start, true, null, message);
-            return parse(content);
+            return decision;
         } catch (Exception e) {
-            // 判断失败不阻塞请求，兜底走简单路径
+            // 判断失败（含重试耗尽或解析失败）不阻塞请求，兜底走简单路径
             log.warn("[route] 判断失败，兜底 SIMPLE：{}", safeMessage(e));
             record(start, false, e, message);
             return RouteDecision.SIMPLE;
         }
+    }
+
+    /** 单次 LLM 路由调用（不包含解析，可被重试）；返回模型原始输出文本 */
+    private String doCall(String message) {
+        ChatClient client = clientRegistry.get(ROUTE_MODEL);
+        return client.prompt()
+                .system(SYSTEM_PROMPT)
+                .user(message)
+                .call()
+                .chatResponse()
+                .getResult()
+                .getOutput()
+                .getText();
     }
 
     /** judge 调用观测落库（无会话上下文，sessionId 为空；token 近似估算） */

@@ -41,6 +41,8 @@ final class AgentChatCaller {
     private final ToolAssignments toolAssignments;
     /** LLM 调用观测记录器（可 null：无观测场景下直通） */
     private final LlmCallRecorder recorder;
+    /** 模型调用重试策略（指数退避，最多 3 次） */
+    private final LlmRetry retry;
 
     AgentChatCaller(ChatClientRegistry clientRegistry,
                     AgentService agentService,
@@ -52,10 +54,19 @@ final class AgentChatCaller {
                     AgentService agentService,
                     ToolAssignments toolAssignments,
                     LlmCallRecorder recorder) {
+        this(clientRegistry, agentService, toolAssignments, recorder, new LlmRetry());
+    }
+
+    AgentChatCaller(ChatClientRegistry clientRegistry,
+                    AgentService agentService,
+                    ToolAssignments toolAssignments,
+                    LlmCallRecorder recorder,
+                    LlmRetry retry) {
         this.clientRegistry = clientRegistry;
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
         this.recorder = recorder;
+        this.retry = retry;
     }
 
     /** 带会话观测的单次调用（推荐入口：sessionId 用于 llm_call_log 归因） */
@@ -66,23 +77,26 @@ final class AgentChatCaller {
     /** 带工具事件发射器的调用：emitter 非 null 时本次调用的工具执行起止经其发进度行（供 CLI 展示） */
     String call(String sessionId, String forAgent, String fallbackSystem, String user,
                 Consumer<String> toolEmitter) {
-        long start = System.currentTimeMillis();
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
-        try {
-            org.springframework.ai.chat.model.ChatResponse resp = buildSpec(config, forAgent, fallbackSystem, user, toolEmitter)
-                    .call().chatResponse();
-            String content = resp == null || resp.getResult() == null
-                    || resp.getResult().getOutput() == null
-                    ? null : resp.getResult().getOutput().getText();
-            Usage usage = resp == null || resp.getMetadata() == null
-                    ? null : resp.getMetadata().getUsage();
-            recordOk(sessionId, forAgent, model, false, usage, start, content);
-            return content;
-        } catch (RuntimeException e) {
-            recordError(sessionId, forAgent, model, false, start, e);
-            throw e;
-        }
+        // 模型调用失败自动重试（最多 3 次、指数退避）；单次调用含观测埋点
+        return retry.executeWithRetry(() -> {
+            long start = System.currentTimeMillis();
+            try {
+                org.springframework.ai.chat.model.ChatResponse resp = buildSpec(config, forAgent, fallbackSystem, user, toolEmitter)
+                        .call().chatResponse();
+                String content = resp == null || resp.getResult() == null
+                        || resp.getResult().getOutput() == null
+                        ? null : resp.getResult().getOutput().getText();
+                Usage usage = resp == null || resp.getMetadata() == null
+                        ? null : resp.getMetadata().getUsage();
+                recordOk(sessionId, forAgent, model, false, usage, start, content);
+                return content;
+            } catch (RuntimeException e) {
+                recordError(sessionId, forAgent, model, false, start, e);
+                throw e;
+            }
+        });
     }
 
     /**
@@ -102,28 +116,40 @@ final class AgentChatCaller {
     /** 带工具事件发射器的流式调用：语义同 {@link #stream(String, String, String, Consumer)} */
     String stream(String sessionId, String forAgent, String fallbackSystem, String user,
                   Consumer<String> onToken, Consumer<String> toolEmitter) {
-        long start = System.currentTimeMillis();
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
-        StringBuilder collected = new StringBuilder();
-        try {
-            buildSpec(config, forAgent, fallbackSystem, user, toolEmitter)
-                    .stream()
-                    .content()
-                    .doOnNext(token -> {
-                        collected.append(token);
-                        onToken.accept(token);
-                    })
-                    .blockLast();
-        } catch (RuntimeException e) {
-            recordError(sessionId, forAgent, model, true, start, e);
-            throw e;
+        // 流式重试约束：仅「首个 token 尚未发出」的失败才允许重试（一旦开始输出，
+        // onToken 已回调、无法回滚，重试会造成重复输出）；已产生输出则立即抛出。
+        for (int attempt = 1; attempt <= retry.maxAttempts(); attempt++) {
+            long start = System.currentTimeMillis();
+            StringBuilder collected = new StringBuilder();
+            try {
+                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter)
+                        .stream()
+                        .content()
+                        .doOnNext(token -> {
+                            collected.append(token);
+                            onToken.accept(token);
+                        })
+                        .blockLast();
+            } catch (RuntimeException e) {
+                recordError(sessionId, forAgent, model, true, start, e);
+                boolean partialOutput = collected.length() > 0;
+                boolean canRetry = !partialOutput && LlmRetry.isRetryable(e) && attempt < retry.maxAttempts();
+                if (canRetry) {
+                    retry.waitBeforeRetry(attempt);
+                    continue;
+                }
+                throw e;
+            }
+            // 流式无 usage 回包：按已收输出文本近似估算（与 ContextAssemblingAdvisor 同口径）
+            String out = collected.toString();
+            int tokens = LlmCallRecorder.estimateTokens(out);
+            record(sessionId, forAgent, model, true, true, null, tokens, tokens, start, null);
+            return out;
         }
-        // 流式无 usage 回包：按已收输出文本近似估算（与 ContextAssemblingAdvisor 同口径）
-        String out = collected.toString();
-        int tokens = LlmCallRecorder.estimateTokens(out);
-        record(sessionId, forAgent, model, true, true, null, tokens, tokens, start, null);
-        return out;
+        // 理论不可达（maxAttempts>=1）
+        throw new IllegalStateException("stream 重试循环异常退出");
     }
 
     /** 组装请求（查表配置 → 取客户端 → system/user → 请求级 model → 工具注入），call/stream 共用；config 由调用方查好传入（避免重复查表） */

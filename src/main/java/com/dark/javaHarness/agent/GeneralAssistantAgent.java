@@ -52,6 +52,8 @@ public class GeneralAssistantAgent implements Agent {
     private final ToolAssignments toolAssignments;
     /** LLM 调用观测记录器（可 null：无观测场景下直通） */
     private final LlmCallRecorder recorder;
+    /** 模型调用重试策略（最多 3 次、指数退避） */
+    private final LlmRetry retry;
 
     public GeneralAssistantAgent(String agentName,
                                  ChatClientRegistry clientRegistry,
@@ -65,6 +67,7 @@ public class GeneralAssistantAgent implements Agent {
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
         this.recorder = recorder;
+        this.retry = new LlmRetry();
     }
 
     /** 返回 Agent 名称（用于注册与路由） */
@@ -77,23 +80,26 @@ public class GeneralAssistantAgent implements Agent {
     @Override
     public String execute(Goal goal) {
         log.info("AI agent '{}' 开始处理目标: {}", name(), goal.objective());
-        long start = System.currentTimeMillis();
-        try {
-            org.springframework.ai.chat.model.ChatResponse resp =
-                    buildChatRequestSpec(goal.sessionId(), goal.objective()).call().chatResponse();
-            String reply = resp == null || resp.getResult() == null
-                    || resp.getResult().getOutput() == null
-                    ? null : resp.getResult().getOutput().getText();
-            recordCall(goal.sessionId(), false, true,
-                    resp == null || resp.getMetadata() == null ? null : resp.getMetadata().getUsage(),
-                    null, start, null);
-            log.info("AI agent '{}' 得到回复: {}", name(), reply);
-            // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
-            return reply;
-        } catch (RuntimeException e) {
-            recordCall(goal.sessionId(), false, false, null, null, start, e);
-            throw e;
-        }
+        // 模型调用失败自动重试（最多 3 次、指数退避）；单次调用含观测埋点
+        return retry.executeWithRetry(() -> {
+            long start = System.currentTimeMillis();
+            try {
+                org.springframework.ai.chat.model.ChatResponse resp =
+                        buildChatRequestSpec(goal.sessionId(), goal.objective()).call().chatResponse();
+                String reply = resp == null || resp.getResult() == null
+                        || resp.getResult().getOutput() == null
+                        ? null : resp.getResult().getOutput().getText();
+                recordCall(goal.sessionId(), false, true,
+                        resp == null || resp.getMetadata() == null ? null : resp.getMetadata().getUsage(),
+                        null, start, null);
+                log.info("AI agent '{}' 得到回复: {}", name(), reply);
+                // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
+                return reply;
+            } catch (RuntimeException e) {
+                recordCall(goal.sessionId(), false, false, null, null, start, e);
+                throw e;
+            }
+        });
     }
 
     /**
