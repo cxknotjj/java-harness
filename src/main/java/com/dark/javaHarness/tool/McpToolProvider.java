@@ -67,9 +67,13 @@ public class McpToolProvider {
 
     /** 建立连接并返回工具回调；初始化/发现失败抛异常（由上层降级为空） */
     private List<ToolCallback> connectAndDiscover() {
+        // 超时预算按「慢速外部 MCP server」放宽松：requestTimeout 约束单次 tools/call
+        // 从发起到服务端返回的整段墙钟时间（含服务端真正干活，如 Playwright 首次拉起 Chrome），
+        // 而非通信本身（stdio/HTTP 传输都是毫秒级）；过小会把「服务端在执行」误判为超时。
+        // initializationTimeout 约束 initialize 握手——外部 server（如 npx 拉起 + 框架初始化）冷启动可能 >10s。
         McpSyncClient client = McpClient.sync(httpTransport(serverUrl))
-                .requestTimeout(Duration.ofSeconds(15))
-                .initializationTimeout(Duration.ofSeconds(10))
+                .requestTimeout(Duration.ofSeconds(120))
+                .initializationTimeout(Duration.ofSeconds(30))
                 .clientInfo(new McpSchema.Implementation("javaHarness", "1.0"))
                 .build();
         this.client = client;
