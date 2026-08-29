@@ -102,10 +102,15 @@ public class ChatApiClient {
                             if (onProgress != null) {
                                 onProgress.accept(data);
                             }
-                        } else if (!SseProtocol.DONE_MARKER.equals(data)) {
-                            // [DONE] 后还会跟 meta 事件，忽略但不中断，继续读到 meta
-                            onToken.accept(SseProtocol.unescapeLineBreaks(data));
+                        } else if (SseProtocol.EVENT_TOKEN.equals(event)) {
+                            // [DONE] 行与 token 共用 event: token 块结构，读到 DONE 不再发回调
+                            if (!SseProtocol.DONE_MARKER.equals(data) && onToken != null) {
+                                onToken.accept(SseProtocol.unescapeLineBreaks(data));
+                            }
                         }
+                        // 未知事件忽略：SSE 的 event 字段粘滞，未声明事件的 data 必须归属已声明
+                        // 的事件——历史上「token 块不带 event:」曾导致 progress 后的 token 被
+                        // 误归入 progress 而全部丢失（CLI 显示 0 字），故不再做无 event 兜底。
                     }
                 }
             }

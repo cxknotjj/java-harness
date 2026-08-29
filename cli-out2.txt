@@ -1,0 +1,26 @@
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] ------------------------< com.dark:javaHarness >------------------------
+[INFO] Building javaHarness 0.0.1-SNAPSHOT
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ javaHarness ---
+[INFO] Copying 1 resource from src\main\resources to target\classes
+[INFO] Copying 3 resources from src\main\resources to target\classes
+[INFO] 
+[INFO] --- compiler:3.14.1:compile (default-compile) @ javaHarness ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- exec:3.5.0:exec (default-cli) @ javaHarness ---
+（非交互终端，输入降级：无历史翻阅/补全；用 mvn -Pcli compile exec:exec 可获完整体验）
+==============================================
+ javaHarness CLI - 聊天客户端 (主服务: 8080)
+ 直接输入文本对话，/help 帮助，/exit 退出
+ ↑↓ 翻输入历史，Tab 补全命令
+==============================================
+已加载会话 61
+你> | ⏺ sum({"a": 200, "b": 20000}) (0s)⏺ sum ✓ 0.0s
+── 回合结束 · 耗时 4s · 子任务 0 个 · 输出约 0 字 ──
+（会话 61 / null）
+你> 

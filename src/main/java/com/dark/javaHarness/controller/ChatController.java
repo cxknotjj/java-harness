@@ -40,8 +40,10 @@ public class ChatController {
      * 流式聊天接口（带多轮会话记忆）
      * POST /api/chat/stream  Body: {"message": "你好", "sessionId": "1"}
      * 响应为 text/plain，每个 Flux 元素输出独立一行（末尾追加 {@code \n}）：
-     * 逐 token data: <文本>，结束 data: [DONE]，
+     * 逐 token event: token + data: &lt;文本&gt;，结束 event: token + data: [DONE]，
+     * 进度 event: progress + data: {stage,detail}，
      * 末尾 event: meta 与 data: {sessionId,newSession,goalId,status}。
+     * 注意：token 必须显式声明 event（SSE event 字段粘滞，否则会被误归入上一个事件）。
      */
     @PostMapping(value = "/stream", produces = MediaType.TEXT_PLAIN_VALUE)
     public Flux<String> stream(@Valid @RequestBody ChatRequest request) {

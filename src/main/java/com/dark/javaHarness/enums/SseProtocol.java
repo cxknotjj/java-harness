@@ -20,6 +20,13 @@ public final class SseProtocol {
     /** SSE 事件名：执行进度（多 Agent 编排的阶段反馈） */
     public static final String EVENT_PROGRESS = "progress";
 
+    /**
+     * SSE 事件名：内容 token。必须显式声明——SSE 的 event 字段是粘滞的，
+     * progress 块之后不带 event: 的 data 行会被客户端误归入上一事件
+     * （曾导致工具调用后模型回复全部被当作 progress 吞掉、CLI 显示 0 字）。
+     */
+    public static final String EVENT_TOKEN = "token";
+
     /** token 流结束标记 */
     public static final String DONE_MARKER = "[DONE]";
 

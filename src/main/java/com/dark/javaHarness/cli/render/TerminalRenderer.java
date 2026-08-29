@@ -124,7 +124,13 @@ public final class TerminalRenderer {
                     cancelSpinner();
                     archiveToolDone(detail);
                 }
-                default -> startSpinner(stage, detail);
+                // 杂散/空 stage 行（无阶段名的进度噪声，如 MCP 工具回放的残留）直接忽略，
+                // 否则 startSpinner("") 会以空标题起 spinner，折叠时渲染成「✓  · 0s」的孤立空行
+                default -> {
+                    if (stage != null && !stage.isBlank()) {
+                        startSpinner(stage, detail);
+                    }
+                }
             }
         }
     }
@@ -179,6 +185,10 @@ public final class TerminalRenderer {
     // ================================================================
 
     private void startSpinner(String stage, String detail) {
+        // 空标题守卫：只有「无阶段名」的行才能进入，否则会折叠成空白 ✓ 行（防脏输出）
+        if (stage == null || stage.isBlank()) {
+            return;
+        }
         finishSpinnerAsDone();
         spinnerStage = stage == null ? "" : stage;
         spinnerDetail = detail == null ? "" : detail;

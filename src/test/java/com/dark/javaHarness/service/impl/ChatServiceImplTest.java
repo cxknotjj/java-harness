@@ -123,9 +123,9 @@ class ChatServiceImplTest {
 
         List<String> lines = chatService.streamReactive(req).collectList().block();
 
-        assertTrue(lines.contains("data: a"), "应包含第 1 个 token");
-        assertTrue(lines.contains("data: b"), "应包含第 2 个 token");
-        assertTrue(lines.contains("data: [DONE]"), "token 结束后应包含 [DONE]");
+        assertTrue(lines.contains("event: token\ndata: a"), "应包含第 1 个 token（显式 event 声明）");
+        assertTrue(lines.contains("event: token\ndata: b"), "应包含第 2 个 token（显式 event 声明）");
+        assertTrue(lines.contains("event: token\ndata: [DONE]"), "token 结束后应包含 [DONE]（同块结构）");
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: meta")), "末尾应包含 meta 事件");
         String metaData = lines.stream()
                 .filter(l -> l.contains("\"sessionId\":\"50\""))
@@ -172,7 +172,7 @@ class ChatServiceImplTest {
 
         List<String> lines = chatService.streamReactive(req).collectList().block();
 
-        assertTrue(lines.contains("data: writer-token"), "应按 agentId 路由到对应 Agent 的流");
+        assertTrue(lines.contains("event: token\ndata: writer-token"), "应按 agentId 路由到对应 Agent 的流");
         verify(agentService, never()).executeStreamReactive(anyString(), anyString(), anyString());
     }
 
@@ -235,7 +235,8 @@ class ChatServiceImplTest {
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress")), "应包含 event: progress");
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress") && l.contains("\"stage\":\"拆解\"")),
                 "进度行的 event 与 data 应在同一元素内并带 stage JSON");
-        assertTrue(lines.contains("data: 最终回答A"), "内容行仍按普通 token 输出");
+        assertTrue(lines.contains("event: token\ndata: 最终回答A"),
+                "内容行应按 token 事件输出（progress 之后必须显式声明 event: token，否则 SSE 粘滞会吞掉 token）");
         assertFalse(lines.stream().anyMatch(l -> l.contains("{\"stage\"") == false && l.contains("子任务已就绪")),
                 "进度行不应以内容 token 形式泄漏");
     }
@@ -252,8 +253,8 @@ class ChatServiceImplTest {
 
         List<String> lines = chatService.streamReactive(req).collectList().block();
 
-        assertTrue(lines.contains("data: 第一段\\n第二段\\r\\n第三段"),
-                "换行应转义为 \\n/\\r 字面量并保持在同一条 data 行内, 实际输出: " + lines);
+        assertTrue(lines.contains("event: token\ndata: 第一段\\n第二段\\r\\n第三段"),
+                "换行应转义为 \\n/\\r 字面量并保持在同一条 token 块内, 实际输出: " + lines);
         // 不允许出现任何裸内容行（不带 data:/event: 前缀的非空行）
         assertTrue(lines.stream().noneMatch(l -> !l.startsWith("data:") && !l.startsWith("event:")),
                 "流中不得出现脱前缀的物理断行, 实际输出: " + lines);

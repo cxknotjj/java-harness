@@ -88,7 +88,7 @@ public class ChatServiceImpl implements ChatService {
     /**
      * 响应式流式聊天：返回 text/event-stream 格式的 SSE 行文本。
      * - 无 sessionId 时在 boundedElastic 上自动建档
-     * - 逐 token 产出 {@code data: <token>}，结束后产出 {@code data: [DONE]}，末尾产出 meta 事件
+     * - 逐 token 产出 {@code event: token} + {@code data: <token>}，结束后产出 [DONE]，末尾产出 meta 事件
      * - agent 流出错时产出 error 事件 + 错误信息，并以 meta(FAILED) 收尾，避免调用方悬挂
      */
     @Override
@@ -115,7 +115,8 @@ public class ChatServiceImpl implements ChatService {
             Flux<String> body = agentTokens
                     .doOnNext(row -> { if (!ProgressLine.isProgress(row)) { full.append(row); } })
                     .flatMap(ChatServiceImpl::toSseRows)
-                    .concatWithValues("data: " + SseProtocol.DONE_MARKER)
+                    .concatWithValues("event: " + SseProtocol.EVENT_TOKEN
+                            + "\ndata: " + SseProtocol.DONE_MARKER)
                     .concatWith(metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.SUCCEEDED.name(), null))
                     .doOnComplete(() -> writeBackContext(ctx.sid(), request.message(), full.toString()))
                     // 客户端断开（Tomcat 报 AsyncRequestNotUsableException/Connection reset）：
@@ -134,15 +135,18 @@ public class ChatServiceImpl implements ChatService {
     /**
      * 把 Agent 流出的一行转成 SSE 行序列：
      * - 进度行 {@code \u0000stage\u0001detail} → {@code event: progress} + {@code data: {"stage":..,"detail":..}}
-     * - 其它（内容 token）→ {@code data: <token>}
+     * - 其它（内容 token）→ {@code event: token} + {@code data: <token>}
      *
      * <p>progress 的 data JSON 直接用 Jackson 序列化 record，转义交给它，不再手写。
      */
     private static Flux<String> toSseRows(String row) {
         ProgressLine.StageRow p = ProgressLine.decode(row);
         if (p == null) {
-            // 内容行：裸换行会把一条 data 断成多个物理行，CLI 只认前缀行会丢内容——必须行内转义（可逆）
-            return Flux.just("data: " + SseProtocol.escapeLineBreaks(row));
+            // 内容行：裸换行会把一条 data 断成多个物理行，CLI 只认前缀行会丢内容——必须行内转义（可逆）。
+            // event: token 必须显式声明：SSE 的 event 字段粘滞，progress 块之后不带 event: 的
+            // data 行会被客户端误归入 progress（token 被吞、CLI 显示 0 字）。
+            return Flux.just("event: " + SseProtocol.EVENT_TOKEN
+                    + "\ndata: " + SseProtocol.escapeLineBreaks(row));
         }
         try {
             // event 与 data 必须在同一元素内：MVC 逐元素 flush，拆成两个元素会被其它事件的行交叉插入

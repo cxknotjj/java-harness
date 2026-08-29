@@ -31,13 +31,12 @@ class ChatControllerTest {
 
     @Test
     void stream_eachElementEndsWithNewline() {
-        // streamReactive 产出的元素本身不含换行（data: 你好 / data: [DONE] / event: meta / data: {...}）
+        // streamReactive 产出的元素本身不含换行（event: token+data 块 / event: meta+data 块）
         when(chatService.streamReactive(org.mockito.ArgumentMatchers.any()))
                 .thenReturn(Flux.just(
-                        "data: 你好",
-                        "data: [DONE]",
-                        "event: meta",
-                        "data: {\"sessionId\":\"1\",\"newSession\":true}"));
+                        "event: token\ndata: 你好",
+                        "event: token\ndata: [DONE]",
+                        "event: meta\ndata: {\"sessionId\":\"1\",\"newSession\":true}"));
 
         ChatRequest req = new ChatRequest("你好", "1", null);
         List<String> lines = controller.stream(req).collectList().block();
@@ -58,14 +57,16 @@ class ChatControllerTest {
     @Test
     void stream_preservesElementOrder() {
         when(chatService.streamReactive(org.mockito.ArgumentMatchers.any()))
-                .thenReturn(Flux.just("data: a", "data: b", "data: [DONE]", "event: meta"));
+                .thenReturn(Flux.just("event: token\ndata: a", "event: token\ndata: b",
+                        "event: token\ndata: [DONE]", "event: meta\ndata: {}"));
 
         List<String> lines = controller.stream(new ChatRequest("x", "1", null))
                 .map(String::trim)
                 .collectList()
                 .block();
 
-        assertEquals(List.of("data: a", "data: b", "data: [DONE]", "event: meta"), lines,
+        assertEquals(List.of("event: token\ndata: a", "event: token\ndata: b",
+                "event: token\ndata: [DONE]", "event: meta\ndata: {}"), lines,
                 "元素应保持原有顺序且逐一成行");
     }
 }

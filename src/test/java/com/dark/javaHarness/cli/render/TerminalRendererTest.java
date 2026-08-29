@@ -162,6 +162,31 @@ class TerminalRendererTest {
         assertTrue(out.contains("⏺ RunShellCommand(python x.py)"), "应展示工具调用起始行: " + out);
         // ✗ 红色高亮后跟灰色耗时，ANSI 序列隔断连续匹配，分别断言
         assertTrue(out.contains("✗"), "失败结果行应含 ✗: " + out);
-        assertTrue(out.contains("0.3s"), "失败结果行应含耗时: " + out);
+        assertTrue(out.contains("0.3s"), "失败结果行应含耗时 sign: " + out);
+    }
+
+    // ---- 空 stage 过滤：杂散进度行不渲染空标题 spinner / 空 ✓ 行 ----
+
+    @Test
+    void emptyStageProgress_isIgnored_notRenderedAsBarseCheckLine() {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        TerminalRenderer renderer = new TerminalRenderer(
+                new PrintStream(buf, true, StandardCharsets.UTF_8));
+
+        renderer.beginTurn();
+        // 模拟：服务端/客户端解析出的空 stage 杂散行（MCP 等工具回放或解码残留）
+        renderer.onProgress("", "");
+        renderer.onProgress(null, "some detail");
+        renderer.onProgress("  ", "   ");
+        renderer.onToken("最终答案");
+        renderer.endTurn(true, null);
+
+        String out = buf.toString(StandardCharsets.UTF_8);
+        // 不应出现以「✓  · 」开头的空标题归档行（finishSpinnerAsDone 的空标题产物）
+        assertFalse(out.contains("✓  ·"), "空 stage 不应归档出空标题 ✓ 行: " + out);
+        // 空 stage 的 startSpinner 被守卫拒绝，不会产生孤立「✓ 」行
+        assertFalse(out.matches("(?s).*✓[^\u001b\\n]*\\s*·\\s*0s.*"), "不应产生空标题 spinner 折叠行: " + out);
+        // 真实内容不受影响
+        assertTrue(out.contains("最终答案"), "内容 token 应正常输出: " + out);
     }
 }
