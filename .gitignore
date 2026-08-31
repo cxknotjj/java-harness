@@ -7,6 +7,10 @@ target/
 .mvn-repo/
 # CLI 运行历史文件
 .cli-history
+# CLI 调试临时文件（stdin 喂入/输出重定向/服务端日志落盘）
+in.txt
+cli-*.txt
+server.log
 # Sandbox 容器会话挂载目录（agentscope-runtime 运行时自动创建）
 sessions_mount_dir/
 
