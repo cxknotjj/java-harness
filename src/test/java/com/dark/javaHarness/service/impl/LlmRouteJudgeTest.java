@@ -1,6 +1,7 @@
 package com.dark.javaHarness.service.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
@@ -44,6 +45,8 @@ class LlmRouteJudgeTest {
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        when(requestSpec.options(any(org.springframework.ai.openai.OpenAiChatOptions.class)))
+                .thenReturn(requestSpec);
         when(requestSpec.call()).thenReturn(responseSpec);
         when(responseSpec.chatResponse()).thenReturn(new ChatResponse(
                 List.of(new Generation(new AssistantMessage(content)))));
@@ -80,6 +83,8 @@ class LlmRouteJudgeTest {
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        when(requestSpec.options(any(org.springframework.ai.openai.OpenAiChatOptions.class)))
+                .thenReturn(requestSpec);
         when(requestSpec.call()).thenThrow(new IllegalStateException("llm down"));
         judge = new LlmRouteJudge(clientRegistry, null);
 
