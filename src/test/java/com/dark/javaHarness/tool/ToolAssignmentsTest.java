@@ -15,11 +15,13 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.ai.tool.definition.ToolDefinition;
 
 /**
  * ToolAssignments 单测：Sandbox 接入后的双通道（@Tool 对象 + ToolCallback）分配语义。
  * - 退役替换：原 FileTools/SearchTools/ShellTools 能力由沙箱 ToolCallback 等价承担
  * - 最小可见性：writer/未登记（含编排器）为空集；未分配工具对模型不可见
+ * - 同名去重：先到者优先（沙箱工具优先于 MCP 重名工具），防 Spring AI 同名校验失败
  * - 懒加载：EMPTY 集合的专家不触发沙箱初始化
  */
 @ExtendWith(MockitoExtension.class)
@@ -35,17 +37,31 @@ class ToolAssignmentsTest {
 
     private ToolAssignments assignments;
 
-    private final ToolCallback cb = mock(ToolCallback.class);
-    private final ToolCallback mcpCb = mock(ToolCallback.class);
-
     @BeforeEach
     void setUp() {
-        lenient().when(sandbox.baseTools()).thenReturn(List.of(cb));
-        lenient().when(sandbox.readOnlyFileTools()).thenReturn(List.of(cb, cb));
-        lenient().when(sandbox.writeTools()).thenReturn(List.of(cb, cb, cb));
-        lenient().when(sandbox.browserTools()).thenReturn(List.of(cb, cb));
-        lenient().when(mcp.toolCallbacks()).thenReturn(List.of(mcpCb));
+        ToolCallback base = named("base");
+        ToolCallback ro1 = named("ro1");
+        ToolCallback ro2 = named("ro2");
+        ToolCallback w1 = named("w1");
+        ToolCallback w2 = named("w2");
+        ToolCallback w3 = named("w3");
+        ToolCallback b1 = named("browser_navigate");
+        ToolCallback b2 = named("browser_snapshot");
+        ToolCallback mcpSearch = named("mcp_search");
+        lenient().when(sandbox.baseTools()).thenReturn(List.of(base));
+        lenient().when(sandbox.readOnlyFileTools()).thenReturn(List.of(ro1, ro2));
+        lenient().when(sandbox.writeTools()).thenReturn(List.of(w1, w2, w3));
+        lenient().when(sandbox.browserTools()).thenReturn(List.of(b1, b2));
+        lenient().when(mcp.toolCallbacks()).thenReturn(List.of(mcpSearch));
         assignments = new ToolAssignments(webTools, sandbox, mcp);
+    }
+
+    /** 带 toolDefinition 名字的 mock 回调（真实工具名才可验证同名去重语义） */
+    private static ToolCallback named(String name) {
+        ToolCallback cb = mock(ToolCallback.class);
+        lenient().when(cb.getToolDefinition()).thenReturn(ToolDefinition.builder()
+                .name(name).description("test tool").inputSchema("{}").build());
+        return cb;
     }
 
     @Test
@@ -60,14 +76,38 @@ class ToolAssignmentsTest {
     @Test
     void researcherAndGeneral_getsMcpTools_butNoOtherAgentDoes() {
         // MCP 外部工具（扩展工具生态）分配给 researcher 与 general（full-access 也含扩展工具）
-        assertTrue(assignments.forAgent("researcher").callbacks().contains(mcpCb),
+        assertEquals(1, countNames(assignments.forAgent("researcher"), "mcp_search"),
                 "researcher 应能看见 MCP 工具");
-        assertTrue(assignments.forAgent("general").callbacks().contains(mcpCb),
+        assertEquals(1, countNames(assignments.forAgent("general"), "mcp_search"),
                 "general 应能看见 MCP 工具");
-        assertFalse(assignments.forAgent("coder").callbacks().contains(mcpCb),
+        assertEquals(0, countNames(assignments.forAgent("coder"), "mcp_search"),
                 "coder 不应看见 MCP 工具");
-        assertFalse(assignments.forAgent("analyst").callbacks().contains(mcpCb),
+        assertEquals(0, countNames(assignments.forAgent("analyst"), "mcp_search"),
                 "analyst 不应看见 MCP 工具");
+    }
+
+    @Test
+    void duplicateNames_deduped_keepingFirstOccurrence() {
+        // 复现生产事故：Browser MCP 的 browser_navigate/browser_snapshot 与沙箱浏览器工具重名，
+        // Spring AI 校验「Multiple tools with the same name」直接拒绝请求 → 合并时按名去重，先到者优先
+        ToolCallback mcpNavigate = named("browser_navigate");
+        ToolCallback mcpSnapshot = named("browser_snapshot");
+        ToolCallback mcpNew = named("mcp_only");
+        lenient().when(mcp.toolCallbacks())
+                .thenReturn(List.of(mcpNavigate, mcpSnapshot, mcpNew));
+
+        ToolAssignments.ToolSet general = assignments.forAgent("general");
+        assertEquals(9, general.callbacks().size(),
+                "8 沙箱 + 3 MCP − 2 个与沙箱重名（browser_navigate/browser_snapshot）= 9");
+        assertFalse(general.callbacks().contains(mcpNavigate), "重名 MCP 工具应被沙箱版本取代");
+        assertFalse(general.callbacks().contains(mcpSnapshot), "重名 MCP 工具应被沙箱版本取代");
+        assertTrue(general.callbacks().contains(mcpNew), "无冲突 MCP 工具正常保留");
+    }
+
+    private static long countNames(ToolAssignments.ToolSet set, String name) {
+        return set.callbacks().stream()
+                .filter(c -> name.equals(c.getToolDefinition().name()))
+                .count();
     }
 
     @Test

@@ -26,8 +26,13 @@ spring:
       # 首次被 agent 取用工具时才连接（server 与 client 同进程，启动完成后 /mcp 端点即可达）。
       client:
         enabled: false
-        # 懒连接时的 server 地址，由 McpToolProvider 读取
+        # 传输方式：http=Streamable-HTTP 连 server-url；stdio=spawn 外部 MCP 进程（见 stdio-command）
+        transport: stdio
+        # 懒连接时的 server 地址（http 模式），由 McpToolProvider 读取
         server-url: http://localhost:${server.port:8080}/mcp
+        # stdio 模式启动命令。优先级：项目根 mcp-config.json（mcpServers JSON 结构，同 Claude/Cursor）
+        # → 此内联命令（回退）。示例：stdio-command: "npx -y @browsermcp/mcp@latest"
+        stdio-command: ""
   datasource:
     url: jdbc:mysql://localhost:3306/harness?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false
     username: root

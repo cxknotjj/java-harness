@@ -67,10 +67,16 @@ public class ToolAssignments {
         };
     }
 
+    /** 按顺序合并工具列表，按工具名去重（先到者优先）；Spring AI 不允许同名工具注入同一请求 */
     private static List<ToolCallback> concat(List<ToolCallback>... lists) {
         List<ToolCallback> merged = new ArrayList<>();
+        var seen = new java.util.HashSet<String>();
         for (List<ToolCallback> l : lists) {
-            merged.addAll(l);
+            for (ToolCallback c : l) {
+                if (seen.add(c.getToolDefinition().name())) {
+                    merged.add(c);
+                }
+            }
         }
         return List.copyOf(merged);
     }
