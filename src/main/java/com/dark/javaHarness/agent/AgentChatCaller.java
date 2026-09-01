@@ -31,6 +31,9 @@ import org.springframework.ai.tool.ToolCallback;
  */
 final class AgentChatCaller {
 
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(AgentChatCaller.class);
+
     /** 默认系统提示词（agent 表无对应行或 prompt 为空时的兜底） */
     private static final String DEFAULT_SYSTEM_PROMPT =
             "你是一个执行任务的通用 AI 助手，请直接给出简洁、可执行的完成结果。";
@@ -83,20 +86,53 @@ final class AgentChatCaller {
         return retry.executeWithRetry(() -> {
             long start = System.currentTimeMillis();
             try {
-                org.springframework.ai.chat.model.ChatResponse resp = buildSpec(config, forAgent, fallbackSystem, user, toolEmitter)
-                        .call().chatResponse();
-                String content = resp == null || resp.getResult() == null
-                        || resp.getResult().getOutput() == null
-                        ? null : resp.getResult().getOutput().getText();
-                Usage usage = resp == null || resp.getMetadata() == null
-                        ? null : resp.getMetadata().getUsage();
-                recordOk(sessionId, forAgent, model, false, usage, start, content);
-                return content;
+                return invokeAndRecord(config, sessionId, forAgent, fallbackSystem, user,
+                        toolEmitter, false, model, start);
             } catch (RuntimeException e) {
+                // 模型可能把提示词里的专家名（researcher 等）误当工具发起调用——
+                // 工具列表里没有该名字，Spring AI 执行时抛「No ToolCallback found」。
+                // 此时去掉工具列表重试一次：模型纯文本作答仍可产出结果，不炸整个编排。
+                if (isUnknownToolCall(e)) {
+                    log.warn("[caller] {} 发起未知名工具调用，去工具重试一次：{}", forAgent, safeMsg(e));
+                    long start2 = System.currentTimeMillis();
+                    try {
+                        return invokeAndRecord(config, sessionId, forAgent, fallbackSystem, user,
+                                null, true, model, start2);
+                    } catch (RuntimeException e2) {
+                        recordError(sessionId, forAgent, model, false, start2, e2);
+                        throw e2;
+                    }
+                }
                 recordError(sessionId, forAgent, model, false, start, e);
                 throw e;
             }
         });
+    }
+
+    /** 单次调用 + 成功观测记录（失败由调用方记录）；disableTools=true 时不注入任何工具（幻觉工具调用的降级路径） */
+    String invokeAndRecord(AgentConfig config, String sessionId, String forAgent,
+                           String fallbackSystem, String user, Consumer<String> toolEmitter,
+                           boolean disableTools, String model, long start) {
+        org.springframework.ai.chat.model.ChatResponse resp =
+                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, disableTools)
+                        .call().chatResponse();
+        String content = resp == null || resp.getResult() == null
+                || resp.getResult().getOutput() == null
+                ? null : resp.getResult().getOutput().getText();
+        Usage usage = resp == null || resp.getMetadata() == null
+                ? null : resp.getMetadata().getUsage();
+        recordOk(sessionId, forAgent, model, false, usage, start, content);
+        return content;
+    }
+
+    /** 模型幻觉出不存在的工具调用（工具名不在回调列表中，Spring AI 执行阶段抛出） */
+    private static boolean isUnknownToolCall(RuntimeException e) {
+        String msg = e.getMessage();
+        return msg != null && msg.contains("No ToolCallback found for tool name");
+    }
+
+    private static String safeMsg(Exception e) {
+        return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
     }
 
     /**
@@ -124,7 +160,7 @@ final class AgentChatCaller {
             long start = System.currentTimeMillis();
             StringBuilder collected = new StringBuilder();
             try {
-                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter)
+                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, false)
                         .stream()
                         .content()
                         .doOnNext(token -> {
@@ -154,7 +190,8 @@ final class AgentChatCaller {
 
     /** 组装请求（查表配置 → 取客户端 → system/user → 请求级 model → 工具注入），call/stream 共用；config 由调用方查好传入（避免重复查表） */
     private ChatClient.ChatClientRequestSpec buildSpec(AgentConfig config, String forAgent, String fallbackSystem,
-                                                       String user, Consumer<String> toolEmitter) {
+                                                       String user, Consumer<String> toolEmitter,
+                                                       boolean disableTools) {
         String model = config != null ? config.model() : null;
         ChatClient client = clientRegistry.get(model);
         boolean hasTablePrompt = config != null && config.prompt() != null && !config.prompt().isBlank();
@@ -172,7 +209,11 @@ final class AgentChatCaller {
                     .frequencyPenalty(0.5)
                     .build());
         }
-        // 专家工具分配：按 agent 名注入请求级工具（与客户端 defaultTools 合并）
+        // 专家工具分配：按 agent 名注入请求级工具（与客户端 defaultTools 合并）；
+        // disableTools=true 跳过（幻觉工具调用的降级重试路径）
+        if (disableTools) {
+            return spec;
+        }
         ToolAssignments.ToolSet toolSet = toolAssignments == null
                 ? ToolAssignments.ToolSet.EMPTY
                 : toolAssignments.forAgent(forAgent);

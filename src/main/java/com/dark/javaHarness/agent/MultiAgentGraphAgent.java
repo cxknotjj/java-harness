@@ -600,7 +600,10 @@ public class MultiAgentGraphAgent implements Agent {
         // 未指派（lead 输出旧格式或漏 agent 字段）→ 回退 general：通用兜底且持有全量工具
         String resolved = (expert == null || expert.isBlank())
                 ? AgentConstants.DEFAULT_AGENT : expert;
-        String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。";
+        // 提示词明确「专家名只是身份不是工具」：防止模型把 researcher 等名字误当工具调用
+        String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。"
+                + "只能调用系统提供的工具列表中的工具；专家名（researcher/coder/analyst/writer 等）"
+                + "只是你的身份标识，绝不是可调用的工具。";
         return chatCaller.call(sessionId, resolved, persona, task, toolEmitter);
     }
 
