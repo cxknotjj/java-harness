@@ -603,7 +603,9 @@ public class MultiAgentGraphAgent implements Agent {
         // 提示词明确「专家名只是身份不是工具」：防止模型把 researcher 等名字误当工具调用
         String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。"
                 + "只能调用系统提供的工具列表中的工具；专家名（researcher/coder/analyst/writer 等）"
-                + "只是你的身份标识，绝不是可调用的工具。";
+                + "只是你的身份标识，绝不是可调用的工具。"
+                + "工具使用纪律：网络类工具（fetchUrl/browser_navigate 等抓取与浏览）合计调用不超过 8 次；"
+                + "同一 URL 只抓取一次；优先一次抓取多角度提取信息，材料足以支撑结论时立即停止调用工具并输出结果。";
         return chatCaller.call(sessionId, resolved, persona, task, toolEmitter);
     }
 

@@ -7,6 +7,7 @@ import com.dark.javaHarness.exception.ModelQuotaException;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
+import com.dark.javaHarness.tool.ToolCallBudget;
 import com.dark.javaHarness.tool.ToolCallTracer;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,6 +39,9 @@ final class AgentChatCaller {
     /** 默认系统提示词（agent 表无对应行或 prompt 为空时的兜底） */
     private static final String DEFAULT_SYSTEM_PROMPT =
             "你是一个执行任务的通用 AI 助手，请直接给出简洁、可执行的完成结果。";
+
+    /** 单次 LLM 调用内的工具执行硬上限（提示词软约束 ≤8，硬上限留余量） */
+    private static final int TOOL_CALL_BUDGET = 12;
 
     private final ChatClientRegistry clientRegistry;
     private final AgentService agentService;
@@ -236,7 +240,10 @@ final class AgentChatCaller {
                     ToolCallTracer.trace(toolSet.callbacks(), toolEmitter));
             traced.addAll(ToolCallTracer.traceAnnotated(toolSet.annotated(), toolEmitter));
             if (!traced.isEmpty()) {
-                spec.toolCallbacks(traced.toArray(new ToolCallback[0]));
+                // 硬预算：单次调用内工具执行超过上限后不再真执行，返回引导文本收束循环
+                // （防止模型无限调用工具导致 token 按轮数平方级膨胀）
+                spec.toolCallbacks(ToolCallBudget.limit(traced, TOOL_CALL_BUDGET)
+                        .toArray(new ToolCallback[0]));
             }
             return spec;
         }
