@@ -17,13 +17,14 @@ alwaysApply: true
 
 1. **先询问确认**：提交前先 `git status` / `git diff` 向用户简要说明将提交哪些文件，确认内容无误后再操作。
 2. **忽略临时/生成文件**：`.mvn-repo/`（本地 Maven 仓库）、`.cli-history`、`target/`、IDE 本地配置（`.idea/`、`.vscode/`）等**绝不提交**。
-3. **commit message**：使用英文（避免 Windows 下中文 commit 乱码），遵循 Conventional Commits 格式：
+3. **commit message**：遵循 [Conventional Commits](../../docs/COMMIT_CONVENTION.md) 格式，**描述用中文**（type/scope 前缀保持英文）：
    - `feat:` 新功能
    - `fix:` 修复缺陷
    - `refactor:` 重构
    - `docs:` 文档
    - `chore:` 构建、工具、脚本等杂项
    - 正文说明"为什么"而非"做了什么"
+   - **防乱码**：AI 助手执行提交时必须用文件方式 `git commit -F <UTF-8文件>`，禁止命令行内联中文 `-m "中文"`
 4. **只提交明确在任内的文件**：不要用 `git add -A` 盲目添加；如用户有未明确的问题文件，先确认。
 5. **推送前**：确认目标远程（origin / gitee），推送到是否正确的分支。
 
