@@ -22,7 +22,7 @@
 | 语言       | Java                       | 17     | JDK 版本（`pom.xml` release 17）                                                   |
 | 构建       | Maven                      | -      | 依赖与构建管理，本地仓库重定向 `.mvn-repo`                                                    |
 | 核心框架     | Spring Boot                | 3.5.14 | Web 应用框架（**硬约束：与 Spring AI 1.1.4 兼容**）                                         |
-| AI 框架    | Spring AI                  | 1.1.4  | `spring-ai-starter-model-openai`，以 OpenAI 兼容模式对接通义千问 DashScope（qwen3.7-flash）   |
+| AI 框架    | Spring AI                  | 1.1.4  | `spring-ai-starter-model-openai`，以 OpenAI 兼容协议统一对接多供应商（DashScope qwen3.7-flash / DeepSeek deepseek-v4-flash），按 `model_provider` 表路由 |
 | Graph 编排  | spring-ai-alibaba-graph-core | BOM 1.1.2.2 | StateGraph 多 Agent 编排（lead→并行子任务→聚合）+ `GraphLifecycleListener` 进度旁路（路径 B） |
 | 沙箱工具  | spring-ai-alibaba-sandbox | BOM 1.1.2.2 | 容器级工具隔离（传递 `agentscope-runtime-sandbox-core:1.0.2`）：base 容器（Python/Shell/文件读写检索）+ browser 容器（导航/快照/点击/输入），Docker 硬依赖 |
 | Web      | Spring MVC                 | 随 Boot | REST + 响应式 SSE（Controller 返回 `Flux<String>`，`text/event-stream`）+ 全局异常处理 |
@@ -137,8 +137,8 @@ controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测�
 ## 四、注意事项
 
 - **版本约束**：Spring Boot 必须为 3.5.14（与 Spring AI 1.1.4 兼容），升级需整体评估 Spring AI 兼容性。
-- **模型名**：`application.yaml` 中 `model: qwen3.7-flash`，如需切换模型请同步核对 DashScope 可用模型。
-- **DB 迁移**：schema 由 Flyway 管理（`db/migration/V1~V4`）。存量库首次接入自动 baseline（V1 跳过、增量执行）；全新库从 V1 全量建表。新增表结构变更只需追加 `V5__xxx.sql`，启动自动应用。
+- **模型路由**：模型按 `model_provider` 表路由到各服务商（DashScope / DeepSeek，OpenAI 兼容协议）。API Key 解析规则：`app.providers.<provider>.api-key`（yaml）→ `<PROVIDER大写>_API_KEY`（环境变量，如 `DEEPSEEK_API_KEY`）。`general`/`researcher` 走 deepseek-v4-flash，`lead`/`aggregator`/`coder`/`analyst` 等质量敏感环节走 qwen3.7-flash。
+- **DB 迁移**：schema 由 Flyway 管理（`db/migration/V1~V5`）。存量库首次接入自动 baseline（V1 跳过、增量执行）；全新库从 V1 全量建表。新增表结构变更只需追加 `V6__xxx.sql`，启动自动应用。
 - **Docker 硬依赖**：沙箱工具依赖本机 Docker；两个镜像需预拉取（aliyun 新加坡 registry）：`runtime-sandbox-base:latest`（约 1.4GB）与 `runtime-sandbox-browser:latest`（约 2GB），否则首个工具调用会现场拉镜像拖慢执行。无 Docker 时沙箱工具组为空（warn 日志），其余功能不受影响。过程记录见 [docs/0828-沙箱接入与验证.md](./docs/0828-沙箱接入与验证.md)。
 - **容器生命周期**：容器随首次工具调用懒创建、服务优雅停止时随 `@PreDestroy` 销毁；强杀 `mvn spring-boot:run` 不触发优雅关闭会残留容器，需正常停服或 `docker rm -f` 清理。
 
