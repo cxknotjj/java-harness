@@ -1,6 +1,7 @@
 package com.dark.javaHarness.service.impl;
 
 import com.dark.javaHarness.agent.Agent;
+import com.dark.javaHarness.agent.ProgressLine;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
@@ -79,7 +80,10 @@ public class AgentServiceImpl implements AgentService {
     public Flux<String> executeStreamReactive(String agentName, String objective, String sessionId) {
         Agent agent = requireAgent(agentName);
         Goal goal = goalService.create(objective, sessionId);
-        return streamWithLifecycle(goal, agent);
+        Flux<String> stream = streamWithLifecycle(goal, agent);
+        // 仅编排路径在流首下发 goal 进度行：goalId 尽早到达 CLI（客户端断开前也能记录，/resume 免记 ID）
+        return AgentConstants.MULTI_AGENT.equals(agentName)
+                ? withGoalProgress(goal, stream) : stream;
     }
 
     /** 复杂编排断点续跑：固定路由 multi-agent，复用既有 goal（检查点 threadId=goalId）。 */
@@ -87,7 +91,12 @@ public class AgentServiceImpl implements AgentService {
     public Flux<String> resumeStreamReactive(Goal goal) {
         Agent agent = requireAgent(AgentConstants.MULTI_AGENT);
         log.info("[resume] goal '{}' 断点续跑（检查点 threadId={}）", goal.id(), goal.id());
-        return streamWithLifecycle(goal, agent);
+        return withGoalProgress(goal, streamWithLifecycle(goal, agent));
+    }
+
+    /** 流首插入 goal 进度行（stage=goal, detail=goalId），后续编排进度照常 */
+    private static Flux<String> withGoalProgress(Goal goal, Flux<String> stream) {
+        return Flux.concat(Flux.just(ProgressLine.encode("goal", goal.id())), stream);
     }
 
     /**

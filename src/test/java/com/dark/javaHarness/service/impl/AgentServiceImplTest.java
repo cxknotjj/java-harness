@@ -165,12 +165,48 @@ class AgentServiceImplTest {
         Goal goal = new Goal("goal-resume", "复杂任务", "s1");
         java.util.List<String> tokens = agentService.resumeStreamReactive(goal).collectList().block();
 
-        assertEquals(java.util.List.of("ok-multi-agent"), tokens);
+        // 流首为 goal 进度行（goalId 尽早下发供 CLI /resume 记录），随后是 agent 输出
+        assertEquals(java.util.List.of(
+                com.dark.javaHarness.agent.ProgressLine.encode("goal", "goal-resume"),
+                "ok-multi-agent"), tokens);
         assertEquals("multi-agent", routedTo.get(), "续跑应固定路由 multi-agent");
         assertEquals(GoalStatus.SUCCEEDED, goal.status(), "续跑成功后 goal 应标记 SUCCEEDED");
         // 复用传入 goal：不新建 goal（仅 markRunning + 完成共 2 次 update）
         org.mockito.Mockito.verify(goalService, org.mockito.Mockito.never())
                 .create(any(), any());
         org.mockito.Mockito.verify(goalService, org.mockito.Mockito.times(2)).update(goal);
+    }
+
+    /* ---------------- goal 进度行（goalId 尽早下发） ---------------- */
+
+    /** 编排路径（multi-agent）流首下发 goal 进度行：CLI 断开前也能记录 goalId 供 /resume */
+    @Test
+    void executeStreamReactive_multiAgent_emitsGoalProgressFirst() {
+        agentService = new AgentServiceImpl(goalService, agentConfigProvider,
+                List.of(recordingAgent("multi-agent")));
+        Goal goal = stubGoal("multi-agent", "s1");
+
+        java.util.List<String> tokens = agentService.executeStreamReactive("multi-agent", "复杂任务", "s1")
+                .collectList().block();
+
+        assertEquals(com.dark.javaHarness.agent.ProgressLine.encode("goal", "goal-x"), tokens.get(0),
+                "编排流首应为 goal 进度行");
+        assertEquals("ok-multi-agent", tokens.get(tokens.size() - 1));
+        assertEquals(goal.id(), "goal-x");
+    }
+
+    /** 简单路径（general）不发 goal 进度行：普通聊天无可续跑检查点，不产生续跑目标 */
+    @Test
+    void executeStreamReactive_general_noGoalProgress() {
+        agentService = new AgentServiceImpl(goalService, agentConfigProvider,
+                List.of(recordingAgent("general")));
+        stubGoal("general", null);
+
+        java.util.List<String> tokens = agentService.executeStreamReactive("general", "hi", null)
+                .collectList().block();
+
+        assertEquals(java.util.List.of("ok-general"), tokens, "简单路径不应有 goal 进度行");
+        tokens.forEach(t -> org.junit.jupiter.api.Assertions.assertFalse(
+                com.dark.javaHarness.agent.ProgressLine.isProgress(t), "不应含任何进度行"));
     }
 }

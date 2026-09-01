@@ -53,10 +53,15 @@ public class ChatCli {
 
     /**
      * 当前会话最近一次复杂编排的 goalId（/resume 无参时的续跑目标）：
-     * 回合内出现过编排进度（编排/拆解/聚合）即视为编排回合，成功后记录其 goalId；
-     * /new 切换会话时清空。普通单模型聊天不记录（无可续跑的检查点）。
+     * 编排流首的 goal 进度事件到达即记录（不等回合成功——CLI 断开前也已记录）；
+     * 并持久化到 ~/.javaHarness_resume_state，CLI 重启后恢复（会话匹配才生效）。
+     * /new 切换会话时清空并同步清持久化文件。普通单模型聊天不记录（无可续跑的检查点）。
      */
     private String lastOrchestratedGoalId;
+
+    /** /resume 无参续跑目标的持久化文件（sessionId + goalId 两行，跨 CLI 进程保留） */
+    private static final java.nio.file.Path RESUME_STATE_FILE =
+            java.nio.file.Path.of(System.getProperty("user.home"), ".javaHarness_resume_state");
 
     /**
      * 当前选中的 Agent ID：null 表示交由服务端「主 Agent 前置判断」分流
@@ -69,9 +74,10 @@ public class ChatCli {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** 编排类进度 stage 集合：回合内出现任一即视为复杂编排回合（供 /resume 无参续跑判定） */
+    /** 编排类进度 stage 集合：回合内出现任一即视为复杂编排回合（供 /resume 无参续跑判定）。
+     *  goal = 编排流首下发的 goalId 事件（编排路径专属，出现即记录续跑目标） */
     private static final java.util.Set<String> STAGE_ORCHESTRATION =
-            java.util.Set.of("编排", "拆解", "聚合", "子任务");
+            java.util.Set.of("goal", "编排", "拆解", "聚合", "子任务");
 
     /** 默认连本机主服务 8080 */
     public ChatCli() {
@@ -101,6 +107,7 @@ public class ChatCli {
         ui.println("==============================================");
 
         loadExistingSession();
+        restoreResumeState();
 
         while (true) {
             String line = input.read();
@@ -373,8 +380,9 @@ public class ChatCli {
         try {
             String newId = api.createSession();
             this.sessionId = newId;
-            // 会话切换后「当前会话的任务」语义随之清空
+            // 会话切换后「当前会话的任务」语义随之清空（含持久化文件）
             this.lastOrchestratedGoalId = null;
+            persistResumeState();
             ui.println("\033[90m已开启新会话 " + newId + "\033[0m");
         } catch (IOException e) {
             ui.println("新建会话失败: " + e.getMessage());
@@ -494,9 +502,12 @@ public class ChatCli {
      */
     private void runTurn(SseCall call) {
         renderer.beginTurn();
-        // 回合内出现过编排进度（编排/拆解/聚合）→ 复杂编排回合，成功后记录 goalId 供 /resume 无参续跑
+        // 回合内出现过编排进度（goal/编排/拆解/聚合）→ 复杂编排回合
         java.util.concurrent.atomic.AtomicBoolean orchestrated =
                 new java.util.concurrent.atomic.AtomicBoolean(false);
+        // 流中见到的 goalId（goal 进度事件到达即记录——不等回合成功，断开前也已留存）
+        java.util.concurrent.atomic.AtomicReference<String> seenGoalId =
+                new java.util.concurrent.atomic.AtomicReference<>();
         try {
             ChatResponse resp = call.invoke(renderer::onToken,
                     data -> {
@@ -509,6 +520,12 @@ public class ChatCli {
                         } catch (IOException ignored) {
                             // 解析失败则 detail 原样展示，不中断
                         }
+                        if ("goal".equals(stage) && !detail.isBlank()) {
+                            // goalId 到达即记录并持久化：CLI 断开/重启后仍可 /resume
+                            seenGoalId.set(detail);
+                            this.lastOrchestratedGoalId = detail;
+                            persistResumeState();
+                        }
                         if (STAGE_ORCHESTRATION.contains(stage)) {
                             orchestrated.set(true);
                         }
@@ -517,21 +534,63 @@ public class ChatCli {
             // 记住服务端返回的会话ID，后续请求携带以延续多轮上下文
             if (resp.sessionId() != null && !resp.sessionId().isBlank()) {
                 this.sessionId = resp.sessionId();
+                persistResumeState();
             }
             boolean ok = "SUCCEEDED".equals(resp.status());
-            if (ok && orchestrated.get() && resp.goalId() != null && !resp.goalId().isBlank()) {
-                this.lastOrchestratedGoalId = resp.goalId();
-            }
-            renderer.endTurn(ok, ok ? null : resp.goalId() + " " +
+            String goalId = resp.goalId() != null && !resp.goalId().isBlank()
+                    ? resp.goalId() : seenGoalId.get();
+            renderer.endTurn(ok, ok ? null : goalId + " " +
                     (resp.error() == null ? "（无详细信息）" : resp.error()));
             if (ok) {
-                ui.println("\033[90m（会话 " + sessionId + " / " + resp.goalId() + "）\033[0m");
+                ui.println("\033[90m（会话 " + sessionId + " / " + goalId + "）\033[0m");
             }
         } catch (ConnectException e) {
             renderer.endTurn(false, "无法连接主服务 " + baseUrl);
             ui.println("请先启动主进程: mvn -s .mvn/settings.xml spring-boot:run");
         } catch (IOException e) {
             renderer.endTurn(false, e.getMessage());
+        }
+    }
+
+    // ================================================================
+    // /resume 续跑目标的本地持久化（跨 CLI 进程保留）
+    // ================================================================
+
+    /** 把当前 sessionId + goalId 写入持久化文件（失败仅提示，不影响主流程） */
+    private void persistResumeState() {
+        try {
+            java.nio.file.Files.writeString(RESUME_STATE_FILE,
+                    "sessionId=" + (sessionId == null ? "" : sessionId) + "\n"
+                            + "goalId=" + (lastOrchestratedGoalId == null ? "" : lastOrchestratedGoalId) + "\n");
+        } catch (Exception e) {
+            ui.println("\033[90m（续跑状态持久化失败: " + e.getMessage() + "）\033[0m");
+        }
+    }
+
+    /** CLI 启动时恢复持久化的续跑目标：仅当文件中的会话与当前会话一致时生效（/new 后自然失效） */
+    private void restoreResumeState() {
+        if (lastOrchestratedGoalId != null || sessionId == null) {
+            return;
+        }
+        try {
+            if (!java.nio.file.Files.exists(RESUME_STATE_FILE)) {
+                return;
+            }
+            String stateSessionId = null;
+            String stateGoalId = null;
+            for (String line : java.nio.file.Files.readAllLines(RESUME_STATE_FILE)) {
+                if (line.startsWith("sessionId=")) {
+                    stateSessionId = line.substring("sessionId=".length()).trim();
+                } else if (line.startsWith("goalId=")) {
+                    stateGoalId = line.substring("goalId=".length()).trim();
+                }
+            }
+            if (stateGoalId != null && !stateGoalId.isBlank() && sessionId.equals(stateSessionId)) {
+                this.lastOrchestratedGoalId = stateGoalId;
+                ui.println("\033[90m已恢复可续跑任务 " + stateGoalId + "（/resume 继续）\033[0m");
+            }
+        } catch (Exception e) {
+            ui.println("\033[90m（续跑状态恢复失败: " + e.getMessage() + "）\033[0m");
         }
     }
 }
