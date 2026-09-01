@@ -10,8 +10,8 @@ spring:
       api-key: ${QWEN_API:dummy-key-for-startup}
       chat:
         options:
-          # 可选 qwen-turbo / qwen-plus / qwen-max
-          model: qwen3.7-plus
+          # 可选 qwen3.7-flash / qwen-turbo / qwen-plus / qwen-max
+          model: qwen3.7-flash
           temperature: 0.7
     mcp:
       # 自建 MCP Server（Streamable-HTTP，WebMVC 传输）：protocol 必须显式置为 STREAMABLE
