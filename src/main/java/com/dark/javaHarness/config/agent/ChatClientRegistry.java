@@ -25,7 +25,8 @@ public class ChatClientRegistry {
 
     private static final Logger log = LoggerFactory.getLogger(ChatClientRegistry.class);
 
-    private final Map<String, ChatClient> clients = new ConcurrentHashMap<>();
+    /** volatile：reload() 整体替换引用，进行中的调用继续用旧映射，无空窗期 */
+    private volatile Map<String, ChatClient> clients = new ConcurrentHashMap<>();
     private final ChatClient defaultClient;
     private final ChatClientFactory clientFactory;
     private final ModelProviderMapper modelProviderMapper;
@@ -40,25 +41,42 @@ public class ChatClientRegistry {
         loadFromDatabase();
     }
 
-    /** 从 model_provider 表加载映射，交由 ChatClientFactory 构建各模型客户端 */
+    /** 从 model_provider 表加载映射到全新 map，构建成功后整体替换引用（热刷新安全） */
+    private void loadInto(Map<String, ChatClient> target) {
+        List<ModelProviderEntity> rows = modelProviderMapper.selectList(
+                new LambdaQueryWrapper<ModelProviderEntity>()
+                        .eq(ModelProviderEntity::getStatus, 1));
+        if (rows == null || rows.isEmpty()) {
+            log.warn("model_provider 表无启用数据（status=1），对应客户端为空，请求将回退默认客户端");
+            return;
+        }
+        for (ModelProviderEntity row : rows) {
+            ChatClient client = clientFactory.build(row.getProvider(), row.getApiUrl());
+            if (client != null) {
+                target.put(row.getModel(), client);
+            }
+        }
+        log.info("ChatClientRegistry 已从 model_provider 表加载 {} 条模型映射", target.size());
+    }
+
     private void loadFromDatabase() {
+        Map<String, ChatClient> fresh = new ConcurrentHashMap<>();
         try {
-            List<ModelProviderEntity> rows = modelProviderMapper.selectList(
-                    new LambdaQueryWrapper<ModelProviderEntity>()
-                            .eq(ModelProviderEntity::getStatus, 1));
-            if (rows == null || rows.isEmpty()) {
-                log.warn("model_provider 表无数据，使用默认 DashScope 客户端兜底");
-                return;
-            }
-            for (ModelProviderEntity row : rows) {
-                ChatClient client = clientFactory.build(row.getProvider(), row.getApiUrl());
-                if (client != null) {
-                    clients.put(row.getModel(), client);
-                }
-            }
-            log.info("ChatClientRegistry 已从 model_provider 表加载 {} 条模型映射", clients.size());
+            loadInto(fresh);
         } catch (Exception e) {
             log.warn("加载 model_provider 表失败，回退默认 DashScope 客户端", e);
+        }
+        this.clients = fresh;
+    }
+
+    /** 热刷新：重新读取 model_provider 表并整体替换映射（供应商管理接口新增/修改后调用，免重启） */
+    public void reload() {
+        try {
+            Map<String, ChatClient> fresh = new ConcurrentHashMap<>();
+            loadInto(fresh);
+            this.clients = fresh;
+        } catch (Exception e) {
+            log.warn("热刷新 model_provider 表失败，保留原映射继续服务", e);
         }
     }
 

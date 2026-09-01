@@ -83,4 +83,31 @@ class ChatClientRegistryTest {
         assertSame(defaultClient, registry.get("unknown-model"));
         assertSame(defaultClient, registry.get(null));
     }
+
+    /** 热刷新：reload 后按表最新内容重建映射（url 变更生效、新模型注册、旧映射不残留） */
+    @Test
+    void reload_rebuildsClientsFromLatestTableRows() {
+        // 首轮只有 gpt-4o 指向 url1
+        when(modelProviderMapper.selectList(any())).thenReturn(List.of(
+                row(1L, "gpt-4o", "dashscope", "https://old.example.com", 1)));
+        when(clientFactory.defaultClient(any())).thenReturn(defaultClient);
+        when(clientFactory.build("dashscope", "https://old.example.com")).thenReturn(gptClient);
+
+        registry = new ChatClientRegistry(dashScopeBuilder, clientFactory, modelProviderMapper);
+        assertSame(gptClient, registry.get("gpt-4o"));
+
+        // 表已变更：gpt-4o 改指新 url，新增 kimi-k2
+        ChatClient newGpt = org.mockito.Mockito.mock(ChatClient.class);
+        ChatClient kimi = org.mockito.Mockito.mock(ChatClient.class);
+        when(modelProviderMapper.selectList(any())).thenReturn(List.of(
+                row(1L, "gpt-4o", "dashscope", "https://new.example.com", 1),
+                row(2L, "kimi-k2", "moonshot", "https://api.moonshot.cn/v1", 1)));
+        when(clientFactory.build("dashscope", "https://new.example.com")).thenReturn(newGpt);
+        when(clientFactory.build("moonshot", "https://api.moonshot.cn/v1")).thenReturn(kimi);
+
+        registry.reload();
+
+        assertSame(newGpt, registry.get("gpt-4o"), "url 变更后应使用新客户端");
+        assertSame(kimi, registry.get("kimi-k2"), "新模型应被注册");
+    }
 }

@@ -3,6 +3,8 @@ package com.dark.javaHarness.cli;
 import com.dark.javaHarness.cli.api.ChatApiClient;
 import com.dark.javaHarness.cli.render.TerminalRenderer;
 import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.ProviderAddResult;
+import com.dark.javaHarness.domain.dto.ProviderRowView;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
@@ -10,6 +12,8 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.net.ConnectException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.List;
 import java.util.function.Consumer;
 
 /**
@@ -128,6 +132,8 @@ public class ChatCli {
             handleAgentCommand(line);
         } else if (line.startsWith("/resume")) {
             handleResumeCommand(line);
+        } else if (line.startsWith("/provider")) {
+            handleProviderCommand(line);
         } else {
             send(line);
         }
@@ -225,7 +231,7 @@ public class ChatCli {
                 if (!word.startsWith("/")) {
                     return;
                 }
-                for (String cmd : new String[]{"/help", "/new", "/agent", "/resume", "/exit", "/quit"}) {
+                for (String cmd : new String[]{"/help", "/new", "/agent", "/resume", "/provider", "/exit", "/quit"}) {
                     if (cmd.startsWith(word)) {
                         candidates.add(new org.jline.reader.Candidate(cmd));
                     }
@@ -342,6 +348,8 @@ public class ChatCli {
         ui.println("  " + c + "/agent" + r + "       查看当前 Agent");
         ui.println("  " + c + "/resume" + r + "       断点续跑：恢复当前会话最近一次编排任务（从中断处继续）");
         ui.println("  " + c + "/resume <goalId>" + r + "  断点续跑指定的 goal（goalId 见每回合末尾的会话信息）");
+        ui.println("  " + c + "/provider" + r + "      查看模型-服务商映射（model_provider 表全量）");
+        ui.println("  " + c + "/provider add" + r + "  新增供应商：/provider add <provider> <apiUrl> <模型1,模型2,...>");
         ui.println("  " + c + "/exit" + r + "        退出");
     }
 
@@ -413,7 +421,65 @@ public class ChatCli {
             arg = lastOrchestratedGoalId;
         }
         ui.println("\033[90m正在从检查点续跑 goal " + arg + "（已完成节点不再重跑）…\033[0m");
-        runTurn((onToken, onProgress) -> api.resumeStream(arg, onToken, onProgress));
+        final String goalId = arg;
+        runTurn((onToken, onProgress) -> api.resumeStream(goalId, onToken, onProgress));
+    }
+
+    /**
+     * 处理 /provider 命令：模型-服务商映射管理（model_provider 表）。
+     * <pre>
+     * /provider [list]                                    查看全量映射（含禁用行）
+     * /provider add &lt;provider&gt; &lt;apiUrl&gt; &lt;模型1,模型2,...&gt;   新增映射并热刷新（免重启生效）
+     * </pre>
+     * 新增前需确保已设置对应环境变量 <PROVIDER大写>_API_KEY（如 MOONSHOT_API_KEY）。
+     */
+    private void handleProviderCommand(String line) {
+        String arg = line.substring("/provider".length()).trim();
+        if (arg.isEmpty() || "list".equalsIgnoreCase(arg)) {
+            try {
+                List<ProviderRowView> rows = api.listProviders();
+                if (rows.isEmpty()) {
+                    ui.println("暂无模型映射（model_provider 表为空）");
+                    return;
+                }
+                ui.println("模型-服务商映射（共 " + rows.size() + " 行）：");
+                for (ProviderRowView r : rows) {
+                    String flag = r.status() != null && r.status() == 1
+                            ? "\033[32m✓\033[0m" : "\033[31m✗\033[0m";
+                    ui.println("  " + flag + " " + r.model() + "  →  " + r.provider()
+                            + "  \033[90m" + r.apiUrl() + "\033[0m");
+                }
+            } catch (IOException e) {
+                ui.println("获取映射失败: " + e.getMessage());
+            }
+            return;
+        }
+        if (arg.startsWith("add")) {
+            String[] parts = arg.split("\\s+", 4);
+            if (parts.length < 4) {
+                ui.println("用法: /provider add <provider> <apiUrl> <模型1,模型2,...>");
+                return;
+            }
+            String provider = parts[1];
+            List<String> models = Arrays.stream(parts[3].split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .toList();
+            if (models.isEmpty()) {
+                ui.println("至少提供一个模型名");
+                return;
+            }
+            try {
+                ProviderAddResult result = api.addProvider(provider, parts[2], models);
+                ui.println("\033[32m✓ " + result.summary() + "，注册表已热刷新（免重启生效）\033[0m");
+                ui.println("\033[90m提示：请确保已设置环境变量 " + provider.toUpperCase()
+                        + "_API_KEY，否则该供应商模型将回退默认客户端\033[0m");
+            } catch (IOException e) {
+                ui.println("新增供应商失败: " + e.getMessage());
+            }
+            return;
+        }
+        ui.println("用法: /provider [list] | /provider add <provider> <apiUrl> <模型1,模型2,...>");
     }
 
     /** SSE 流式调用函数签名：一次调用产出完整回合（token/progress 回调 + 返回 meta） */
