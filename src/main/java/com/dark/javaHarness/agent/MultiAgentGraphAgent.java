@@ -4,8 +4,11 @@ import com.alibaba.cloud.ai.graph.CompileConfig;
 import com.alibaba.cloud.ai.graph.CompiledGraph;
 import com.alibaba.cloud.ai.graph.NodeOutput;
 import com.alibaba.cloud.ai.graph.OverAllState;
+import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.StateGraph;
 import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
+import com.alibaba.cloud.ai.graph.checkpoint.BaseCheckpointSaver;
+import com.alibaba.cloud.ai.graph.checkpoint.config.SaverConfig;
 import com.alibaba.cloud.ai.graph.exception.GraphStateException;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.Goal;
@@ -25,7 +28,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
-import reactor.core.publisher.SignalType;
 
 /**
  * 多 Agent 编排器：路径 B（复杂请求）的执行体。
@@ -92,21 +94,54 @@ public class MultiAgentGraphAgent implements Agent {
     /** 图拓扑（构建一次）：同步执行缓存编译 {@link #graph}；流式执行每次带监听器重新编译 */
     private final StateGraph stateGraph;
     private final CompiledGraph graph;
+    /**
+     * 检查点存储器（可 null = 不启用断点续跑，如单测环境）：
+     * 非 null 时每个 superstep 结束自动落库（threadId=goalId），
+     * 支持 {@link #resumeStreamReactive(Goal)} 从断点继续（已完成节点不再重跑）。
+     */
+    private final BaseCheckpointSaver checkpointSaver;
 
     public MultiAgentGraphAgent(String agentName,
                                 ChatClientRegistry clientRegistry,
                                 AgentService agentService,
                                 ToolAssignments toolAssignments,
                                 LlmCallRecorder recorder) {
+        this(agentName, clientRegistry, agentService, toolAssignments, recorder, null);
+    }
+
+    public MultiAgentGraphAgent(String agentName,
+                                ChatClientRegistry clientRegistry,
+                                AgentService agentService,
+                                ToolAssignments toolAssignments,
+                                LlmCallRecorder recorder,
+                                BaseCheckpointSaver checkpointSaver) {
         this.agentName = agentName;
         this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments, recorder);
+        this.checkpointSaver = checkpointSaver;
         try {
             this.stateGraph = buildStateGraph();
-            // 同步执行用的常驻实例
-            this.graph = stateGraph.compile();
+            // 同步执行用的常驻实例（带检查点时每个 superstep 自动落库）
+            this.graph = stateGraph.compile(compileConfig(null));
         } catch (GraphStateException e) {
             throw new IllegalStateException("构建/编译多 Agent 编排 StateGraph 失败", e);
         }
+    }
+
+    /** 编译配置：挂检查点存储器（可 null）+ 生命周期监听器（可 null）；releaseThread=false 保留检查点供续跑 */
+    private CompileConfig compileConfig(com.alibaba.cloud.ai.graph.GraphLifecycleListener listener) {
+        CompileConfig.Builder builder = CompileConfig.builder().releaseThread(false);
+        if (checkpointSaver != null) {
+            builder.saverConfig(SaverConfig.builder().register(checkpointSaver).build());
+        }
+        if (listener != null) {
+            builder.withLifecycleListener(listener);
+        }
+        return builder.build();
+    }
+
+    /** 执行用 RunnableConfig：threadId=goalId（检查点归属键） */
+    private static RunnableConfig runnableConfig(String goalId) {
+        return RunnableConfig.builder().threadId(goalId).build();
     }
 
     @Override
@@ -122,7 +157,7 @@ public class MultiAgentGraphAgent implements Agent {
         input.put(K_OBJECTIVE, goal.objective());
         input.put(K_SESSION_ID, goal.sessionId());
 
-        return graph.invoke(input)
+        return graph.invoke(input, runnableConfig(goal.id()))
                 .flatMap(s -> s.value(K_FINAL, String.class))
                 .orElse(goal.objective());
     }
@@ -144,6 +179,84 @@ public class MultiAgentGraphAgent implements Agent {
      */
     @Override
     public Flux<String> executeStreamReactive(Goal goal) {
+        return reactivePipeline(goal, runnableConfig(goal.id()));
+    }
+
+    /**
+     * 断点续跑：从该 goal 上次编排的检查点继续（threadId=goalId）。
+     * 已完成节点（如 lead 拆解、已批量完成的子任务）不再重跑，只补执行缺口；
+     * 聚合节点重新汇总（读检查点中已有的全量 result_*）。
+     *
+     * <p>校验在方法调用时同步完成（快速失败）：
+     * 未启用检查点 / 无该 goal 的检查点记录时抛 {@link IllegalStateException}。
+     *
+     * <p>输出语义与 {@link #executeStreamReactive(Goal)} 完全一致（进度 + 打字机）。
+     *
+     * <p>graph-core 1.1.x 续跑触发条件是 config.checkPointId 非空
+     * （GraphRunnerContext#initializeFromResume：state 自动合并 checkpoint 状态），
+     * 而 saver.get() 对带 checkPointId 的 config 按 ID 精确匹配——
+     * 因此先探测最新 checkpoint，再以其真实 ID 组装续跑 config。
+     *
+     * <p>恢复点选择（{@link #selectResumeCheckpoint}）：
+     * 编排已完成（final 有效）→ 从最终检查点零调用回放；
+     * 否则回退到「子任务批完成、聚合前」的检查点（nextNodeId=aggregate）补跑聚合。
+     */
+    public Flux<String> resumeStreamReactive(Goal goal) {
+        if (checkpointSaver == null) {
+            throw new IllegalStateException("未启用检查点存储，无法续跑");
+        }
+        RunnableConfig probe = runnableConfig(goal.id());
+        com.alibaba.cloud.ai.graph.checkpoint.Checkpoint target;
+        try {
+            java.util.Collection<com.alibaba.cloud.ai.graph.checkpoint.Checkpoint> checkpoints =
+                    checkpointSaver.list(probe);
+            if (checkpoints.isEmpty()) {
+                throw new IllegalStateException(
+                        "无可续跑的编排：goal " + goal.id() + " 没有检查点（可能未走过复杂路径）");
+            }
+            target = selectResumeCheckpoint(checkpoints);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("读取检查点失败: " + goal.id(), e);
+        }
+        log.info("[multi-agent] 断点续跑 goal {}: 从检查点 {} 继续（nextNodeId={}，已完成节点不再重跑）",
+                goal.id(), target.getId(), target.getNextNodeId());
+        RunnableConfig config = RunnableConfig.builder()
+                .threadId(goal.id())
+                .checkPointId(target.getId())
+                .build();
+        return reactivePipeline(goal, config);
+    }
+
+    /**
+     * 恢复点选择：
+     * - 编排已完整跑完（存在 nextNodeId=END 且 final 有效的检查点）→ 选它，续跑零 LLM 调用、直接回放最终回答；
+     * - 聚合未完成（客户端断开时聚合被短路，最新检查点无有效 final）→ 回退到聚合前的检查点
+     *   （nextNodeId=aggregate，state 已含子任务结果），续跑只补跑聚合；
+     * - 都没有（断开极早，如 lead 中断）→ 兜底取任一检查点（通常 lead 之后，重跑缺口最小）。
+     */
+    private static com.alibaba.cloud.ai.graph.checkpoint.Checkpoint selectResumeCheckpoint(
+            java.util.Collection<com.alibaba.cloud.ai.graph.checkpoint.Checkpoint> checkpoints) {
+        com.alibaba.cloud.ai.graph.checkpoint.Checkpoint any = checkpoints.iterator().next();
+        return checkpoints.stream()
+                .filter(cp -> StateGraph.END.equals(cp.getNextNodeId()))
+                .filter(cp -> {
+                    Object fin = cp.getState() == null ? null : cp.getState().get(K_FINAL);
+                    return fin instanceof String s && !s.isBlank();
+                })
+                .findFirst()
+                .orElseGet(() -> checkpoints.stream()
+                        .filter(cp -> NODE_AGGREGATE.equals(cp.getNextNodeId()))
+                        .findFirst()
+                        .orElse(any));
+    }
+
+    /**
+     * 流式管道共用体：构建带旁路的图 → 编译（挂监听器 + 检查点）→ 主干帧合并旁路流。
+     * execute（全新执行）与 resume（断点续跑）仅 RunnableConfig 不同。
+     */
+    private Flux<String> reactivePipeline(Goal goal, RunnableConfig config) {
         Map<String, Object> input = new HashMap<>();
         input.put(K_OBJECTIVE, goal.objective());
         input.put(K_SESSION_ID, goal.sessionId());
@@ -159,23 +272,20 @@ public class MultiAgentGraphAgent implements Agent {
         try {
             // 流式拓扑每次执行独立构建（聚合节点绑定本次执行的 token 旁路，保证并发安全）
             streamingGraph = buildStateGraph(liveTokens, contentSent, toolEvents, cancelled)
-                    .compile(CompileConfig.builder()
-                            .withLifecycleListener(new BranchProgressListener(
-                                    branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX))
-                            .build());
+                    .compile(compileConfig(new BranchProgressListener(
+                            branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX)));
         } catch (GraphStateException e) {
             throw new IllegalStateException("编译带监听器的 StateGraph 失败", e);
         }
 
-        // 关闸在 merge 之前（见死锁说明）；complete 与 next 共用同一把锁，防迟到事件竞争
-        Flux<String> mainLine = streamingGraph.stream(input)
+        // 关闸在 merge 之前（见死锁说明）；complete 与 next 共用同一把锁，防迟到事件竞争。
+        // 注意：图节点异常终止时 graph-core 也会以 CANCEL 清理主干订阅，因此主干段的
+        // doFinally 不能用于判定「客户端断开」（会把编排异常误报为断开）；
+        // 真实断开判定挂在外层合并流上——只有下游（CLI/HTTP）真正断开才会 cancel 到这里。
+        Flux<String> mainLine = streamingGraph.stream(input, config)
                 .concatMap(out -> toRows(out, goal.objective(), contentSent))
                 .doFinally(sig -> {
-                    // 下游断开 → cancel 信号在此收敛：置位短路标志 + 关闸旁路 sink，编排不再消耗 LLM
-                    if (sig == SignalType.CANCEL) {
-                        cancelled.set(true);
-                        log.warn("[multi-agent] 客户端已断开，终止编排：不再发起新的 LLM 调用（进行中的调用等待自然结束）");
-                    }
+                    // 主干终结（完成/异常/被取消）后关闸旁路 sink，防止 merge 永久挂起
                     BranchProgressListener.tryCompleteSerialized(branchEvents);
                     BranchProgressListener.tryCompleteSerialized(liveTokens);
                     BranchProgressListener.tryCompleteSerialized(toolEvents);
@@ -185,6 +295,11 @@ public class MultiAgentGraphAgent implements Agent {
                 .mergeWith(branchEvents.asFlux())
                 .mergeWith(liveTokens.asFlux())
                 .mergeWith(toolEvents.asFlux())
+                .doOnCancel(() -> {
+                    // 客户端断开（Reactor cancel）置位：后续 superstep 的节点短路，不再发起新的 LLM 调用
+                    cancelled.set(true);
+                    log.warn("[multi-agent] 客户端已断开，终止编排：不再发起新的 LLM 调用（进行中的调用等待自然结束）");
+                })
                 .onErrorResume(e -> {
                     log.warn("[multi-agent] 流式执行异常：{}", safe(e));
                     return Flux.just(ProgressLine.encode("编排", "异常，已回退：" + safe(e)));
@@ -206,9 +321,15 @@ public class MultiAgentGraphAgent implements Agent {
         if (out.isSTART()) {
             return Flux.just(ProgressLine.encode("编排", "开始拆解复杂目标…"));
         }
-        // END 帧：确保一定有内容行（防 aggregate 帧 state 未含 final 的时序差异）
+        // END 帧：确保一定有内容行。优先取 state 中的最终回答（断点续跑越过聚合节点时，
+        // final 已在检查点状态里，兜底 objective 会答非所问）；都缺失时才回退 objective
         if (out.isEND()) {
-            return contentSent.get() ? Flux.empty() : Flux.just(objective);
+            if (contentSent.get()) {
+                return Flux.empty();
+            }
+            String fin = state == null ? null
+                    : state.value(K_FINAL, String.class).orElse(null);
+            return Flux.just(fin == null || fin.isBlank() ? objective : fin);
         }
         if (NODE_LEAD.equals(node)) {
             int n = state.value(K_SUBTASK_COUNT, Integer.class).orElse(0);
@@ -258,7 +379,10 @@ public class MultiAgentGraphAgent implements Agent {
                                        AtomicBoolean contentSent,
                                        Sinks.Many<String> toolEvents,
                                        AtomicBoolean cancelled) throws GraphStateException {
-        StateGraph g = new StateGraph();
+        // 注册编排 state 键的覆盖合并策略。关键：graph-core resume 时以 OverAllState#input()
+        // 合并 checkpoint 状态，只保留「已注册 KeyStrategy」的键；不注册则断点续跑时
+        // subtask/result/final 等全部丢失（全新执行走 withData 无此过滤，故首跑不受影响）
+        StateGraph g = new StateGraph(MultiAgentGraphAgent::stateKeyStrategies);
         // 子任务工具事件发射器：并行节点可能同时回调，经 Sink 锁串行化
         java.util.function.Consumer<String> toolEmitter = toolEvents == null ? null
                 : row -> BranchProgressListener.tryEmitSerialized(toolEvents, row);
@@ -291,6 +415,26 @@ public class MultiAgentGraphAgent implements Agent {
         g.addEdge(StateGraph.START, NODE_LEAD);
 
         return g;
+    }
+
+    /**
+     * 编排 state 全部键的注册策略（覆盖语义，与节点直接 put 的现有行为一致）：
+     * 输入键 + 拆解产物 + 各子任务槽位 + 最终回答。
+     */
+    private static Map<String, com.alibaba.cloud.ai.graph.KeyStrategy> stateKeyStrategies() {
+        Map<String, com.alibaba.cloud.ai.graph.KeyStrategy> strategies = new HashMap<>();
+        com.alibaba.cloud.ai.graph.KeyStrategy replace =
+                new com.alibaba.cloud.ai.graph.state.strategy.ReplaceStrategy();
+        strategies.put(K_OBJECTIVE, replace);
+        strategies.put(K_SESSION_ID, replace);
+        strategies.put(K_SUBTASK_COUNT, replace);
+        strategies.put(K_FINAL, replace);
+        for (int i = 0; i < MAX_SUBTASKS; i++) {
+            strategies.put(K_SUBTASK_PREFIX + i, replace);
+            strategies.put(K_SUBTASK_AGENT_PREFIX + i, replace);
+            strategies.put(K_RESULT_PREFIX + i, replace);
+        }
+        return strategies;
     }
 
     /* ------------ 节点实现（同步 NodeAction，返回状态更新 Map） ------------ */
@@ -365,10 +509,9 @@ public class MultiAgentGraphAgent implements Agent {
                                           AtomicBoolean contentSent,
                                           AtomicBoolean cancelled) {
         if (isCancelled(cancelled)) {
+            // 短路不写占位 final：避免「假完成」状态落检查点，导致续跑无法补跑聚合
             log.info("[multi-agent][aggregate] 客户端已断开，跳过聚合调用");
-            Map<String, Object> skipped = new HashMap<>();
-            skipped.put(K_FINAL, "（客户端已断开，编排已终止）");
-            return skipped;
+            return new HashMap<>();
         }
         int n = state.value(K_SUBTASK_COUNT, Integer.class).orElse(0);
         String sessionId = state.value(K_SESSION_ID, String.class).orElse(null);

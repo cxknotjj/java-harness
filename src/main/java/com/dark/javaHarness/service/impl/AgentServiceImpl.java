@@ -72,14 +72,30 @@ public class AgentServiceImpl implements AgentService {
 
     /**
      * 响应式流式执行：返回逐 token 产出的 {@link Flux}。
-     * 在 AgentService 层完成 goal 生命周期（RUNNING -> SUCCEEDED/FAILED），
-     * doOnNext 收集完整 token，doOnComplete/doOnError 回写 goal 状态；
-     * 阻塞的 DB 操作与 Agent 执行通过 subscribeOn(boundedElastic) 隔离，避免阻塞调用方线程。
+     * 在 AgentService 层完成 goal 生命周期（见 {@link #streamWithLifecycle}），
+     * 新建 goal 后路由到指定 Agent 执行。
      */
     @Override
     public Flux<String> executeStreamReactive(String agentName, String objective, String sessionId) {
         Agent agent = requireAgent(agentName);
         Goal goal = goalService.create(objective, sessionId);
+        return streamWithLifecycle(goal, agent);
+    }
+
+    /** 复杂编排断点续跑：固定路由 multi-agent，复用既有 goal（检查点 threadId=goalId）。 */
+    @Override
+    public Flux<String> resumeStreamReactive(Goal goal) {
+        Agent agent = requireAgent(AgentConstants.MULTI_AGENT);
+        log.info("[resume] goal '{}' 断点续跑（检查点 threadId={}）", goal.id(), goal.id());
+        return streamWithLifecycle(goal, agent);
+    }
+
+    /**
+     * 流式执行 + goal 生命周期回写（RUNNING -> SUCCEEDED/FAILED/取消 FAILED）。
+     * doOnNext 收集完整 token，doOnComplete/doOnError 回写 goal 状态；
+     * 阻塞的 DB 操作与 Agent 执行通过 subscribeOn(boundedElastic) 隔离，避免阻塞调用方线程。
+     */
+    private Flux<String> streamWithLifecycle(Goal goal, Agent agent) {
         goal.markRunning();
         goalService.update(goal);
         StringBuilder full = new StringBuilder();

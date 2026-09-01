@@ -3,6 +3,7 @@ package com.dark.javaHarness.agent;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -303,6 +304,114 @@ class MultiAgentGraphAgentTest {
         // lead + 2 个并行子任务 + 聚合共 4 次调用，全部走默认客户端（model=null）
         verify(clientRegistry, org.mockito.Mockito.times(4)).get(isNull());
         verify(requestSpec, never()).options(any());
+    }
+
+    /* ---------------- 断点续跑（Checkpointer） ---------------- */
+
+    /** 未启用检查点存储（构造传 null）→ resume 快速失败，抛出明确异常（无需 LLM 桩） */
+    @Test
+    void resume_withoutCheckpointer_throwsFast() {
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
+
+        assertThrows(IllegalStateException.class,
+                () -> agent.resumeStreamReactive(new Goal("gr1", "调研竞品")),
+                "未启用 checkpointer 应拒绝续跑");
+    }
+
+    /** 启用了检查点但该 goal 从未跑过编排（无检查点记录）→ resume 快速失败（无需 LLM 桩） */
+    @Test
+    void resume_withoutCheckpoint_throwsFast() {
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
+                new com.alibaba.cloud.ai.graph.checkpoint.savers.MemorySaver());
+
+        assertThrows(IllegalStateException.class,
+                () -> agent.resumeStreamReactive(new Goal("gr2", "调研竞品")),
+                "无检查点记录应拒绝续跑");
+    }
+
+    /**
+     * 完整跑完一次编排后 resume：检查点已记录最终状态（nextNodeId=END），
+     * 续跑不应再发起任何 LLM 调用，且应从检查点状态取回最终回答（END 帧兜底读 state.final）。
+     */
+    @Test
+    void resume_afterCompletedRun_skipsAllLlmCalls() {
+        stubChat(fixedContent());
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
+                new com.alibaba.cloud.ai.graph.checkpoint.savers.MemorySaver());
+
+        // 首跑：lead + 2 子任务（call）+ 聚合（stream）= 检查点逐 superstep 落库
+        java.util.List<String> first = agent
+                .executeStreamReactive(new Goal("gr3", "调研竞品并输出报告"))
+                .collectList()
+                .block();
+        assertNotNull(first);
+        assertEquals(fixedContent(), first.get(first.size() - 1), "首跑应以最终回答收尾");
+
+        // 续跑：所有节点已完成，零 LLM 调用，从检查点状态直接取回最终回答
+        java.util.List<String> resumed = agent
+                .resumeStreamReactive(new Goal("gr3", "调研竞品并输出报告"))
+                .collectList()
+                .block();
+        assertNotNull(resumed);
+        assertEquals(fixedContent(), resumed.get(resumed.size() - 1),
+                "续跑应从检查点状态取回最终回答, 实际帧序列: " + resumed);
+
+        // call 只发生 3 次（lead+2 子任务）、stream 只 1 次（聚合），resume 零新增
+        verify(requestSpec, org.mockito.Mockito.times(3)).call();
+        verify(requestSpec, org.mockito.Mockito.times(1)).stream();
+    }
+
+    /**
+     * 中途断开后 resume 补执行缺口：
+     * 时序：lead 正常完成落检查点 → 子任务批 call() 阻塞 → dispose（cancel 后图执行停止，
+     * 进行中的子任务结果不被接收、子任务批 superstep 无检查点）
+     * → resume 只能恢复到 lead 检查点（nextNodeId=__PARALLEL__(lead)）→ lead 不重跑（结果已复用），
+     * 子任务批作为执行缺口补跑（call +2），聚合补跑（stream 1 次）。
+     * call 共 5 次 = 首跑（lead 1 + 子任务 2）+ 续跑子任务 2。
+     */
+    @Test
+    void resume_afterLeadCheckpoint_reusesLeadResult() throws Exception {
+        java.util.concurrent.CountDownLatch releaseSubtasks = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger callCount = new java.util.concurrent.atomic.AtomicInteger();
+        when(clientRegistry.get(any())).thenReturn(chatClient);
+        when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
+        lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
+        when(chatClient.prompt()).thenReturn(requestSpec);
+        when(requestSpec.system(anyString())).thenReturn(requestSpec);
+        when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        // lead（第 1 次 call）立即返回拆解 JSON；子任务（第 2、3 次 call）阻塞到放行
+        when(requestSpec.call()).thenAnswer(inv -> {
+            if (callCount.incrementAndGet() == 1) {
+                return responseSpec;
+            }
+            releaseSubtasks.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            return responseSpec;
+        });
+        when(responseSpec.chatResponse()).thenReturn(chatResponseOf(fixedContent()));
+        lenient().when(requestSpec.stream()).thenReturn(streamSpec);
+        lenient().when(streamSpec.content()).thenReturn(Flux.just(fixedContent()));
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
+                new com.alibaba.cloud.ai.graph.checkpoint.savers.MemorySaver());
+
+        // lead 完成（检查点已落库）→ 子任务批阻塞中 → 模拟客户端断开
+        reactor.core.Disposable disposable = agent
+                .executeStreamReactive(new Goal("gr4", "调研竞品并输出报告"))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                .subscribe();
+        Thread.sleep(500);
+        disposable.dispose();       // cancel → 置位短路标志
+        releaseSubtasks.countDown(); // 放行：子任务返回 → 聚合短路（不写 final）
+        Thread.sleep(300);
+
+        // 续跑：从 lead 检查点恢复 → lead 不重跑（复用拆解），子任务批补跑 + 聚合补跑
+        java.util.List<String> resumed = agent
+                .resumeStreamReactive(new Goal("gr4", "调研竞品并输出报告"))
+                .collectList()
+                .block();
+        assertNotNull(resumed);
+        assertEquals(fixedContent(), resumed.get(resumed.size() - 1), "续跑应以最终回答收尾");
+        verify(requestSpec, org.mockito.Mockito.times(5)).call();
+        verify(requestSpec, org.mockito.Mockito.times(1)).stream();
     }
 
     /**

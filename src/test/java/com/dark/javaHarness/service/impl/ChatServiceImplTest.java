@@ -2,6 +2,8 @@ package com.dark.javaHarness.service.impl;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -17,11 +19,14 @@ import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.enums.GoalStatus;
+import com.dark.javaHarness.exception.ResumeConflictException;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
+import com.dark.javaHarness.service.GoalService;
 import com.dark.javaHarness.service.RouteJudge;
 import com.dark.javaHarness.service.SessionService;
 import java.util.List;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -37,6 +42,7 @@ import reactor.core.publisher.Flux;
  * - 首次不带 sessionId → newSession=true 且自动建档
  * - 后续带 sessionId → newSession=false 且不重复建档
  * - 执行成功后 user/assistant 上下文写回 session_messages
+ * - resume：goal 校验（不存在 400 / RUNNING 409）+ 复用 goal 断点续跑
  */
 @ExtendWith(MockitoExtension.class)
 class ChatServiceImplTest {
@@ -47,6 +53,8 @@ class ChatServiceImplTest {
     private SessionService sessionService;
     @Mock
     private RouteJudge routeJudge;
+    @Mock
+    private GoalService goalService;
 
     @InjectMocks
     private ChatServiceImpl chatService;
@@ -260,5 +268,51 @@ class ChatServiceImplTest {
                 "流中不得出现脱前缀的物理断行, 实际输出: " + lines);
         // 写回记忆仍为 user+assistant 两条（转义只发生在传输层，不污染存储原文）
         verify(sessionService, times(2)).saveContext(eq("50"), any());
+    }
+
+    /* ---------------- resume（断点续跑） ---------------- */
+
+    /** goal 不存在 → IllegalArgumentException（全局异常处理映射 400） */
+    @Test
+    void resume_goalNotFound_throwsIllegalArgument() {
+        when(goalService.get("g404")).thenReturn(Optional.empty());
+
+        assertThrows(IllegalArgumentException.class, () -> chatService.resume("g404"));
+    }
+
+    /** goal 仍在执行中（RUNNING）→ ResumeConflictException（映射 409，防同一检查点双跑） */
+    @Test
+    void resume_runningGoal_throwsConflict() {
+        Goal running = new Goal("g-run", "复杂任务", "s1");
+        running.markRunning();
+        when(goalService.get("g-run")).thenReturn(Optional.of(running));
+
+        assertThrows(ResumeConflictException.class, () -> chatService.resume("g-run"));
+        verify(agentService, never()).resumeStreamReactive(any());
+    }
+
+    /** 正常续跑：复用 goal 对象路由 multi-agent，SSE 输出带 goal 的 sessionId 与 goalId */
+    @Test
+    void resume_success_delegatesToAgentServiceWithSameGoal() {
+        Goal goal = new Goal("g-ok", "复杂任务", "s9");
+        goal.succeed("旧结果");  // 非 RUNNING（如上次断开已被置 FAILED / SUCCEEDED）
+        when(goalService.get("g-ok")).thenReturn(Optional.of(goal));
+        when(agentService.resumeStreamReactive(goal)).thenReturn(Flux.just("续跑答案"));
+
+        List<String> lines = chatService.resume("g-ok").collectList().block();
+
+        assertNotNull(lines);
+        // 复用同一 goal 实例（threadId=goalId 的检查点归属）
+        verify(agentService).resumeStreamReactive(goal);
+        assertTrue(lines.contains("event: token\ndata: 续跑答案"), "续跑内容应按 token 事件输出");
+        String meta = lines.stream()
+                .filter(l -> l.startsWith("event: meta"))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("续跑流应以 meta 收尾"));
+        assertTrue(meta.contains("\"sessionId\":\"s9\""), "meta 应带 goal 的会话ID");
+        assertTrue(meta.contains("\"goalId\":\"g-ok\""), "meta 应带 goalId（CLI 供 /resume 复用）");
+        assertTrue(meta.contains("\"status\":\"SUCCEEDED\""));
+        // 成功后写回会话记忆（user=objective + assistant=续跑完整回复，共 2 条）
+        verify(sessionService, times(2)).saveContext(eq("s9"), any());
     }
 }

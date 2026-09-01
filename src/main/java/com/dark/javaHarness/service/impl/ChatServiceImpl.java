@@ -9,8 +9,10 @@ import com.dark.javaHarness.domain.dto.SseMeta;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.enums.SseProtocol;
+import com.dark.javaHarness.exception.ResumeConflictException;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
+import com.dark.javaHarness.service.GoalService;
 import com.dark.javaHarness.service.RouteJudge;
 import com.dark.javaHarness.service.SessionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,11 +42,14 @@ public class ChatServiceImpl implements ChatService {
     private final AgentService agentService;
     private final SessionService sessionService;
     private final RouteJudge routeJudge;
+    private final GoalService goalService;
 
-    public ChatServiceImpl(AgentService agentService, SessionService sessionService, RouteJudge routeJudge) {
+    public ChatServiceImpl(AgentService agentService, SessionService sessionService,
+                           RouteJudge routeJudge, GoalService goalService) {
         this.agentService = agentService;
         this.sessionService = sessionService;
         this.routeJudge = routeJudge;
+        this.goalService = goalService;
     }
 
     private static final Logger log = LoggerFactory.getLogger(ChatServiceImpl.class);
@@ -109,27 +114,53 @@ public class ChatServiceImpl implements ChatService {
             Flux<String> agentTokens = (request.agentId() != null)
                     ? agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())
                     : agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid());
-            // doOnNext 收集完整回复，流正常结束后由 doOnComplete 统一写回会话记忆（保持多轮记忆语义）
-            // 其中「进度行」（以 ProgressLine.MARK 开头，多 Agent 编排的阶段反馈）不计入会话摘要
-            StringBuilder full = new StringBuilder();
-            Flux<String> body = agentTokens
-                    .doOnNext(row -> { if (!ProgressLine.isProgress(row)) { full.append(row); } })
-                    .flatMap(ChatServiceImpl::toSseRows)
-                    .concatWithValues("event: " + SseProtocol.EVENT_TOKEN
-                            + "\ndata: " + SseProtocol.DONE_MARKER)
-                    .concatWith(metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.SUCCEEDED.name(), null))
-                    .doOnComplete(() -> writeBackContext(ctx.sid(), request.message(), full.toString()))
-                    // 客户端断开（Tomcat 报 AsyncRequestNotUsableException/Connection reset）：
-                    // 框架层 ERROR 堆栈由 ClientAbortLogFilter 降噪，此处统一记可观测 warn 单行
-                    .doOnCancel(() -> log.warn("[stream] 客户端断开，取消推送与编排：sid={}", ctx.sid()))
-                    .onErrorResume(ex -> {
-                        String err = safeMessage(ex);
-                        return Flux.concat(
-                                Flux.just("event: " + SseProtocol.EVENT_ERROR + "\ndata: " + err),
-                                metaEvent(ctx.sid(), ctx.newSession(), GoalStatus.FAILED.name(), err));
-                    });
-            return body;
+            return toSseBody(agentTokens, ctx.sid(), ctx.newSession(), request.message(), null);
         });
+    }
+
+    /** 复杂编排断点续跑：校验 goal 状态后走 multi-agent 检查点续跑（SSE 输出同 streamReactive）。 */
+    @Override
+    public Flux<String> resume(String goalId) {
+        if (goalId == null || goalId.isBlank()) {
+            throw new IllegalArgumentException("goalId 不能为空");
+        }
+        Goal goal = goalService.get(goalId)
+                .orElseThrow(() -> new IllegalArgumentException("目标不存在: " + goalId));
+        if (goal.status() == GoalStatus.RUNNING) {
+            throw new ResumeConflictException("该目标仍在执行中，无法续跑: " + goalId);
+        }
+        log.info("[resume] goal '{}' 续跑请求（原状态={}）", goal.id(), goal.status());
+        return toSseBody(agentService.resumeStreamReactive(goal), goal.sessionId(), false,
+                goal.objective(), goal.id());
+    }
+
+    /**
+     * SSE 包装公共体（stream 与 resume 共用）：进度/内容行转 SSE 事件 + [DONE] + meta 收尾，
+     * 成功后写回会话记忆（user=本次消息 objective，assistant=完整回复），出错发 error 事件。
+     *
+     * @param goalId     meta 事件携带的目标 ID（resume 场景传 goal.id()；全新 stream 时 null）
+     */
+    private Flux<String> toSseBody(Flux<String> agentTokens, String sessionId, boolean newSession,
+                                   String userMessage, String goalId) {
+        // doOnNext 收集完整回复，流正常结束后由 doOnComplete 统一写回会话记忆（保持多轮记忆语义）
+        // 其中「进度行」（以 ProgressLine.MARK 开头，多 Agent 编排的阶段反馈）不计入会话摘要
+        StringBuilder full = new StringBuilder();
+        return agentTokens
+                .doOnNext(row -> { if (!ProgressLine.isProgress(row)) { full.append(row); } })
+                .flatMap(ChatServiceImpl::toSseRows)
+                .concatWithValues("event: " + SseProtocol.EVENT_TOKEN
+                        + "\ndata: " + SseProtocol.DONE_MARKER)
+                .concatWith(metaEvent(sessionId, newSession, goalId, GoalStatus.SUCCEEDED.name(), null))
+                .doOnComplete(() -> writeBackContext(sessionId, userMessage, full.toString()))
+                // 客户端断开（Tomcat 报 AsyncRequestNotUsableException/Connection reset）：
+                // 框架层 ERROR 堆栈由 ClientAbortLogFilter 降噪，此处统一记可观测 warn 单行
+                .doOnCancel(() -> log.warn("[stream] 客户端断开，取消推送与编排：sid={}", sessionId))
+                .onErrorResume(ex -> {
+                    String err = safeMessage(ex);
+                    return Flux.concat(
+                            Flux.just("event: " + SseProtocol.EVENT_ERROR + "\ndata: " + err),
+                            metaEvent(sessionId, newSession, goalId, GoalStatus.FAILED.name(), err));
+                });
     }
 
     /**
@@ -166,8 +197,8 @@ public class ChatServiceImpl implements ChatService {
     }
 
     /** 组装 SSE meta 事件单元素块（event+data 同元素，保证成对不被交叉）：{@code event: meta\n data: {json}} */
-    private Flux<String> metaEvent(String sessionId, boolean newSession, String status, String error) {
-        SseMeta meta = new SseMeta(sessionId, newSession, null, status, error);
+    private Flux<String> metaEvent(String sessionId, boolean newSession, String goalId, String status, String error) {
+        SseMeta meta = new SseMeta(sessionId, newSession, goalId, status, error);
         try {
             return Flux.just("event: " + SseProtocol.EVENT_META + "\ndata: " + OBJECT_MAPPER.writeValueAsString(meta));
         } catch (Exception e) {

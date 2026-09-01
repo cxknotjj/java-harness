@@ -77,6 +77,27 @@ public class ChatApiClient {
                 .url(baseUrl + "/api/chat/stream")
                 .post(RequestBody.create(json, JSON))
                 .build();
+        return readSse(request, onToken, onProgress);
+    }
+
+    /**
+     * 调用 POST /api/chat/resume?goalId=... 断点续跑（SSE）：从上次编排检查点继续，
+     * SSE 解析与 {@link #chatStream} 完全一致（token/progress/meta）。
+     *
+     * @throws IOException 网络错误、非 2xx 响应（含 409 执行中/400 不存在），或服务端 error 事件
+     */
+    public ChatResponse resumeStream(String goalId, Consumer<String> onToken, Consumer<String> onProgress)
+            throws IOException {
+        Request request = new Request.Builder()
+                .url(baseUrl + "/api/chat/resume?goalId=" + goalId)
+                .post(RequestBody.create(new byte[0], null))
+                .build();
+        return readSse(request, onToken, onProgress);
+    }
+
+    /** SSE 流式响应读取公共体（chatStream/resumeStream 共用）：逐行解析 event/data，流末返回 meta。 */
+    private ChatResponse readSse(Request request, Consumer<String> onToken, Consumer<String> onProgress)
+            throws IOException {
         try (Response resp = http.newCall(request).execute()) {
             if (!resp.isSuccessful()) {
                 throw new IOException("HTTP " + resp.code() + ": " + resp.body().string());

@@ -34,6 +34,13 @@ public interface AgentService {
      */
     Flux<String> executeStreamReactiveByAgentId(Long agentId, String objective, String sessionId);
 
+    /**
+     * 复杂编排断点续跑：复用既有 goal（id 即检查点 threadId），从上次检查点继续执行。
+     * 固定路由到 multi-agent；goal 状态先置回 RUNNING，成功/失败/断连照常回写。
+     * 输出语义与 {@link #executeStreamReactive} 完全一致。
+     */
+    Flux<String> resumeStreamReactive(Goal goal);
+
     Set<String> agentNames();
 
     /**

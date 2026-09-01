@@ -1,5 +1,8 @@
 package com.dark.javaHarness.config.agent;
 
+import com.alibaba.cloud.ai.graph.checkpoint.BaseCheckpointSaver;
+import com.alibaba.cloud.ai.graph.checkpoint.savers.mysql.CreateOption;
+import com.alibaba.cloud.ai.graph.checkpoint.savers.mysql.MysqlSaver;
 import com.dark.javaHarness.agent.GeneralAssistantAgent;
 import com.dark.javaHarness.agent.MultiAgentGraphAgent;
 import com.dark.javaHarness.enums.AgentConstants;
@@ -7,6 +10,7 @@ import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
+import javax.sql.DataSource;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
@@ -45,13 +49,28 @@ public class ChatAgentConfig {
                 toolAssignments, recorder);
     }
 
-    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合）。 */
+    /**
+     * 复杂路径检查点存储器：graph-core MysqlSaver，落库到 harness 库的
+     * GRAPH_THREAD / GRAPH_CHECKPOINT 两表（首次自动建表，CREATE_IF_NOT_EXISTS，
+     * 与 Flyway 管理的表互不冲突）。threadId=goalId，每个 superstep 落一条，
+     * 供长编排断开/失败后断点续跑。
+     */
+    @Bean
+    public BaseCheckpointSaver graphCheckpointSaver(DataSource dataSource) {
+        return MysqlSaver.builder()
+                .dataSource(dataSource)
+                .createOption(CreateOption.CREATE_IF_NOT_EXISTS)
+                .build();
+    }
+
+    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合），带 MySQL 检查点。 */
     @Bean
     public MultiAgentGraphAgent multiAgent(ChatClientRegistry registry,
                                            @Lazy AgentService agentService,
                                            ToolAssignments toolAssignments,
-                                           LlmCallRecorder recorder) {
+                                           LlmCallRecorder recorder,
+                                           BaseCheckpointSaver graphCheckpointSaver) {
         return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService,
-                toolAssignments, recorder);
+                toolAssignments, recorder, graphCheckpointSaver);
     }
 }

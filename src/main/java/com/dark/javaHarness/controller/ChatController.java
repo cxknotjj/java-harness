@@ -8,6 +8,7 @@ import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Flux;
 
@@ -48,5 +49,15 @@ public class ChatController {
     @PostMapping(value = "/stream", produces = MediaType.TEXT_PLAIN_VALUE)
     public Flux<String> stream(@Valid @RequestBody ChatRequest request) {
         return chatService.streamReactive(request).map(s -> s + "\n");
+    }
+
+    /**
+     * 复杂编排断点续跑：按 goalId 从上次检查点继续执行 multi-agent 编排。
+     * POST /api/chat/resume?goalId=&lt;id&gt;  响应格式与 /api/chat/stream 一致。
+     * goal 不存在返回 400；仍在执行中返回 409；无检查点时流内发 error 事件。
+     */
+    @PostMapping(value = "/resume", produces = MediaType.TEXT_PLAIN_VALUE)
+    public Flux<String> resume(@RequestParam("goalId") String goalId) {
+        return chatService.resume(goalId).map(s -> s + "\n");
     }
 }

@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.io.PrintStream;
 import java.net.ConnectException;
 import java.nio.charset.StandardCharsets;
+import java.util.function.Consumer;
 
 /**
  * 命令行聊天客户端：独立进程运行，通过 REST 调用主服务（8080）的 /api/chat/stream（SSE 流式）。
@@ -114,6 +115,8 @@ public class ChatCli {
             handleNewSession();
         } else if (line.startsWith("/agent")) {
             handleAgentCommand(line);
+        } else if (line.startsWith("/resume")) {
+            handleResumeCommand(line);
         } else {
             send(line);
         }
@@ -211,7 +214,7 @@ public class ChatCli {
                 if (!word.startsWith("/")) {
                     return;
                 }
-                for (String cmd : new String[]{"/help", "/new", "/agent", "/exit", "/quit"}) {
+                for (String cmd : new String[]{"/help", "/new", "/agent", "/resume", "/exit", "/quit"}) {
                     if (cmd.startsWith(word)) {
                         candidates.add(new org.jline.reader.Candidate(cmd));
                     }
@@ -326,6 +329,7 @@ public class ChatCli {
         ui.println("  " + c + "/agent <id>" + r + "  切换到指定 Agent（agent 表主键，此后不走分流）");
         ui.println("  " + c + "/agent off" + r + "   取消指定，恢复服务端自动分流");
         ui.println("  " + c + "/agent" + r + "       查看当前 Agent");
+        ui.println("  " + c + "/resume <goalId>" + r + "  断点续跑：从中断处继续未完成的复杂编排任务");
         ui.println("  " + c + "/exit" + r + "        退出");
     }
 
@@ -376,13 +380,36 @@ public class ChatCli {
         }
     }
 
-    /** 发送一条消息到主服务 /api/chat/stream（SSE 流式）。
-     *  展示全部委托给 TerminalRenderer：进度 spinner 原位刷新、token 流式 Markdown、回合小结。 */
+    /** 发送一条消息到主服务 /api/chat/stream（SSE 流式）。展示逻辑见 {@link #runTurn}。 */
     private void send(String message) {
+        runTurn((onToken, onProgress) -> api.chatStream(message, sessionId, agentId, onToken, onProgress));
+    }
+
+    /** 处理 /resume 命令：断点续跑指定 goal 的未完成复杂编排 */
+    private void handleResumeCommand(String line) {
+        String arg = line.substring("/resume".length()).trim();
+        if (arg.isEmpty()) {
+            ui.println("用法: /resume <goalId>（goalId 见每回合末尾的会话信息）");
+            return;
+        }
+        ui.println("\033[90m正在从检查点续跑 goal " + arg + "（已完成节点不再重跑）…\033[0m");
+        runTurn((onToken, onProgress) -> api.resumeStream(arg, onToken, onProgress));
+    }
+
+    /** SSE 流式调用函数签名：一次调用产出完整回合（token/progress 回调 + 返回 meta） */
+    @FunctionalInterface
+    private interface SseCall {
+        ChatResponse invoke(Consumer<String> onToken, Consumer<String> onProgress) throws IOException;
+    }
+
+    /**
+     * 跑一个完整回合（send 与 /resume 共用）：进度 spinner 原位刷新、token 流式 Markdown、
+     * 回合小结；记住服务端返回的会话ID延续多轮上下文。
+     */
+    private void runTurn(SseCall call) {
         renderer.beginTurn();
         try {
-            ChatResponse resp = api.chatStream(message, sessionId, agentId,
-                    renderer::onToken,
+            ChatResponse resp = call.invoke(renderer::onToken,
                     data -> {
                         String stage = "";
                         String detail = data;

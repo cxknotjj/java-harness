@@ -153,4 +153,24 @@ class AgentServiceImplTest {
         assertEquals("客户端断开，编排已取消", goal.summary());
         org.mockito.Mockito.verify(goalService, org.mockito.Mockito.times(2)).update(goal);
     }
+
+    /* ---------------- resumeStreamReactive（断点续跑） ---------------- */
+
+    /** 续跑固定路由到 multi-agent，复用传入 goal（不新建），生命周期照常回写 SUCCEEDED */
+    @Test
+    void resumeStreamReactive_routesToMultiAgentAndReusesGoal() {
+        agentService = new AgentServiceImpl(goalService, agentConfigProvider,
+                List.of(recordingAgent("multi-agent")));
+
+        Goal goal = new Goal("goal-resume", "复杂任务", "s1");
+        java.util.List<String> tokens = agentService.resumeStreamReactive(goal).collectList().block();
+
+        assertEquals(java.util.List.of("ok-multi-agent"), tokens);
+        assertEquals("multi-agent", routedTo.get(), "续跑应固定路由 multi-agent");
+        assertEquals(GoalStatus.SUCCEEDED, goal.status(), "续跑成功后 goal 应标记 SUCCEEDED");
+        // 复用传入 goal：不新建 goal（仅 markRunning + 完成共 2 次 update）
+        org.mockito.Mockito.verify(goalService, org.mockito.Mockito.never())
+                .create(any(), any());
+        org.mockito.Mockito.verify(goalService, org.mockito.Mockito.times(2)).update(goal);
+    }
 }

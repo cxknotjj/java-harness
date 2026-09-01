@@ -19,4 +19,11 @@ public interface ChatService {
      * 出错时产出 error 事件后终止。DB 操作隔离在 boundedElastic 上执行。
      */
     Flux<String> streamReactive(ChatRequest request);
+
+    /**
+     * 复杂编排断点续跑：按 goalId 复用既有 goal，从上次检查点继续执行（multi-agent）。
+     * goal 不存在抛 400（IllegalArgumentException）；仍在 RUNNING 抛 409
+     * （{@code ResumeConflictException}，防双跑）。SSE 输出语义同 {@link #streamReactive}。
+     */
+    Flux<String> resume(String goalId);
 }

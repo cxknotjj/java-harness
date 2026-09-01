@@ -70,6 +70,13 @@ public class GlobalExceptionHandler {
         return ErrorResponse.of(HttpStatus.NOT_FOUND.value(), "资源不存在");
     }
 
+    /** 409：续跑冲突（goal 仍在执行中，防同一检查点被双跑） */
+    @ExceptionHandler(ResumeConflictException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ErrorResponse handleResumeConflict(ResumeConflictException e) {
+        return ErrorResponse.of(HttpStatus.CONFLICT.value(), e.getMessage());
+    }
+
     /** 客户端断连（SSE/异步流式场景的预期事件）：warn 单行可观测，不刷 ERROR 堆栈 */
     @ExceptionHandler(AsyncRequestNotUsableException.class)
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
