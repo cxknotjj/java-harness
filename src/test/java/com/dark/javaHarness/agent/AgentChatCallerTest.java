@@ -49,8 +49,8 @@ class AgentChatCallerTest {
         caller = new AgentChatCaller(clientRegistry, agentService, null);
         // lenient：invokeOnce_disableTools 用例直接调 invokeAndRecord，不查表
         org.mockito.Mockito.lenient().when(agentService.getAgentConfig("researcher"))
-                .thenReturn(Optional.of(new AgentConfig("m1", "系统提示词")));
-        when(clientRegistry.get("m1")).thenReturn(client);
+                .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词")));
+        when(clientRegistry.get(1L)).thenReturn(client);
         when(client.prompt()).thenReturn(spec);
         when(spec.system(anyString())).thenReturn(spec);
         when(spec.user(anyString())).thenReturn(spec);
@@ -100,7 +100,7 @@ class AgentChatCallerTest {
         when(callSpec.chatResponse()).thenReturn(ok);
 
         String out = caller.invokeAndRecord(
-                new AgentConfig("m1", "系统提示词"), "s1", "researcher",
+                new AgentConfig(1L, "m1", "系统提示词"), "s1", "researcher",
                 "兜底提示", "任务内容", null, true, "m1", System.currentTimeMillis());
 
         assertEquals("ok", out);

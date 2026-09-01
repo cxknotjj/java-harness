@@ -43,7 +43,7 @@ public class ChatClientFactory {
         String placeholder = "dummy-key-for-startup";
         if (placeholder.equals(env.getProperty("spring.ai.openai.api-key"))) {
             log.warn("检测到使用占位 API Key（'{}'）。真实调用大模型前，" +
-                    "请通过环境变量 QWEN_API 配置真实密钥。", placeholder);
+                    "请通过环境变量 QWEN_API_KEY 配置真实密钥。", placeholder);
         }
     }
 

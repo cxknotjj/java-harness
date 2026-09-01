@@ -77,7 +77,7 @@ private final ChatClientRegistry clientRegistry;
 
     /** 单次 LLM 路由调用（不包含解析，可被重试）；返回模型原始输出文本 */
     private String doCall(String message) {
-        ChatClient client = clientRegistry.get(ROUTE_MODEL);
+        ChatClient client = clientRegistry.getByModel(ROUTE_MODEL);
         // 请求级显式携带 model：ChatClientFactory 的 defaultOptions 不含模型名，
         // 缺失时 DashScope 返回 400「you must provide a model parameter」（与
         // AgentChatCaller/GeneralAssistantAgent 同款约定）

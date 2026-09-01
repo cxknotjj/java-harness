@@ -72,7 +72,9 @@ public class ChatCli {
      */
     private Long agentId = null;
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    // 未知字段宽容：与服务端版本错开时（DTO 新增字段）仍可解析
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .disable(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
     /** 编排类进度 stage 集合：回合内出现任一即视为复杂编排回合（供 /resume 无参续跑判定）。
      *  goal = 编排流首下发的 goalId 事件（编排路径专属，出现即记录续跑目标） */
@@ -450,13 +452,14 @@ public class ChatCli {
                     ui.println("暂无模型映射（model_provider 表为空）");
                     return;
                 }
-                ui.println("模型-服务商映射（共 " + rows.size() + " 行）：");
+                ui.println("部署模型映射（id | 模型 → 供应商 | 端点，共 " + rows.size() + " 行）：");
                 for (ProviderRowView r : rows) {
                     String flag = r.status() != null && r.status() == 1
                             ? "\033[32m✓\033[0m" : "\033[31m✗\033[0m";
-                    ui.println("  " + flag + " " + r.model() + "  →  " + r.provider()
+                    ui.println("  " + flag + " [" + r.id() + "] " + r.model() + "  →  " + r.provider()
                             + "  \033[90m" + r.apiUrl() + "\033[0m");
                 }
+                ui.println("\033[90m提示：不同供应商可有同名模型（各自成行）；agent 按 id 绑定端点\033[0m");
             } catch (IOException e) {
                 ui.println("获取映射失败: " + e.getMessage());
             }

@@ -39,9 +39,9 @@ class LlmRouteJudgeTest {
 
     private LlmRouteJudge judge;
 
-    /** 组装：registry.get(route-judge) 返回 mock client，prompt 链式 stub 到 chatResponse() */
+    /** 组装：registry.getByModel(route-judge 模型名) 返回 mock client，prompt 链式 stub 到 chatResponse() */
     private void stubContent(String content) {
-        when(clientRegistry.get(anyString())).thenReturn(chatClient);
+        when(clientRegistry.getByModel(anyString())).thenReturn(chatClient);
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
@@ -79,7 +79,7 @@ class LlmRouteJudgeTest {
 
     @Test
     void judge_whenCallThrows_shouldFallbackSimple() {
-        when(clientRegistry.get(anyString())).thenReturn(chatClient);
+        when(clientRegistry.getByModel(anyString())).thenReturn(chatClient);
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);

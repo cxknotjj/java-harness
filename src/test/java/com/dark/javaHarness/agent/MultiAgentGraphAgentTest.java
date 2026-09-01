@@ -254,27 +254,27 @@ class MultiAgentGraphAgentTest {
         String leadJson = "{\"subtasks\":[{\"desc\":\"调研竞品\",\"agent\":\"researcher\"},"
                 + "{\"desc\":\"统计销量\",\"agent\":\"analyst\"}]}";
         stubChat(leadJson); // 默认客户端：lead + 聚合（get(any()) 兜底）
-        // 专家行有配置 → 子任务按专家 model 取对应客户端
+        // 专家行有配置 → 子任务按专家部署模型 id 取对应客户端
         when(agentService.getAgentConfig(eq("researcher")))
-                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig("qwen-plus", "调研提示词")));
+                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig(101L, "qwen-plus", "调研提示词")));
         when(agentService.getAgentConfig(eq("analyst")))
-                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig("deepseek-chat", "分析提示词")));
+                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig(102L, "deepseek-chat", "分析提示词")));
         // 先建好独立 stub 的专家客户端，再注册（避免在 when() 求值内嵌套 stubbing）
         ChatClient researcherClient = newStubbedClient("调研结果");
         ChatClient analystClient = newStubbedClient("分析结果");
-        when(clientRegistry.get(eq("qwen-plus"))).thenReturn(researcherClient);
-        when(clientRegistry.get(eq("deepseek-chat"))).thenReturn(analystClient);
+        when(clientRegistry.get(eq(101L))).thenReturn(researcherClient);
+        when(clientRegistry.get(eq(102L))).thenReturn(analystClient);
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         String reply = agent.execute(new Goal("g5", "调研竞品并统计销量"));
 
         assertNotNull(reply);
         assertFalse(reply.isBlank(), "专家派遣后仍应产出聚合最终回答");
-        // 子任务按指派查询专家配置并取对应模型客户端
+        // 子任务按指派查询专家配置并取对应部署模型的客户端
         verify(agentService).getAgentConfig("researcher");
         verify(agentService).getAgentConfig("analyst");
-        verify(clientRegistry).get("qwen-plus");
-        verify(clientRegistry).get("deepseek-chat");
+        verify(clientRegistry).get(101L);
+        verify(clientRegistry).get(102L);
     }
 
     /** lead 指派了白名单外的专家名 → 拒绝按非法名查配置/取客户端，回退默认执行 */
@@ -287,9 +287,9 @@ class MultiAgentGraphAgentTest {
         String reply = agent.execute(new Goal("g6", "任务X"));
 
         assertNotNull(reply);
-        // 白名单拒绝：绝不以非法名查配置、取客户端
+        // 白名单拒绝：绝不以非法名查配置；客户端只允许走默认兜底（get(null)），不得按 id 取
         verify(agentService, never()).getAgentConfig("hacker");
-        verify(clientRegistry, never()).get("hacker");
+        verify(clientRegistry, never()).get(any(Long.class));
     }
 
     /** agent 表无任何配置（含 null model）→ 走默认客户端，model 参数不应被设置 */

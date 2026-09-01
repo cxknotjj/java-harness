@@ -3,6 +3,7 @@ package com.dark.javaHarness.agent;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.LlmCallLog;
+import com.dark.javaHarness.exception.ModelQuotaException;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
@@ -89,6 +90,11 @@ final class AgentChatCaller {
                 return invokeAndRecord(config, sessionId, forAgent, fallbackSystem, user,
                         toolEmitter, false, model, start);
             } catch (RuntimeException e) {
+                // 账户级硬错误（余额不足/配额耗尽）：重试无意义，立即转人话异常向上传播
+                if (ModelQuotaException.matches(e)) {
+                    recordError(sessionId, forAgent, model, false, start, e);
+                    throw ModelQuotaException.from(e, model);
+                }
                 // 模型可能把提示词里的专家名（researcher 等）误当工具发起调用——
                 // 工具列表里没有该名字，Spring AI 执行时抛「No ToolCallback found」。
                 // 此时去掉工具列表重试一次：模型纯文本作答仍可产出结果，不炸整个编排。
@@ -170,6 +176,10 @@ final class AgentChatCaller {
                         .blockLast();
             } catch (RuntimeException e) {
                 recordError(sessionId, forAgent, model, true, start, e);
+                // 账户级硬错误：与阻塞（call）路径同口径转换，不重试直接抛人话异常
+                if (ModelQuotaException.matches(e)) {
+                    throw ModelQuotaException.from(e, model);
+                }
                 boolean partialOutput = collected.length() > 0;
                 boolean canRetry = !partialOutput && LlmRetry.isRetryable(e) && attempt < retry.maxAttempts();
                 if (canRetry) {
@@ -192,8 +202,10 @@ final class AgentChatCaller {
     private ChatClient.ChatClientRequestSpec buildSpec(AgentConfig config, String forAgent, String fallbackSystem,
                                                        String user, Consumer<String> toolEmitter,
                                                        boolean disableTools) {
+        // Registry 模式：凭部署模型 id 取对应厂商的 ChatClient（未绑定/未命中回退默认 DashScope）
+        Long modelProviderId = config != null ? config.modelProviderId() : null;
         String model = config != null ? config.model() : null;
-        ChatClient client = clientRegistry.get(model);
+        ChatClient client = clientRegistry.get(modelProviderId);
         boolean hasTablePrompt = config != null && config.prompt() != null && !config.prompt().isBlank();
         String sysText = hasTablePrompt ? config.prompt() : DEFAULT_SYSTEM_PROMPT;
         String userText = hasTablePrompt ? user : fallbackSystem + "\n" + user;

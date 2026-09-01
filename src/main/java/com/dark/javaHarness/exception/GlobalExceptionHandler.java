@@ -77,6 +77,22 @@ public class GlobalExceptionHandler {
         return ErrorResponse.of(HttpStatus.CONFLICT.value(), e.getMessage());
     }
 
+    /** 502：模型供应商账户级硬错误（余额不足/配额耗尽）——上游故障透传，message 已是人话提示 */
+    @ExceptionHandler(ModelQuotaException.class)
+    @ResponseStatus(HttpStatus.BAD_GATEWAY)
+    public ErrorResponse handleModelQuota(ModelQuotaException e) {
+        log.warn("[quota] 模型供应商账户错误：{}", e.getMessage());
+        return ErrorResponse.of(HttpStatus.BAD_GATEWAY.value(), e.getMessage());
+    }
+
+    /** 409：唯一键冲突（如 model_provider.model 大小写不敏感撞键，并发 add 场景兜底） */
+    @ExceptionHandler(org.springframework.dao.DuplicateKeyException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ErrorResponse handleDuplicateKey(org.springframework.dao.DuplicateKeyException e) {
+        log.warn("[duplicate] 唯一键冲突：{}", e.getMessage());
+        return ErrorResponse.of(HttpStatus.CONFLICT.value(), "记录已存在（模型名大小写不敏感），请勿重复添加");
+    }
+
     /** 客户端断连（SSE/异步流式场景的预期事件）：warn 单行可观测，不刷 ERROR 堆栈 */
     @ExceptionHandler(AsyncRequestNotUsableException.class)
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)

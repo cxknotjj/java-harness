@@ -47,20 +47,26 @@ public class ProviderAdminServiceImpl implements ProviderAdminService {
         validate(request);
         int status = request.resolvedStatus();
 
-        // 一次查出请求中的已存在模型，避免逐个 select
+        // 一次查出请求涉及的已存在端点，避免逐个 select。
+        // 判定键 = (provider, model) 小写复合（与 uk_provider_model 对齐）：
+        // 跨供应商允许同名模型（腾讯与官方的 deepseek-v4-flash 各自成行），
+        // 同供应商内同名 = 更新既有端点（换 api_url / 重启用）
         Set<String> models = new HashSet<>(request.models());
         Map<String, ModelProviderEntity> existing = mapper.selectList(
                         new LambdaQueryWrapper<ModelProviderEntity>()
                                 .in(ModelProviderEntity::getModel, models)).stream()
-                .collect(Collectors.toMap(ModelProviderEntity::getModel, Function.identity()));
+                .filter(e -> request.provider().equalsIgnoreCase(e.getProvider()))
+                .collect(Collectors.toMap(
+                        e -> key(e.getProvider(), e.getModel()), Function.identity()));
 
         int added = 0;
         int updated = 0;
         for (String model : models) {
-            ModelProviderEntity row = existing.get(model);
+            String normalized = model.trim();
+            ModelProviderEntity row = existing.get(key(request.provider(), normalized));
             if (row == null) {
                 row = new ModelProviderEntity();
-                row.setModel(model);
+                row.setModel(normalized);
                 row.setProvider(request.provider());
                 row.setApiUrl(request.apiUrl());
                 row.setStatus(status);
@@ -81,6 +87,11 @@ public class ProviderAdminServiceImpl implements ProviderAdminService {
         return new ProviderAddResult(added, updated);
     }
 
+    /** 端点判定键：provider + model 统一小写（MySQL ci collation 语义对齐） */
+    private static String key(String provider, String model) {
+        return provider.toLowerCase() + "|" + model.toLowerCase();
+    }
+
     private void validate(ProviderAddRequest request) {
         if (request == null || request.provider() == null || request.provider().isBlank()) {
             throw new IllegalArgumentException("provider 不能为空");
@@ -91,6 +102,14 @@ public class ProviderAdminServiceImpl implements ProviderAdminService {
         if (request.models() == null || request.models().isEmpty()
                 || request.models().stream().anyMatch(m -> m == null || m.isBlank())) {
             throw new IllegalArgumentException("models 不能为空且不能含空项");
+        }
+        // 模型名防呆：只允许字母/数字/点/下划线/连字符——方括号、反引号等符号
+        // 多为 CLI 误输入（如 markdown 包裹残留），入库后 agent 永远不会引用
+        for (String m : request.models()) {
+            if (!m.trim().matches("[A-Za-z0-9._-]+")) {
+                throw new IllegalArgumentException(
+                        "模型名 '" + m.trim() + "' 含非法字符（仅允许字母/数字/./_/-）");
+            }
         }
     }
 }

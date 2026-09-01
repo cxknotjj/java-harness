@@ -23,4 +23,15 @@ public interface GoalService {
 
     /** 将 Goal 当前状态持久化（状态变更后调用） */
     void update(Goal goal);
+
+    /**
+     * 将全部 RUNNING 状态的目标批量标记为 FAILED（服务启动时清理僵尸目标）。
+     *
+     * <p>服务非正常退出（强杀进程）时 Reactor 的 cancel/error 回调不会执行，
+     * goal 会永久残留 RUNNING，导致 /resume 被 409 拦截。单实例部署下
+     * 启动时必然没有正在执行的编排，可安全统一清理。
+     *
+     * @return 清理的目标数量
+     */
+    int failAllRunning(String reason);
 }

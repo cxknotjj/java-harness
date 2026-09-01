@@ -16,6 +16,9 @@ import org.springframework.stereotype.Service;
 @Service
 public class GoalServiceImpl implements GoalService {
 
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(GoalServiceImpl.class);
+
     private final GoalMapper goalMapper;
 
     public GoalServiceImpl(GoalMapper goalMapper) {
@@ -53,6 +56,26 @@ public class GoalServiceImpl implements GoalService {
     @Override
     public void update(Goal goal) {
         goalMapper.updateById(toEntity(goal));
+    }
+
+    /** 启动时清理僵尸 RUNNING 目标：服务非正常退出（强杀）时 cancel/error 回调不执行，状态残留会拦住 /resume */
+    @jakarta.annotation.PostConstruct
+    void cleanStaleRunningGoalsOnStartup() {
+        int cleaned = failAllRunning("服务重启，执行中断");
+        if (cleaned > 0) {
+            log.warn("[goal] 启动清理僵尸 RUNNING 目标 {} 个（上次服务非正常退出）", cleaned);
+        }
+    }
+
+    /** 将全部 RUNNING 目标批量标记为 FAILED（单实例部署下启动时执行，安全） */
+    @Override
+    public int failAllRunning(String reason) {
+        return goalMapper.update(null,
+                com.baomidou.mybatisplus.core.toolkit.Wrappers.<GoalEntity>lambdaUpdate()
+                        .eq(GoalEntity::getStatus, GoalStatus.RUNNING.name())
+                        .set(GoalEntity::getStatus, GoalStatus.FAILED.name())
+                        .set(GoalEntity::getSummary, reason)
+                        .set(GoalEntity::getFinishedAt, java.time.LocalDateTime.now()));
     }
 
     private GoalEntity toEntity(Goal g) {

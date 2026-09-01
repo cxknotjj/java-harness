@@ -126,7 +126,7 @@ curl -s -X POST http://localhost:8080/api/chat \
 
 ```powershell
 # Windows PowerShell
-$env:QWEN_API = "sk-你的key"        # DashScope（通义千问）
+$env:QWEN_API_KEY = "sk-你的key"     # DashScope（通义千问）
 $env:DEEPSEEK_API_KEY = "sk-你的key" # DeepSeek
 ```
 
@@ -244,7 +244,7 @@ flowchart LR
 > [!WARNING]
 > API Key 出于安全不落库，解析规则（约定优于配置）：
 > 1. `app.providers.<provider>.api-key`（yaml 显式映射，优先）
-> 2. `<PROVIDER大写>_API_KEY` 环境变量（约定式回退，如 `dashscope` → `QWEN_API` 映射、`deepseek` → `DEEPSEEK_API_KEY`）
+> 2. `<PROVIDER大写>_API_KEY` 环境变量（约定式回退，如 `QWEN_API_KEY`、`DEEPSEEK_API_KEY`）
 
 ## 📁 项目结构
 

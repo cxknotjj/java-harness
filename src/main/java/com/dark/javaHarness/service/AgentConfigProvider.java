@@ -3,7 +3,9 @@ package com.dark.javaHarness.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.entity.AgentEntity;
+import com.dark.javaHarness.domain.entity.ModelProviderEntity;
 import com.dark.javaHarness.mapper.AgentMapper;
+import com.dark.javaHarness.mapper.ModelProviderMapper;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,9 +21,11 @@ public class AgentConfigProvider {
     private static final Logger log = LoggerFactory.getLogger(AgentConfigProvider.class);
 
     private final AgentMapper agentMapper;
+    private final ModelProviderMapper modelProviderMapper;
 
-    public AgentConfigProvider(AgentMapper agentMapper) {
+    public AgentConfigProvider(AgentMapper agentMapper, ModelProviderMapper modelProviderMapper) {
         this.agentMapper = agentMapper;
+        this.modelProviderMapper = modelProviderMapper;
     }
 
     /** 按 agentId 从 agent 表查询 agentName（CLI 传入 agentId 时用于路由映射） */
@@ -42,18 +46,20 @@ public class AgentConfigProvider {
         return Optional.empty();
     }
 
-    /** 从 agent 表读取指定 Agent 的运行配置（模型 + 系统提示词） */
+    /** 从 agent 表读取指定 Agent 的运行配置（部署模型 + 系统提示词；模型名经 model_provider 表解析） */
     public Optional<AgentConfig> getAgentConfig(String agentName) {
         try {
             AgentEntity row = agentMapper.selectOne(new LambdaQueryWrapper<AgentEntity>()
                     .eq(AgentEntity::getAgentName, agentName)
                     .last("LIMIT 1"));
             if (row != null) {
+                String modelName = resolveModelName(row.getModelProviderId());
                 AgentConfig cfg = new AgentConfig(
-                        blankToNull(row.getModel()),
+                        row.getModelProviderId(),
+                        modelName,
                         blankToNull(row.getPrompt()));
-                log.info("[agent配置] agentName='{}' -> model={}, prompt={}",
-                        agentName, cfg.model(), cfg.prompt());
+                log.info("[agent配置] agentName='{}' -> modelProviderId={}, model={}, prompt={}",
+                        agentName, cfg.modelProviderId(), cfg.model(), cfg.prompt());
                 return Optional.of(cfg);
             }
             log.warn("[agent配置] agent 表无 agentName='{}' 记录，将使用默认配置", agentName);
@@ -61,6 +67,20 @@ public class AgentConfigProvider {
             log.warn("读取 agent 表配置失败 agent={}", agentName, e);
         }
         return Optional.empty();
+    }
+
+    /** 按 model_provider.id 解析模型名（请求级 model 参数用）；id 空或查不到返回 null（走默认） */
+    private String resolveModelName(Long modelProviderId) {
+        if (modelProviderId == null) {
+            return null;
+        }
+        try {
+            ModelProviderEntity mp = modelProviderMapper.selectById(modelProviderId);
+            return mp == null ? null : mp.getModel();
+        } catch (Exception e) {
+            log.warn("解析 model_provider={} 的模型名失败，将回退默认模型", modelProviderId, e);
+            return null;
+        }
     }
 
     private String blankToNull(String s) {

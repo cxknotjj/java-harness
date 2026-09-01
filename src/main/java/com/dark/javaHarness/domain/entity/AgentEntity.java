@@ -24,8 +24,8 @@ public class AgentEntity {
     /** Agent 描述 */
     private String description;
 
-    /** 绑定的模型名（如 qwen3.7-plus） */
-    private String model;
+    /** 绑定的部署模型（model_provider.id）：精确表达"该 Agent 用哪个端点的哪个模型" */
+    private Long modelProviderId;
 
     /** 系统提示词（System Prompt） */
     private String prompt;

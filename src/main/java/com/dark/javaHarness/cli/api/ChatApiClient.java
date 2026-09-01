@@ -31,7 +31,9 @@ public class ChatApiClient {
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
     private final OkHttpClient http;
-    private final ObjectMapper mapper = new ObjectMapper();
+    // 服务端可能先于 CLI 迭代（DTO 新增字段）：未知字段宽容，保证前后版本错开也能解析
+    private final ObjectMapper mapper = new ObjectMapper()
+            .disable(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
     private final String baseUrl;
 
     public ChatApiClient(String baseUrl) {

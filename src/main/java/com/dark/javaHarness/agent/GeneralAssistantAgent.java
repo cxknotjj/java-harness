@@ -201,12 +201,12 @@ public class GeneralAssistantAgent implements Agent {
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective,
                                                                   Consumer<String> toolEmitter) {
         AgentConfig config = agentService.getAgentConfig(agentName)
-                .orElse(new AgentConfig(null, DEFAULT_SYSTEM_PROMPT));
+                .orElse(new AgentConfig(null, null, DEFAULT_SYSTEM_PROMPT));
         String model = config.model();
-        // Registry 模式：凭 model 字段取对应厂商的 ChatClient（未匹配回退默认 DashScope）
-        ChatClient client = clientRegistry.get(model);
-        log.info("[agent请求] agentName='{}' -> 配置 model='{}'，实际使用 client={}",
-                name(), model, client == null ? "null" : client.getClass().getSimpleName());
+        // Registry 模式：凭部署模型 id 取对应厂商的 ChatClient（未绑定/未命中回退默认 DashScope）
+        ChatClient client = clientRegistry.get(config.modelProviderId());
+        log.info("[agent请求] agentName='{}' -> 配置 modelProviderId={}, model='{}'，实际使用 client={}",
+                name(), config.modelProviderId(), model, client == null ? "null" : client.getClass().getSimpleName());
         ChatClient.ChatClientRequestSpec spec = client.prompt()
                 // 官方记忆 Advisor：从 SessionService(ChatMemory) 按会话ID注入历史
                 .advisors(MessageChatMemoryAdvisor.builder(memoryStore).build())

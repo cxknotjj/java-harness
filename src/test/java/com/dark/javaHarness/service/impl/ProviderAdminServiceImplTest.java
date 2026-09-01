@@ -22,7 +22,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 /**
  * ProviderAdminService 单测：
- * - add：新模型 insert，已存在模型按 model 唯一键 update，随后热刷新注册表
+ * - add：新端点 insert，同供应商内已存在端点 update，随后热刷新注册表
+ * - add：跨供应商同名模型各自成行（uk_provider_model 复合键），不互相挤占
+ * - add：同供应商内大小写不同的模型名按 ci collation 语义命中同一行走 update
  * - add：provider/apiUrl/models 校验失败抛 IllegalArgumentException 且不写库
  * - list：返回全量映射行
  */
@@ -82,6 +84,56 @@ class ProviderAdminServiceImplTest {
         assertEquals(7L, updatedRow.getId());
         assertEquals("https://api.moonshot.cn/v1", updatedRow.getApiUrl());
         assertEquals(1, updatedRow.getStatus());
+        verify(registry).reload();
+    }
+
+    @Test
+    void add_sameModelDifferentProvider_insertsIndependentRow() {
+        // uk_provider_model 复合键：跨供应商允许同名模型（腾讯代理的 Deepseek-v4-flash
+        // 与 DeepSeek 官方的 deepseek-v4-flash 各自成行，互不挤占）
+        ModelProviderEntity existing = new ModelProviderEntity();
+        existing.setId(9L);
+        existing.setModel("deepseek-v4-flash");
+        existing.setProvider("deepseek");
+        existing.setApiUrl("https://api.deepseek.com");
+        existing.setStatus(1);
+        when(mapper.selectList(any())).thenReturn(List.of(existing));
+
+        ProviderAddResult result = service.add(
+                request("tecent", "https://chatapi.weixin.qq.com/openai/v1", List.of("Deepseek-v4-flash")));
+
+        assertEquals(1, result.added(), "跨供应商同名模型应 insert 独立新行");
+        assertEquals(0, result.updated());
+        ArgumentCaptor<ModelProviderEntity> captor = ArgumentCaptor.forClass(ModelProviderEntity.class);
+        verify(mapper).insert(captor.capture());
+        assertEquals("tecent", captor.getValue().getProvider());
+        assertEquals("Deepseek-v4-flash", captor.getValue().getModel());
+        verify(mapper, never()).updateById(any(ModelProviderEntity.class));
+        verify(registry).reload();
+    }
+
+    @Test
+    void add_sameProviderDifferentCase_updatesExistingRow() {
+        // MySQL ci collation：同供应商内 'Deepseek-v4-flash' 必须命中库里
+        // 'deepseek-v4-flash' 行走 update，否则误判 insert 撞唯一键 500
+        ModelProviderEntity existing = new ModelProviderEntity();
+        existing.setId(9L);
+        existing.setModel("deepseek-v4-flash");
+        existing.setProvider("deepseek");
+        existing.setApiUrl("https://api.deepseek.com");
+        existing.setStatus(1);
+        when(mapper.selectList(any())).thenReturn(List.of(existing));
+
+        ProviderAddResult result = service.add(
+                request("deepseek", "https://api.deepseek.com/v2", List.of("Deepseek-v4-flash")));
+
+        assertEquals(0, result.added(), "同供应商大小写不同的同名模型不应 insert");
+        assertEquals(1, result.updated());
+        verify(mapper, never()).insert(any(ModelProviderEntity.class));
+        ArgumentCaptor<ModelProviderEntity> captor = ArgumentCaptor.forClass(ModelProviderEntity.class);
+        verify(mapper).updateById(captor.capture());
+        assertEquals(9L, captor.getValue().getId(), "应更新库中原名（小写）行");
+        assertEquals("https://api.deepseek.com/v2", captor.getValue().getApiUrl());
         verify(registry).reload();
     }
 
