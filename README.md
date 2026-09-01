@@ -233,10 +233,18 @@ flowchart LR
 - 🗺️ **模型映射**（`model_provider` 表）：新增模型/服务商 = 加一行（`status=1`）重启即生效；`status=0` 禁用 → 回退默认 DashScope 客户端
 - 🧭 **路由**：请求携带 `agentId` → 映射 `agentName` 路由；未命中回退默认 `general`
 
+> [!TIP]
+> **新增第三方供应商（如 Moonshot、OpenRouter）零代码**：
+> 1. 设置环境变量 `MOONSHOT_API_KEY`（约定规则：`<PROVIDER大写>_API_KEY`）
+> 2. `model_provider` 表加行：`INSERT INTO model_provider(model, provider, api_url, status) VALUES('kimi-k2','moonshot','https://api.moonshot.cn/v1',1);`
+> 3. 重启生效
+>
+> 也可在 `application.yaml` 的 `app.providers.<provider>.api-key` 显式映射（优先级高于环境变量约定），现有环境变量名保持兼容。
+
 > [!WARNING]
-> API Key 出于安全不落库，按服务商标识从环境变量读取：
-> - `dashscope` → `DASHSCOPE_API_KEY` / `QWEN_API`（映射 `spring.ai.openai.api-key`）
-> - `deepseek` → `DEEPSEEK_API_KEY`（映射 `app.deepseek.api-key`）
+> API Key 出于安全不落库，解析规则（约定优于配置）：
+> 1. `app.providers.<provider>.api-key`（yaml 显式映射，优先）
+> 2. `<PROVIDER大写>_API_KEY` 环境变量（约定式回退，如 `dashscope` → `QWEN_API` 映射、`deepseek` → `DEEPSEEK_API_KEY`）
 
 ## 📁 项目结构
 
@@ -301,7 +309,7 @@ src/main/java/com/dark/javaHarness/
 
 ## 🧪 运行测试
 
-单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**（当前 137 个用例全绿）：
+单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**（当前 143 个用例全绿）：
 
 ```bash
 mvn -s .mvn/settings.xml test
