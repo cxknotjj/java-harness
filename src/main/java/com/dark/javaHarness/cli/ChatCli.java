@@ -48,6 +48,13 @@ public class ChatCli {
     private String sessionId;
 
     /**
+     * 当前会话最近一次复杂编排的 goalId（/resume 无参时的续跑目标）：
+     * 回合内出现过编排进度（编排/拆解/聚合）即视为编排回合，成功后记录其 goalId；
+     * /new 切换会话时清空。普通单模型聊天不记录（无可续跑的检查点）。
+     */
+    private String lastOrchestratedGoalId;
+
+    /**
      * 当前选中的 Agent ID：null 表示交由服务端「主 Agent 前置判断」分流
      * （SIMPLE → general 单模型；COMPLEX → multi-agent 编排并推送进度事件）。
      * 注意：一旦非空（如默认带 1），服务端会绕过 RouteJudge 直接路由，
@@ -57,6 +64,10 @@ public class ChatCli {
     private Long agentId = null;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /** 编排类进度 stage 集合：回合内出现任一即视为复杂编排回合（供 /resume 无参续跑判定） */
+    private static final java.util.Set<String> STAGE_ORCHESTRATION =
+            java.util.Set.of("编排", "拆解", "聚合", "子任务");
 
     /** 默认连本机主服务 8080 */
     public ChatCli() {
@@ -329,7 +340,8 @@ public class ChatCli {
         ui.println("  " + c + "/agent <id>" + r + "  切换到指定 Agent（agent 表主键，此后不走分流）");
         ui.println("  " + c + "/agent off" + r + "   取消指定，恢复服务端自动分流");
         ui.println("  " + c + "/agent" + r + "       查看当前 Agent");
-        ui.println("  " + c + "/resume <goalId>" + r + "  断点续跑：从中断处继续未完成的复杂编排任务");
+        ui.println("  " + c + "/resume" + r + "       断点续跑：恢复当前会话最近一次编排任务（从中断处继续）");
+        ui.println("  " + c + "/resume <goalId>" + r + "  断点续跑指定的 goal（goalId 见每回合末尾的会话信息）");
         ui.println("  " + c + "/exit" + r + "        退出");
     }
 
@@ -353,6 +365,8 @@ public class ChatCli {
         try {
             String newId = api.createSession();
             this.sessionId = newId;
+            // 会话切换后「当前会话的任务」语义随之清空
+            this.lastOrchestratedGoalId = null;
             ui.println("\033[90m已开启新会话 " + newId + "\033[0m");
         } catch (IOException e) {
             ui.println("新建会话失败: " + e.getMessage());
@@ -385,12 +399,18 @@ public class ChatCli {
         runTurn((onToken, onProgress) -> api.chatStream(message, sessionId, agentId, onToken, onProgress));
     }
 
-    /** 处理 /resume 命令：断点续跑指定 goal 的未完成复杂编排 */
+    /**
+     * 处理 /resume 命令：断点续跑未完成的复杂编排。
+     * 带参 = 显式指定 goalId；无参 = 恢复当前会话最近一次编排任务（用户无需记住 goalId）。
+     */
     private void handleResumeCommand(String line) {
         String arg = line.substring("/resume".length()).trim();
         if (arg.isEmpty()) {
-            ui.println("用法: /resume <goalId>（goalId 见每回合末尾的会话信息）");
-            return;
+            if (lastOrchestratedGoalId == null || lastOrchestratedGoalId.isBlank()) {
+                ui.println("当前会话没有可续跑的编排任务（/resume <goalId> 可显式指定）");
+                return;
+            }
+            arg = lastOrchestratedGoalId;
         }
         ui.println("\033[90m正在从检查点续跑 goal " + arg + "（已完成节点不再重跑）…\033[0m");
         runTurn((onToken, onProgress) -> api.resumeStream(arg, onToken, onProgress));
@@ -408,6 +428,9 @@ public class ChatCli {
      */
     private void runTurn(SseCall call) {
         renderer.beginTurn();
+        // 回合内出现过编排进度（编排/拆解/聚合）→ 复杂编排回合，成功后记录 goalId 供 /resume 无参续跑
+        java.util.concurrent.atomic.AtomicBoolean orchestrated =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
         try {
             ChatResponse resp = call.invoke(renderer::onToken,
                     data -> {
@@ -420,6 +443,9 @@ public class ChatCli {
                         } catch (IOException ignored) {
                             // 解析失败则 detail 原样展示，不中断
                         }
+                        if (STAGE_ORCHESTRATION.contains(stage)) {
+                            orchestrated.set(true);
+                        }
                         renderer.onProgress(stage, detail);
                     });
             // 记住服务端返回的会话ID，后续请求携带以延续多轮上下文
@@ -427,6 +453,9 @@ public class ChatCli {
                 this.sessionId = resp.sessionId();
             }
             boolean ok = "SUCCEEDED".equals(resp.status());
+            if (ok && orchestrated.get() && resp.goalId() != null && !resp.goalId().isBlank()) {
+                this.lastOrchestratedGoalId = resp.goalId();
+            }
             renderer.endTurn(ok, ok ? null : resp.goalId() + " " +
                     (resp.error() == null ? "（无详细信息）" : resp.error()));
             if (ok) {

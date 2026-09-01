@@ -165,7 +165,12 @@ final class AgentChatCaller {
                 .user(userText);
         if (model != null && !model.isBlank()) {
             // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
-            spec.options(OpenAiChatOptions.builder().model(model).build());
+            // frequencyPenalty：长报告聚合场景下模型易陷入重复循环（同一段落循环生成多次），
+            // 用频率惩罚抑制；对 lead 的 JSON 输出无副作用
+            spec.options(OpenAiChatOptions.builder()
+                    .model(model)
+                    .frequencyPenalty(0.5)
+                    .build());
         }
         // 专家工具分配：按 agent 名注入请求级工具（与客户端 defaultTools 合并）
         ToolAssignments.ToolSet toolSet = toolAssignments == null
