@@ -95,10 +95,18 @@
             <artifactId>spring-ai-alibaba-graph-core</artifactId>
         </dependency>
 
-        <!-- Spring AI Alibaba：Sandbox 容器级沙箱（agentscope-runtime，Docker 后端；版本由 BOM 管理） -->
+        <!-- Spring AI Alibaba：Sandbox 容器级沙箱（agentscope-runtime，Docker 后端；版本由 BOM 管理）。
+             排除其传递引入的 commons-logging：与 Spring 自带 spring-jcl 冲突，
+             启动时报 "Standard Commons Logging discovery in action" 警告 -->
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-sandbox</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>commons-logging</groupId>
+                    <artifactId>commons-logging</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- Model Context Protocol 客户端：把外部 MCP Server（STDIO / HTTP / SSE）暴露的工具注册为
