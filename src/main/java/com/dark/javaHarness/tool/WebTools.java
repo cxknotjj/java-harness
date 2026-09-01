@@ -16,9 +16,9 @@ import org.springframework.stereotype.Component;
 /**
  * 网页能力工具集（对标 dsh web 工具的抓取侧）。
  *
- * fetchUrl 抓取 URL 并把 HTML 粗提为纯文本（去 script/style/标签），供模型阅读网页内容。
- * 网页搜索（web search）需要搜索服务商 API key，待接入后补充 searchWeb 工具；
- * 原服务端 mock 天气（DemoTools.getWeather）的联网诉求由本工具替代。
+ * fetchUrl 抓取 URL 并把 HTML 粗提为纯文本（去 script/style/标签与导航/广告噪声，
+ * 可按查询意图只保留相关段落），供模型阅读网页内容。
+ * 网页搜索（web search）需要搜索服务商 API key，待接入后补充 searchWeb 工具。
  */
 @Component
 public class WebTools {

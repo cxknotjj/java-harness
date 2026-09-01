@@ -29,9 +29,6 @@ public final class ToolCallBudget {
      * {@link #EXHAUSTED_MESSAGE}（不触发真实工具）。
      */
     public static List<ToolCallback> limit(List<ToolCallback> callbacks, int maxCalls) {
-        if (callbacks == null || callbacks.isEmpty()) {
-            return callbacks;
-        }
         AtomicInteger counter = new AtomicInteger();
         return callbacks.stream()
                 .map(cb -> (ToolCallback) new BudgetedCallback(cb, counter, maxCalls))
@@ -57,7 +54,10 @@ public final class ToolCallBudget {
 
         @Override
         public String call(String toolInput) {
-            return call(toolInput, null);
+            if (counter.incrementAndGet() > maxCalls) {
+                return EXHAUSTED_MESSAGE;
+            }
+            return delegate.call(toolInput);
         }
 
         @Override
@@ -65,7 +65,7 @@ public final class ToolCallBudget {
             if (counter.incrementAndGet() > maxCalls) {
                 return EXHAUSTED_MESSAGE;
             }
-            return toolContext == null ? delegate.call(toolInput) : delegate.call(toolInput, toolContext);
+            return delegate.call(toolInput, toolContext);
         }
     }
 }

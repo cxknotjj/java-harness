@@ -54,12 +54,6 @@ final class AgentChatCaller {
 
     AgentChatCaller(ChatClientRegistry clientRegistry,
                     AgentService agentService,
-                    ToolAssignments toolAssignments) {
-        this(clientRegistry, agentService, toolAssignments, null);
-    }
-
-    AgentChatCaller(ChatClientRegistry clientRegistry,
-                    AgentService agentService,
                     ToolAssignments toolAssignments,
                     LlmCallRecorder recorder) {
         this(clientRegistry, agentService, toolAssignments, recorder, new LlmRetry());
@@ -126,11 +120,8 @@ final class AgentChatCaller {
         org.springframework.ai.chat.model.ChatResponse resp =
                 buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, disableTools)
                         .call().chatResponse();
-        String content = resp == null || resp.getResult() == null
-                || resp.getResult().getOutput() == null
-                ? null : resp.getResult().getOutput().getText();
-        Usage usage = resp == null || resp.getMetadata() == null
-                ? null : resp.getMetadata().getUsage();
+        String content = contentOf(resp);
+        Usage usage = usageOf(resp);
         recordOk(sessionId, forAgent, model, false, usage, start, content);
         return content;
     }
@@ -139,6 +130,17 @@ final class AgentChatCaller {
     private static boolean isUnknownToolCall(RuntimeException e) {
         String msg = e.getMessage();
         return msg != null && msg.contains("No ToolCallback found for tool name");
+    }
+
+    /** 模型空响应防御：逐层取 assistant 文本，任一层缺失返回 null（call/stream 记录与展示共用） */
+    static String contentOf(org.springframework.ai.chat.model.ChatResponse resp) {
+        return resp != null && resp.getResult() != null && resp.getResult().getOutput() != null
+                ? resp.getResult().getOutput().getText() : null;
+    }
+
+    /** 模型空响应防御：逐层取 usage，任一层缺失返回 null */
+    static Usage usageOf(org.springframework.ai.chat.model.ChatResponse resp) {
+        return resp != null && resp.getMetadata() != null ? resp.getMetadata().getUsage() : null;
     }
 
     private static String safeMsg(Exception e) {
@@ -276,8 +278,7 @@ final class AgentChatCaller {
 
     private void recordError(String sessionId, String agentName, String model, boolean stream,
                              long start, Exception e) {
-        String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-        record(sessionId, agentName, model, stream, false, null, null, null, start, msg);
+        record(sessionId, agentName, model, stream, false, null, null, null, start, safeMsg(e));
     }
 
     private void record(String sessionId, String agentName, String model, boolean stream, boolean ok,

@@ -46,7 +46,7 @@ class AgentChatCallerTest {
 
     @BeforeEach
     void setUp() {
-        caller = new AgentChatCaller(clientRegistry, agentService, null);
+        caller = new AgentChatCaller(clientRegistry, agentService, null, null);
         // lenient：invokeOnce_disableTools 用例直接调 invokeAndRecord，不查表
         org.mockito.Mockito.lenient().when(agentService.getAgentConfig("researcher"))
                 .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词")));

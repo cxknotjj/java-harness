@@ -36,7 +36,7 @@ import reactor.core.publisher.SignalType;
  * 无需改动 ChatService。新增厂商只需在 ChatClientRegistry 中 register 即可。
  *
  * 多轮会话记忆基于 session + session_messages 两张表（一对一）。
- * 已注册工具调用：模型可按需调用 DemoTools 中的工具（取时间/计算/查天气）。
+ * 已注册工具调用：模型可按需调用 DemoTools（取时间/计算）与 WebTools（网页抓取）。
  */
 public class GeneralAssistantAgent implements Agent {
 
@@ -86,12 +86,9 @@ public class GeneralAssistantAgent implements Agent {
             try {
                 org.springframework.ai.chat.model.ChatResponse resp =
                         buildChatRequestSpec(goal.sessionId(), goal.objective()).call().chatResponse();
-                String reply = resp == null || resp.getResult() == null
-                        || resp.getResult().getOutput() == null
-                        ? null : resp.getResult().getOutput().getText();
+                String reply = AgentChatCaller.contentOf(resp);
                 recordCall(goal.sessionId(), false, true,
-                        resp == null || resp.getMetadata() == null ? null : resp.getMetadata().getUsage(),
-                        null, start, null);
+                        AgentChatCaller.usageOf(resp), null, start, null);
                 log.info("AI agent '{}' 得到回复: {}", name(), reply);
                 // 会话记忆写回不在此处做，统一由 ChatService 负责（与流式路径保持一致）
                 return reply;

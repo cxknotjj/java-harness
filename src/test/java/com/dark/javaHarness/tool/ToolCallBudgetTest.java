@@ -1,8 +1,6 @@
 package com.dark.javaHarness.tool;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -70,11 +68,5 @@ class ToolCallBudgetTest {
         assertEquals(ToolCallBudget.EXHAUSTED_MESSAGE, fourth, "预算跨工具共享：第 4 次应被拦截");
         assertEquals(2, t1.executions);
         assertEquals(1, t2.executions);
-    }
-
-    @Test
-    void emptyOrNullList_returnedAsIs() {
-        assertTrue(ToolCallBudget.limit(List.of(), 5).isEmpty());
-        assertSame(null, ToolCallBudget.limit(null, 5));
     }
 }
