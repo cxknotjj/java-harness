@@ -291,11 +291,22 @@ class ChatServiceImplTest {
         verify(agentService, never()).resumeStreamReactive(any());
     }
 
+    /** 已成功的 goal（SUCCEEDED）→ 拒绝续跑：检查点回放无新工作，且会把状态拉回 RUNNING */
+    @Test
+    void resume_succeededGoal_throwsConflict() {
+        Goal done = new Goal("g-done", "复杂任务", "s1");
+        done.succeed("最终结果");
+        when(goalService.get("g-done")).thenReturn(Optional.of(done));
+
+        assertThrows(ResumeConflictException.class, () -> chatService.resume("g-done"));
+        verify(agentService, never()).resumeStreamReactive(any());
+    }
+
     /** 正常续跑：复用 goal 对象路由 multi-agent，SSE 输出带 goal 的 sessionId 与 goalId */
     @Test
     void resume_success_delegatesToAgentServiceWithSameGoal() {
         Goal goal = new Goal("g-ok", "复杂任务", "s9");
-        goal.succeed("旧结果");  // 非 RUNNING（如上次断开已被置 FAILED / SUCCEEDED）
+        goal.fail("客户端断开，编排已取消");  // 非 RUNNING（断点续跑的核心场景：上次中断的 FAILED goal）
         when(goalService.get("g-ok")).thenReturn(Optional.of(goal));
         when(agentService.resumeStreamReactive(goal)).thenReturn(Flux.just("续跑答案"));
 

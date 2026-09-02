@@ -30,6 +30,23 @@ public class ChatApiClient {
 
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
+    /** 非 2xx 响应异常：携带 HTTP 状态码与响应体（CLI 据此区分 409 的「执行中」与「已完成」） */
+    public static class ApiException extends IOException {
+        public final int code;
+        public final String body;
+
+        public ApiException(int code, String body) {
+            super("HTTP " + code + ": " + body);
+            this.code = code;
+            this.body = body;
+        }
+    }
+
+    /** 判断异常是否为「goal 已完成，无需续跑」的 409（CLI 收到后应清除本地续跑记录） */
+    public static boolean isGoalCompleted(IOException e) {
+        return e instanceof ApiException api && api.code == 409 && api.body.contains("无需续跑");
+    }
+
     private final OkHttpClient http;
     // 服务端可能先于 CLI 迭代（DTO 新增字段）：未知字段宽容，保证前后版本错开也能解析
     private final ObjectMapper mapper = new ObjectMapper()
@@ -107,7 +124,7 @@ public class ChatApiClient {
             throws IOException {
         try (Response resp = http.newCall(request).execute()) {
             if (!resp.isSuccessful()) {
-                throw new IOException("HTTP " + resp.code() + ": " + resp.body().string());
+                throw new ApiException(resp.code(), resp.body().string());
             }
             ChatResponse meta = null;
             String event = null;
@@ -191,7 +208,29 @@ public class ChatApiClient {
     }
 
     /**
-     * 调用 /api/harness/sessions 获取会话列表，返回第一个会话的 ID。
+     * 调用 GET /api/chat/goal-status?goalId=... 查询 goal 生命周期状态。
+     *
+     * @return 状态名（PENDING/RUNNING/SUCCEEDED/FAILED）；goal 不存在返回 null（404）
+     * @throws IOException 网络错误，或其他非 2xx 响应
+     */
+    public String goalStatus(String goalId) throws IOException {
+        Request request = new Request.Builder()
+                .url(baseUrl + "/api/chat/goal-status?goalId=" + goalId)
+                .get()
+                .build();
+        try (Response resp = http.newCall(request).execute()) {
+            if (resp.code() == 404) {
+                return null;
+            }
+            if (!resp.isSuccessful()) {
+                throw new IOException("HTTP " + resp.code() + ": " + resp.body().string());
+            }
+            return mapper.readTree(resp.body().string()).path("status").asText(null);
+        }
+    }
+
+    /**
+     * 调用 GET /api/harness/sessions 获取会话列表，返回第一个会话的 ID。
      * 无任何会话时返回 null（调用方可决定新建会话）。
      *
      * @throws IOException 网络错误，或非 2xx 响应（消息含 HTTP 状态码与响应体）

@@ -551,6 +551,13 @@ public class ChatCli {
             renderer.endTurn(false, "无法连接主服务 " + baseUrl);
             ui.println("请先启动主进程: mvn -s .mvn/settings.xml spring-boot:run");
         } catch (IOException e) {
+            if (ChatApiClient.isGoalCompleted(e)) {
+                // 服务端判定任务已完成（409 无需续跑）：清掉过期的本地续跑记录，下次启动不再提示
+                this.lastOrchestratedGoalId = null;
+                persistResumeState();
+                renderer.endTurn(false, "该任务已完成，无需续跑（已清除本地续跑记录）");
+                return;
+            }
             renderer.endTurn(false, e.getMessage());
         }
     }
@@ -570,7 +577,7 @@ public class ChatCli {
         }
     }
 
-    /** CLI 启动时恢复持久化的续跑目标：仅当文件中的会话与当前会话一致时生效（/new 后自然失效） */
+    /** CLI 启动时恢复持久化的续跑目标：会话匹配且服务端确认未完成才提示（已完成的直接清记录） */
     private void restoreResumeState() {
         if (lastOrchestratedGoalId != null || sessionId == null) {
             return;
@@ -588,10 +595,24 @@ public class ChatCli {
                     stateGoalId = line.substring("goalId=".length()).trim();
                 }
             }
-            if (stateGoalId != null && !stateGoalId.isBlank() && sessionId.equals(stateSessionId)) {
-                this.lastOrchestratedGoalId = stateGoalId;
-                ui.println("\033[90m已恢复可续跑任务 " + stateGoalId + "（/resume 继续）\033[0m");
+            if (stateGoalId == null || stateGoalId.isBlank() || !sessionId.equals(stateSessionId)) {
+                return;
             }
+            // 向服务端确认任务未完成：避免「记录里的任务实际已跑完」时误导用户 /resume（撞 409）
+            String status = null;
+            try {
+                status = api.goalStatus(stateGoalId);
+            } catch (IOException ignored) {
+                // 服务未就绪/网络失败：保留提示（/resume 真被拦截时也会自动清记录）
+            }
+            if ("SUCCEEDED".equals(status)) {
+                this.lastOrchestratedGoalId = null;
+                persistResumeState(); // 覆盖持久化文件，彻底清除过期记录
+                ui.println("\033[90m上次编排任务已完成（服务端已确认），无需续跑\033[0m");
+                return;
+            }
+            this.lastOrchestratedGoalId = stateGoalId;
+            ui.println("\033[90m已恢复可续跑任务 " + stateGoalId + "（/resume 继续）\033[0m");
         } catch (Exception e) {
             ui.println("\033[90m（续跑状态恢复失败: " + e.getMessage() + "）\033[0m");
         }

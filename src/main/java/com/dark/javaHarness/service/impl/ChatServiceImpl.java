@@ -129,6 +129,11 @@ public class ChatServiceImpl implements ChatService {
         if (goal.status() == GoalStatus.RUNNING) {
             throw new ResumeConflictException("该目标仍在执行中，无法续跑: " + goalId);
         }
+        if (goal.status() == GoalStatus.SUCCEEDED) {
+            // 已成功的 goal 再 resume 会把状态拉回 RUNNING（kill 进程后卡死），且检查点回放
+            // 只是跳过所有节点重复吐最终结果——直接拒绝，避免误以为有新工作发生
+            throw new ResumeConflictException("该任务已完成，无需续跑: " + goalId);
+        }
         log.info("[resume] goal '{}' 续跑请求（原状态={}）", goal.id(), goal.status());
         return toSseBody(agentService.resumeStreamReactive(goal), goal.sessionId(), false,
                 goal.objective(), goal.id());

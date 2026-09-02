@@ -2,9 +2,12 @@ package com.dark.javaHarness.controller;
 
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.GoalStatusView;
 import com.dark.javaHarness.service.ChatService;
+import com.dark.javaHarness.service.GoalService;
 import jakarta.validation.Valid;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -22,9 +25,11 @@ import reactor.core.publisher.Flux;
 public class ChatController {
 
     private final ChatService chatService;
+    private final GoalService goalService;
 
-    public ChatController(ChatService chatService) {
+    public ChatController(ChatService chatService, GoalService goalService) {
         this.chatService = chatService;
+        this.goalService = goalService;
     }
 
     /**
@@ -59,5 +64,17 @@ public class ChatController {
     @PostMapping(value = "/resume", produces = MediaType.TEXT_PLAIN_VALUE)
     public Flux<String> resume(@RequestParam("goalId") String goalId) {
         return chatService.resume(goalId).map(s -> s + "\n");
+    }
+
+    /**
+     * 查询 goal 状态：GET /api/chat/goal-status?goalId=&lt;id&gt; → {"goalId":"...","status":"RUNNING"}。
+     * CLI 启动恢复续跑记录时向服务端确认任务是否已完成（已完成则不再提示 /resume）。
+     * goal 不存在返回 404。
+     */
+    @GetMapping("/goal-status")
+    public GoalStatusView goalStatus(@RequestParam("goalId") String goalId) {
+        return goalService.get(goalId)
+                .map(g -> new GoalStatusView(g.id(), g.status().name()))
+                .orElseThrow(() -> new IllegalArgumentException("目标不存在: " + goalId));
     }
 }
