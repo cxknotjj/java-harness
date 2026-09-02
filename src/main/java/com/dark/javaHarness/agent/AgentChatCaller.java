@@ -43,6 +43,9 @@ final class AgentChatCaller {
     /** 单次 LLM 调用内的工具执行硬上限（提示词软约束 ≤8，硬上限留余量） */
     private static final int TOOL_CALL_BUDGET = 12;
 
+    /** 单次 LLM 调用内工具结果可注入上下文的 token 硬预算（超出的结果被截断，耗尽后不再执行工具） */
+    private static final int CONTEXT_TOKEN_BUDGET = 5000;
+
     private final ChatClientRegistry clientRegistry;
     private final AgentService agentService;
     /** 专家工具分配表：按 agent 名注入请求级工具 */
@@ -242,9 +245,9 @@ final class AgentChatCaller {
                     ToolCallTracer.trace(toolSet.callbacks(), toolEmitter));
             traced.addAll(ToolCallTracer.traceAnnotated(toolSet.annotated(), toolEmitter));
             if (!traced.isEmpty()) {
-                // 硬预算：单次调用内工具执行超过上限后不再真执行，返回引导文本收束循环
-                // （防止模型无限调用工具导致 token 按轮数平方级膨胀）
-                spec.toolCallbacks(ToolCallBudget.limit(traced, TOOL_CALL_BUDGET)
+                // 硬预算：单次调用内工具执行次数超限不再真执行；工具结果总量 ≤5k token，
+                // 超出的截断、耗尽后返回引导文本收束循环（防止 token 按轮数平方级膨胀）
+                spec.toolCallbacks(ToolCallBudget.limit(traced, TOOL_CALL_BUDGET, CONTEXT_TOKEN_BUDGET)
                         .toArray(new ToolCallback[0]));
             }
             return spec;

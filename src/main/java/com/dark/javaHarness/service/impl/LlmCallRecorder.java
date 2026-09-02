@@ -63,14 +63,6 @@ public class LlmCallRecorder {
      * 供流式调用（无 usage 回包）标记估算值。
      */
     public static int estimateTokens(String text) {
-        if (text == null || text.isEmpty()) {
-            return 0;
-        }
-        int tokens = 0;
-        for (int i = 0; i < text.length(); i++) {
-            tokens += text.charAt(i) > 0x2E80 ? 1 : 0; // CJK 及全角区按 1 token
-        }
-        int other = text.length() - tokens;
-        return tokens + (other + 3) / 4;
+        return com.dark.javaHarness.tool.TokenEstimator.estimateTokens(text);
     }
 }
