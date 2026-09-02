@@ -47,12 +47,13 @@ class ToolAssignmentsTest {
         ToolCallback w3 = named("w3");
         ToolCallback b1 = named("browser_navigate");
         ToolCallback b2 = named("browser_snapshot");
-        ToolCallback mcpSearch = named("mcp_search");
+        ToolCallback b3 = named("browser_click");
+        ToolCallback mcpInteractive = named("browser_click");
         lenient().when(sandbox.baseTools()).thenReturn(List.of(base));
         lenient().when(sandbox.readOnlyFileTools()).thenReturn(List.of(ro1, ro2));
         lenient().when(sandbox.writeTools()).thenReturn(List.of(w1, w2, w3));
-        lenient().when(sandbox.browserTools()).thenReturn(List.of(b1, b2));
-        lenient().when(mcp.toolCallbacks()).thenReturn(List.of(mcpSearch));
+        lenient().when(sandbox.browserTools()).thenReturn(List.of(b1, b2, b3));
+        lenient().when(mcp.toolCallbacks()).thenReturn(List.of(mcpInteractive));
         assignments = new ToolAssignments(webTools, sandbox, mcp);
     }
 
@@ -68,40 +69,59 @@ class ToolAssignmentsTest {
     void researcher_getsWebAndReadOnlySandboxTools() {
         ToolAssignments.ToolSet set = assignments.forAgent("researcher");
         assertEquals(List.of(webTools), set.annotated(), "researcher 注入网页抓取");
-        assertEquals(5, set.callbacks().size(), "researcher = 只读文件(2) + 浏览器(2) + MCP(1)");
+        assertEquals(5, set.callbacks().size(), "researcher = 只读文件(2) + 浏览器(3) + MCP(0，重名被沙箱取代)");
         verify(sandbox, never()).baseTools();
         verify(sandbox, never()).writeTools();
     }
 
     @Test
     void researcherAndGeneral_getsMcpTools_butNoOtherAgentDoes() {
-        // MCP 外部工具（扩展工具生态）分配给 researcher 与 general（full-access 也含扩展工具）
-        assertEquals(1, countNames(assignments.forAgent("researcher"), "mcp_search"),
-                "researcher 应能看见 MCP 工具");
-        assertEquals(1, countNames(assignments.forAgent("general"), "mcp_search"),
-                "general 应能看见 MCP 工具");
-        assertEquals(0, countNames(assignments.forAgent("coder"), "mcp_search"),
+        // MCP 外部工具（白名单内的交互类）分配给 researcher 与 general
+        assertEquals(1, countNames(assignments.forAgent("researcher"), "browser_click"),
+                "researcher 应能看见白名单内的 MCP 工具");
+        assertEquals(1, countNames(assignments.forAgent("general"), "browser_click"),
+                "general 应能看见白名单内的 MCP 工具");
+        assertEquals(0, countNames(assignments.forAgent("coder"), "browser_click"),
                 "coder 不应看见 MCP 工具");
-        assertEquals(0, countNames(assignments.forAgent("analyst"), "mcp_search"),
+        assertEquals(0, countNames(assignments.forAgent("analyst"), "browser_click"),
                 "analyst 不应看见 MCP 工具");
+    }
+
+    @Test
+    void mcpToolsOutsideWhitelist_invisibleToEveryAgent() {
+        // 白名单收窄：browsermcp 全量 12 个工具里只放行交互类 4 个，
+        // 未入白名单的（如 hover/tabs/console）对任何 agent 都不可见（省 schema token）
+        ToolCallback mcpHover = named("browser_hover");
+        ToolCallback mcpTabs = named("browser_tabs");
+        ToolCallback mcpConsole = named("browser_console_messages");
+        lenient().when(mcp.toolCallbacks())
+                .thenReturn(List.of(mcpHover, mcpTabs, mcpConsole));
+
+        for (String agent : new String[]{"researcher", "general"}) {
+            ToolAssignments.ToolSet set = assignments.forAgent(agent);
+            assertEquals(0, countNames(set, "browser_hover"), agent + " 不应看见白名单外工具");
+            assertEquals(0, countNames(set, "browser_tabs"), agent + " 不应看见白名单外工具");
+            assertEquals(0, countNames(set, "browser_console_messages"), agent + " 不应看见白名单外工具");
+        }
     }
 
     @Test
     void duplicateNames_deduped_keepingFirstOccurrence() {
         // 复现生产事故：Browser MCP 的 browser_navigate/browser_snapshot 与沙箱浏览器工具重名，
         // Spring AI 校验「Multiple tools with the same name」直接拒绝请求 → 合并时按名去重，先到者优先
-        ToolCallback mcpNavigate = named("browser_navigate");
-        ToolCallback mcpSnapshot = named("browser_snapshot");
-        ToolCallback mcpNew = named("mcp_only");
+        // （白名单外的 MCP 工具先被过滤，再对白名单内的做同名去重）
+        ToolCallback mcpHover = named("browser_hover");     // 白名单外 → 直接过滤
+        ToolCallback mcpClick = named("browser_click");     // 白名单内，但与沙箱浏览器重名 → 被沙箱版本取代
+        ToolCallback mcpScroll = named("browser_scroll");   // 白名单内且无冲突 → 正常保留
         lenient().when(mcp.toolCallbacks())
-                .thenReturn(List.of(mcpNavigate, mcpSnapshot, mcpNew));
+                .thenReturn(List.of(mcpHover, mcpClick, mcpScroll));
 
         ToolAssignments.ToolSet general = assignments.forAgent("general");
-        assertEquals(9, general.callbacks().size(),
-                "8 沙箱 + 3 MCP − 2 个与沙箱重名（browser_navigate/browser_snapshot）= 9");
-        assertFalse(general.callbacks().contains(mcpNavigate), "重名 MCP 工具应被沙箱版本取代");
-        assertFalse(general.callbacks().contains(mcpSnapshot), "重名 MCP 工具应被沙箱版本取代");
-        assertTrue(general.callbacks().contains(mcpNew), "无冲突 MCP 工具正常保留");
+        assertEquals(10, general.callbacks().size(),
+                "9 沙箱 + 3 MCP − 1 白名单外(browser_hover) − 1 重名(browser_click) = 10");
+        assertFalse(general.callbacks().contains(mcpHover), "白名单外 MCP 工具不可见");
+        assertFalse(general.callbacks().contains(mcpClick), "重名 MCP 工具应被沙箱版本取代");
+        assertTrue(general.callbacks().contains(mcpScroll), "白名单内无冲突 MCP 工具正常保留");
     }
 
     private static long countNames(ToolAssignments.ToolSet set, String name) {
@@ -131,7 +151,7 @@ class ToolAssignmentsTest {
     void general_getsFullToolset() {
         ToolAssignments.ToolSet set = assignments.forAgent("general");
         assertEquals(List.of(webTools), set.annotated());
-        assertEquals(9, set.callbacks().size(), "general = 执行(1) + 只读(2) + 写入(3) + 浏览器(2) + MCP(1) 全量");
+        assertEquals(9, set.callbacks().size(), "general = 执行(1) + 只读(2) + 写入(3) + 浏览器(3) + MCP(0，重名被沙箱取代) 全量");
     }
 
     @Test

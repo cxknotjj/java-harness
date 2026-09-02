@@ -23,9 +23,18 @@ import org.springframework.stereotype.Component;
  *
  * <p>权限边界是服务端硬边界：只把分配到的工具 schema 发给模型，
  * 未分配的工具模型不可见、服务端也无执行注册。
+ *
+ * <p>MCP 工具白名单：browsermcp 全量 12 个工具（~2.5k token schema）随每次 LLM 调用
+ * 的 tools 字段发送、工具循环内每轮重发；其中导航/快照与沙箱浏览器重名早已被去重丢弃，
+ * 其余多数（hover/select_option/tabs/console/network…）在编排场景从未被调用。
+ * 白名单只保留沙箱未覆盖的页面交互类工具，收窄约 60% 的无效 schema 开销。
  */
 @Component
 public class ToolAssignments {
+
+    /** MCP 工具白名单：只放行页面交互类（读取走沙箱 browser_navigate/browser_snapshot） */
+    private static final java.util.Set<String> MCP_TOOL_WHITELIST = java.util.Set.of(
+            "browser_click", "browser_type", "browser_press_key", "browser_scroll");
 
     /** 双通道工具集：@Tool 注解对象（.tools 注入）+ ToolCallback（.toolCallbacks 注入） */
     public record ToolSet(List<Object> annotated, List<ToolCallback> callbacks) {
@@ -52,7 +61,7 @@ public class ToolAssignments {
         return switch (agentName == null ? "" : agentName) {
             case "researcher" -> new ToolSet(
                     List.of(webTools),
-                    concat(sandbox.readOnlyFileTools(), sandbox.browserTools(), mcp.toolCallbacks()));
+                    concat(sandbox.readOnlyFileTools(), sandbox.browserTools(), mcpTools()));
             case "coder" -> new ToolSet(
                     List.of(),
                     concat(sandbox.baseTools(), sandbox.writeTools()));
@@ -62,9 +71,16 @@ public class ToolAssignments {
             case "general" -> new ToolSet(
                     List.of(webTools),
                     concat(sandbox.baseTools(), sandbox.readOnlyFileTools(), sandbox.writeTools(),
-                            sandbox.browserTools(), mcp.toolCallbacks()));
+                            sandbox.browserTools(), mcpTools()));
             default -> ToolSet.EMPTY;
         };
+    }
+
+    /** MCP 工具经白名单过滤后再参与分配（收窄 schema 开销 + 维持最小权限） */
+    private List<ToolCallback> mcpTools() {
+        return mcp.toolCallbacks().stream()
+                .filter(cb -> MCP_TOOL_WHITELIST.contains(cb.getToolDefinition().name()))
+                .toList();
     }
 
     /** 按顺序合并工具列表，按工具名去重（先到者优先）；Spring AI 不允许同名工具注入同一请求 */
