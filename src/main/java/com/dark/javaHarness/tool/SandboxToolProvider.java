@@ -7,10 +7,19 @@ import io.agentscope.runtime.sandbox.box.Sandbox;
 import io.agentscope.runtime.sandbox.manager.ManagerConfig;
 import io.agentscope.runtime.sandbox.manager.SandboxService;
 import jakarta.annotation.PreDestroy;
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 /**
@@ -24,7 +33,9 @@ import org.springframework.stereotype.Component;
  * base 容器（Python/Shell/文件）与 browser 容器（Chromium 浏览器，独立镜像）。
  *
  * <p>初始化策略（架构决策：沙箱是硬依赖、不做宿主机降级）：
- * 懒初始化（首次取用才拉起 Docker 容器），失败时记录 warn 并返回空工具面、
+ * 懒初始化（首次取用才拉起 Docker 容器）+ 专用后台线程限时初始化（默认 15s）——
+ * Docker 未运行时 agentscope 的 Docker 发现会回退到 Windows 命名管道且底层无超时、
+ * 可能永久阻塞，限时等待保证请求线程绝不被拖死；超时/失败时沙箱工具面为空、
  * 进程内不再重试——即无 Docker 环境下沙箱类能力整体不可用，但应用其余功能不受影响；
  * 绝不回退到宿主机执行（文件/Shell 工具已删除，无退路可走）。
  * base 与 browser 两组初始化相互独立：浏览器镜像缺失只降级浏览器工具，不影响执行/文件类。
@@ -41,13 +52,29 @@ public class SandboxToolProvider {
     private final Object lock = new Object();
     private volatile boolean initialized;
 
+    /** 沙箱初始化专用单线程（守护线程）：Docker 管道阻塞时也不拖垮请求线程池 */
+    private final ExecutorService initExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "sandbox-init");
+        t.setDaemon(true);
+        return t;
+    });
+    /** 一次性初始化任务句柄：预热线程与请求线程共用，保证 init 全进程只跑一次 */
+    private volatile Future<?> initTask;
+
+    /**
+     * 初始化超时上限。Docker 未运行时 agentscope 的 Docker 发现会回退到 Windows
+     * 命名管道（\\.\pipe\docker_engine），该连接底层无超时、可能永久阻塞（实测挂死
+     * 3 分钟以上），必须由本层兜底超时，超时后请求按"无沙箱工具"继续。
+     */
+    volatile long initTimeoutMs = Duration.ofSeconds(15).toMillis();
+
     /** 浏览器组独立初始化锁：与 base 组互不阻塞、互不牵连 */
     private final Object browserLock = new Object();
     private volatile boolean browserInitialized;
 
-    private volatile List<ToolCallback> base = List.of();
-    private volatile List<ToolCallback> readOnly = List.of();
-    private volatile List<ToolCallback> write = List.of();
+    volatile List<ToolCallback> base = List.of();
+    volatile List<ToolCallback> readOnly = List.of();
+    volatile List<ToolCallback> write = List.of();
     private volatile List<ToolCallback> browser = List.of();
     private volatile SandboxService service;
 
@@ -78,7 +105,14 @@ public class SandboxToolProvider {
         return browser;
     }
 
-    /** 懒初始化 base 组：双检锁保证只尝试一次；失败降级为空工具面（宿主机零暴露，不重试） */
+    /**
+     * 懒初始化 base 组：init 在专用后台线程执行。
+     * 首次触发时启动 init 任务并限时等待（默认 15s）：Docker 不可用时 agentscope 会
+     * 阻塞在命名管道连接上（无底层超时），限时等待保证请求线程永远不被拖死。
+     * 全进程只尝试一次。
+     * <p>若 init 任务已在后台跑（prewarm 预热过、管道阻塞未完成），本次请求只快速
+     * 检查、不阻塞等待——避免 prewarm 超时后每个请求再各等满一次超时。
+     */
     private void ensure() {
         if (initialized) {
             return;
@@ -87,13 +121,57 @@ public class SandboxToolProvider {
             if (initialized) {
                 return;
             }
-            try {
-                init();
-            } catch (Throwable t) {
-                log.warn("[sandbox] 沙箱初始化失败（Docker 环境？），沙箱工具面为空，不回退宿主机工具: {}",
-                        t.toString());
+            Future<?> task = initTask;
+            if (task == null) {
+                initTask = task = initExecutor.submit(this::initGuarded);
+                awaitInit(task);
+            } else if (task.isDone()) {
+                // prewarm 已跑完但还没置位：首次请求取一次结果（含超时/失败分支）
+                awaitInit(task);
+            } else {
+                // 后台仍在初始化（典型：Docker 管道阻塞中）：请求不等待，按空工具面放行；
+                // 若后台最终完成，volatile 工具字段填充后后续请求仍能取到
+                log.warn("[sandbox] 沙箱仍在后台初始化中，本次请求不等待，沙箱工具面暂时为空");
+                initialized = true;
             }
+        }
+    }
+
+    /** 限时等待 init 任务完成，超时/异常/中断均记日志并放行（工具面为空，不重试） */
+    private void awaitInit(Future<?> task) {
+        try {
+            task.get(initTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            task.cancel(true); // 中断底层阻塞的管道/Docker 连接，防守护线程永久占用
+            log.warn("[sandbox] 沙箱初始化超过 {}s（Docker 运行中？），本进程放弃等待，"
+                    + "沙箱工具面为空、不回退宿主机工具", initTimeoutMs / 1000);
+        } catch (ExecutionException e) {
+            log.warn("[sandbox] 沙箱初始化失败（Docker 环境？），沙箱工具面为空，不回退宿主机工具: {}",
+                    e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("[sandbox] 等待沙箱初始化被中断，沙箱工具面为空");
+        } finally {
             initialized = true;
+        }
+    }
+
+    /** 应用就绪后后台预热沙箱：Docker 可用时首请求零等待，不可用时仅在后台失败不影响请求 */
+    @EventListener(ApplicationReadyEvent.class)
+    public void prewarm() {
+        synchronized (lock) {
+            if (initTask == null) {
+                initTask = initExecutor.submit(this::initGuarded);
+            }
+        }
+    }
+
+    /** init 的守护包装：任何异常（含取消中断）只记日志，绝不上抛拖垮后台线程 */
+    private void initGuarded() {
+        try {
+            init();
+        } catch (Throwable t) {
+            log.warn("[sandbox] 沙箱初始化异常（Docker 环境？）: {}", t.toString());
         }
     }
 
@@ -129,7 +207,7 @@ public class SandboxToolProvider {
         }
     }
 
-    private void init() throws Exception {
+    protected void init() throws Exception {
         SandboxService svc = new SandboxService(ManagerConfig.builder().build());
         svc.start();
         Sandbox sandbox = new BaseSandbox(svc, SANDBOX_USER, SANDBOX_SESSION);
@@ -154,9 +232,10 @@ public class SandboxToolProvider {
                 base.size(), readOnly.size(), write.size());
     }
 
-    /** 应用退出时释放沙箱服务与全部容器（base + browser） */
+    /** 应用退出时释放沙箱服务与全部容器（base + browser），并关闭初始化线程池 */
     @PreDestroy
     public void shutdown() {
+        initExecutor.shutdownNow();
         try {
             SandboxService svc = service;
             if (svc != null) {
