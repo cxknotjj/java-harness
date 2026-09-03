@@ -27,6 +27,9 @@ public class ModelProviderEntity {
     /** 服务商端点 base-url（库驱动，构建 ChatClient 时使用） */
     private String apiUrl;
 
+    /** 是否关闭思考：1-该端点请求注入 enable_thinking:false（dashscope 思考模型）0-模型默认 */
+    private Integer disableThinking;
+
     /** 状态：1-启用 0-禁用 */
     private Integer status;
 

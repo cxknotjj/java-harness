@@ -54,6 +54,8 @@ public class GeneralAssistantAgent implements Agent {
     private final LlmCallRecorder recorder;
     /** 模型调用重试策略（最多 3 次、指数退避） */
     private final LlmRetry retry;
+    /** 会话历史裁剪预算（token），来自 app.context.history-budget 配置 */
+    private final int historyBudget;
 
     public GeneralAssistantAgent(String agentName,
                                  ChatClientRegistry clientRegistry,
@@ -61,12 +63,24 @@ public class GeneralAssistantAgent implements Agent {
                                  AgentService agentService,
                                  ToolAssignments toolAssignments,
                                  LlmCallRecorder recorder) {
+        this(agentName, clientRegistry, memoryStore, agentService, toolAssignments, recorder, null);
+    }
+
+    /** budgets：上下文预算配置（路径 A 会话历史裁剪预算；null 时用内置默认值，单测场景） */
+    public GeneralAssistantAgent(String agentName,
+                                 ChatClientRegistry clientRegistry,
+                                 SessionService memoryStore,
+                                 AgentService agentService,
+                                 ToolAssignments toolAssignments,
+                                 LlmCallRecorder recorder,
+                                 com.dark.javaHarness.config.ContextBudgetProperties budgets) {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.memoryStore = memoryStore;
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
         this.recorder = recorder;
+        this.historyBudget = budgets != null ? budgets.getHistoryBudget() : 4000;
         this.retry = new LlmRetry();
     }
 
@@ -209,7 +223,7 @@ public class GeneralAssistantAgent implements Agent {
                 .advisors(MessageChatMemoryAdvisor.builder(memoryStore).build())
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
                 // 上下义组装拦截器：对注入后的序列做过滤/截断/role 归一化（token 预算控制）
-                .advisors(new ContextAssemblingAdvisor())
+                .advisors(new ContextAssemblingAdvisor(historyBudget))
                 .system(config.prompt() != null ? config.prompt() : DEFAULT_SYSTEM_PROMPT)
                 .user(objective);
         // 请求级工具注入（本 agent 名分配到的工具集，general=全量；与客户端 defaultTools 合并）

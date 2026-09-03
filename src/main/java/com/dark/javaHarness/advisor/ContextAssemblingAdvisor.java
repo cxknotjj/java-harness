@@ -1,5 +1,6 @@
 package com.dark.javaHarness.advisor;
 
+import com.dark.javaHarness.tool.TokenEstimator;
 import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
@@ -38,7 +39,7 @@ public class ContextAssemblingAdvisor implements CallAdvisor, StreamAdvisor {
     private final int tokenBudget;
 
     public ContextAssemblingAdvisor() {
-        // 默认 token 预算：约 4000（后续可由配置注入）
+        // 默认 token 预算（生产由 GeneralAssistantAgent 从 app.context.history-budget 注入）
         this(4000);
     }
 
@@ -178,15 +179,9 @@ public class ContextAssemblingAdvisor implements CallAdvisor, StreamAdvisor {
         return out;
     }
 
-    /** 近似 token 估算：中文按字符、英文按每 4 字符近似 1 token。 */
+    /** token 估算统一走 {@link TokenEstimator}（全项目唯一口径，与观测/工具预算可比对） */
     private long estimateTokens(Message m) {
-        String text = m.getText();
-        if (text == null) {
-            return 0;
-        }
-        long chinese = text.codePoints().filter(cp -> cp > 0x2E80).count();
-        long other = text.length() - chinese;
-        return chinese + (other + 3) / 4;
+        return TokenEstimator.estimateTokens(m.getText());
     }
 
     private String roleOf(Message m) {

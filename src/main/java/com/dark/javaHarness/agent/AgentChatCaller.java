@@ -1,5 +1,6 @@
 package com.dark.javaHarness.agent;
 
+import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.LlmCallLog;
@@ -13,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.api.Advisor;
 import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.tool.ToolCallback;
@@ -36,15 +38,12 @@ final class AgentChatCaller {
     private static final org.slf4j.Logger log =
             org.slf4j.LoggerFactory.getLogger(AgentChatCaller.class);
 
+    /** 流式调用空闲超时：相邻 token 间隔超过该时长即判定端点挂起，超时失败进入调用方回退/重试逻辑 */
+    private static final java.time.Duration STREAM_IDLE_TIMEOUT = java.time.Duration.ofSeconds(300);
+
     /** 默认系统提示词（agent 表无对应行或 prompt 为空时的兜底） */
     private static final String DEFAULT_SYSTEM_PROMPT =
             "你是一个执行任务的通用 AI 助手，请直接给出简洁、可执行的完成结果。";
-
-    /** 单次 LLM 调用内的工具执行硬上限（提示词软约束 ≤8，硬上限留余量） */
-    private static final int TOOL_CALL_BUDGET = 12;
-
-    /** 单次 LLM 调用内工具结果可注入上下文的 token 硬预算（超出的结果被截断，耗尽后不再执行工具） */
-    private static final int CONTEXT_TOKEN_BUDGET = 5000;
 
     private final ChatClientRegistry clientRegistry;
     private final AgentService agentService;
@@ -54,6 +53,8 @@ final class AgentChatCaller {
     private final LlmCallRecorder recorder;
     /** 模型调用重试策略（指数退避，最多 3 次） */
     private final LlmRetry retry;
+    /** 上下文预算配置（工具次数/结果预算等；null 时用内置默认值，单测场景） */
+    private final ContextBudgetProperties budgets;
 
     AgentChatCaller(ChatClientRegistry clientRegistry,
                     AgentService agentService,
@@ -67,21 +68,42 @@ final class AgentChatCaller {
                     ToolAssignments toolAssignments,
                     LlmCallRecorder recorder,
                     LlmRetry retry) {
+        this(clientRegistry, agentService, toolAssignments, recorder, retry, null);
+    }
+
+    AgentChatCaller(ChatClientRegistry clientRegistry,
+                    AgentService agentService,
+                    ToolAssignments toolAssignments,
+                    LlmCallRecorder recorder,
+                    ContextBudgetProperties budgets) {
+        this(clientRegistry, agentService, toolAssignments, recorder, new LlmRetry(), budgets);
+    }
+
+    AgentChatCaller(ChatClientRegistry clientRegistry,
+                    AgentService agentService,
+                    ToolAssignments toolAssignments,
+                    LlmCallRecorder recorder,
+                    LlmRetry retry,
+                    ContextBudgetProperties budgets) {
         this.clientRegistry = clientRegistry;
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
         this.recorder = recorder;
         this.retry = retry;
+        this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
     }
 
     /** 带会话观测的单次调用（推荐入口：sessionId 用于 llm_call_log 归因） */
     String call(String sessionId, String forAgent, String fallbackSystem, String user) {
-        return call(sessionId, forAgent, fallbackSystem, user, null);
+        return call(sessionId, forAgent, fallbackSystem, user, null, new Advisor[0]);
     }
 
-    /** 带工具事件发射器的调用：emitter 非 null 时本次调用的工具执行起止经其发进度行（供 CLI 展示） */
+    /**
+     * 带请求级 advisor 挂载的单次调用（如 lead/聚合的 PromptBudgetAdvisor）：
+     * toolEmitter 可为 null（无工具进度行）；extraAdvisors 为请求级 advisor（可变参数，可为空）。
+     */
     String call(String sessionId, String forAgent, String fallbackSystem, String user,
-                Consumer<String> toolEmitter) {
+                Consumer<String> toolEmitter, Advisor... extraAdvisors) {
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
         // 模型调用失败自动重试（最多 3 次、指数退避）；单次调用含观测埋点
@@ -89,7 +111,7 @@ final class AgentChatCaller {
             long start = System.currentTimeMillis();
             try {
                 return invokeAndRecord(config, sessionId, forAgent, fallbackSystem, user,
-                        toolEmitter, false, model, start);
+                        toolEmitter, false, model, start, extraAdvisors);
             } catch (RuntimeException e) {
                 // 账户级硬错误（余额不足/配额耗尽）：重试无意义，立即转人话异常向上传播
                 if (ModelQuotaException.matches(e)) {
@@ -104,7 +126,7 @@ final class AgentChatCaller {
                     long start2 = System.currentTimeMillis();
                     try {
                         return invokeAndRecord(config, sessionId, forAgent, fallbackSystem, user,
-                                null, true, model, start2);
+                                null, true, model, start2, extraAdvisors);
                     } catch (RuntimeException e2) {
                         recordError(sessionId, forAgent, model, false, start2, e2);
                         throw e2;
@@ -119,9 +141,9 @@ final class AgentChatCaller {
     /** 单次调用 + 成功观测记录（失败由调用方记录）；disableTools=true 时不注入任何工具（幻觉工具调用的降级路径） */
     String invokeAndRecord(AgentConfig config, String sessionId, String forAgent,
                            String fallbackSystem, String user, Consumer<String> toolEmitter,
-                           boolean disableTools, String model, long start) {
+                           boolean disableTools, String model, long start, Advisor... extraAdvisors) {
         org.springframework.ai.chat.model.ChatResponse resp =
-                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, disableTools)
+                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
                         .call().chatResponse();
         String content = contentOf(resp);
         Usage usage = usageOf(resp);
@@ -161,12 +183,15 @@ final class AgentChatCaller {
      */
     String stream(String sessionId, String forAgent, String fallbackSystem, String user,
                   Consumer<String> onToken) {
-        return stream(sessionId, forAgent, fallbackSystem, user, onToken, null);
+        return stream(sessionId, forAgent, fallbackSystem, user, onToken, null, new Advisor[0]);
     }
 
-    /** 带工具事件发射器的流式调用：语义同 {@link #stream(String, String, String, Consumer)} */
+    /**
+     * 带请求级 advisor 挂载的流式调用（如聚合的 PromptBudgetAdvisor）：
+     * toolEmitter 可为 null（无工具进度行）；extraAdvisors 为请求级 advisor（可变参数，可为空）。
+     */
     String stream(String sessionId, String forAgent, String fallbackSystem, String user,
-                  Consumer<String> onToken, Consumer<String> toolEmitter) {
+                  Consumer<String> onToken, Consumer<String> toolEmitter, Advisor... extraAdvisors) {
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
         // 流式重试约束：仅「首个 token 尚未发出」的失败才允许重试（一旦开始输出，
@@ -175,9 +200,11 @@ final class AgentChatCaller {
             long start = System.currentTimeMillis();
             StringBuilder collected = new StringBuilder();
             try {
-                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, false)
+                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, false, extraAdvisors)
                         .stream()
                         .content()
+                        // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
+                        .timeout(STREAM_IDLE_TIMEOUT)
                         .doOnNext(token -> {
                             collected.append(token);
                             onToken.accept(token);
@@ -210,7 +237,7 @@ final class AgentChatCaller {
     /** 组装请求（查表配置 → 取客户端 → system/user → 请求级 model → 工具注入），call/stream 共用；config 由调用方查好传入（避免重复查表） */
     private ChatClient.ChatClientRequestSpec buildSpec(AgentConfig config, String forAgent, String fallbackSystem,
                                                        String user, Consumer<String> toolEmitter,
-                                                       boolean disableTools) {
+                                                       boolean disableTools, Advisor... extraAdvisors) {
         // Registry 模式：凭部署模型 id 取对应厂商的 ChatClient（未绑定/未命中回退默认 DashScope）
         Long modelProviderId = config != null ? config.modelProviderId() : null;
         String model = config != null ? config.model() : null;
@@ -221,6 +248,11 @@ final class AgentChatCaller {
         ChatClient.ChatClientRequestSpec spec = client.prompt()
                 .system(sysText)
                 .user(userText);
+        // 请求级 advisor 挂载（如 lead/聚合的 PromptBudgetAdvisor）：
+        // 不用 default advisor——聚合与子任务共用同一客户端，default 挂载会连坐到无关调用
+        for (Advisor advisor : extraAdvisors) {
+            spec.advisors(advisor);
+        }
         if (model != null && !model.isBlank()) {
             // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
             // frequencyPenalty：长报告聚合场景下模型易陷入重复循环（同一段落循环生成多次），
@@ -247,7 +279,8 @@ final class AgentChatCaller {
             if (!traced.isEmpty()) {
                 // 硬预算：单次调用内工具执行次数超限不再真执行；工具结果总量 ≤5k token，
                 // 超出的截断、耗尽后返回引导文本收束循环（防止 token 按轮数平方级膨胀）
-                spec.toolCallbacks(ToolCallBudget.limit(traced, TOOL_CALL_BUDGET, CONTEXT_TOKEN_BUDGET)
+                spec.toolCallbacks(ToolCallBudget.limit(traced,
+                                budgets.getToolCallLimit(), budgets.getToolResultBudget())
                         .toArray(new ToolCallback[0]));
             }
             return spec;

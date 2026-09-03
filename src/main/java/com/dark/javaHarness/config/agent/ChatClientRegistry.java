@@ -56,7 +56,8 @@ public class ChatClientRegistry {
             return;
         }
         for (ModelProviderEntity row : rows) {
-            ChatClient client = clientFactory.build(row.getProvider(), row.getApiUrl());
+            ChatClient client = clientFactory.build(row.getProvider(), row.getApiUrl(),
+                    row.getDisableThinking() != null && row.getDisableThinking() == 1);
             if (client != null) {
                 target.put(row.getId(), client);
                 String nameKey = row.getModel().toLowerCase();

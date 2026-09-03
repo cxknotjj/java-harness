@@ -10,6 +10,8 @@ import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
 import com.alibaba.cloud.ai.graph.checkpoint.BaseCheckpointSaver;
 import com.alibaba.cloud.ai.graph.checkpoint.config.SaverConfig;
 import com.alibaba.cloud.ai.graph.exception.GraphStateException;
+import com.dark.javaHarness.advisor.PromptBudgetAdvisor;
+import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
@@ -24,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
@@ -100,13 +103,15 @@ public class MultiAgentGraphAgent implements Agent {
      * 支持 {@link #resumeStreamReactive(Goal)} 从断点继续（已完成节点不再重跑）。
      */
     private final BaseCheckpointSaver checkpointSaver;
+    /** 上下文预算配置（lead/聚合静态 prompt 预算；null 时用内置默认值，单测场景） */
+    private final ContextBudgetProperties budgets;
 
     public MultiAgentGraphAgent(String agentName,
                                 ChatClientRegistry clientRegistry,
                                 AgentService agentService,
                                 ToolAssignments toolAssignments,
                                 LlmCallRecorder recorder) {
-        this(agentName, clientRegistry, agentService, toolAssignments, recorder, null);
+        this(agentName, clientRegistry, agentService, toolAssignments, recorder, null, null);
     }
 
     public MultiAgentGraphAgent(String agentName,
@@ -115,9 +120,20 @@ public class MultiAgentGraphAgent implements Agent {
                                 ToolAssignments toolAssignments,
                                 LlmCallRecorder recorder,
                                 BaseCheckpointSaver checkpointSaver) {
+        this(agentName, clientRegistry, agentService, toolAssignments, recorder, checkpointSaver, null);
+    }
+
+    public MultiAgentGraphAgent(String agentName,
+                                ChatClientRegistry clientRegistry,
+                                AgentService agentService,
+                                ToolAssignments toolAssignments,
+                                LlmCallRecorder recorder,
+                                BaseCheckpointSaver checkpointSaver,
+                                ContextBudgetProperties budgets) {
         this.agentName = agentName;
         this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments, recorder);
         this.checkpointSaver = checkpointSaver;
+        this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
         try {
             this.stateGraph = buildStateGraph();
             // 同步执行用的常驻实例（带检查点时每个 superstep 自动落库）
@@ -538,7 +554,7 @@ public class MultiAgentGraphAgent implements Agent {
 
     /**
      * 流式聚合：首个内容 token 前推「聚合」进度行，随后逐 token 实时发射；
-     * 流式异常时回退阻塞调用——已推出过 token 则以已收内容为准（避免内容重复），
+     * 流式异常或 0 个内容 token 时回退阻塞调用——已推出过 token 则以已收内容为准（避免内容重复），
      * 一个 token 都没推过则整段回退（主干 toRows 会兜底发聚合进度+完整内容）。
      */
     private String predictAggregateStreaming(String sessionId,
@@ -558,8 +574,12 @@ public class MultiAgentGraphAgent implements Agent {
                         collected.append(token);
                         contentSent.set(true);
                         BranchProgressListener.tryEmitSerialized(liveTokens, token);
-                    });
-            return collected.toString();
+                    },
+                    null,
+                    aggregateBudgetAdvisor());
+            // 流式成功但 0 个内容 token（思考模型流式输出全在 reasoning_content 等）：
+            // 不能把空串当最终回答落 final（CLI 会回显目标本身），回退阻塞调用兜底
+            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results);
         } catch (Exception e) {
             log.warn("[multi-agent][aggregate] 流式聚合失败，回退阻塞调用：{}", safe(e));
             return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results);
@@ -583,9 +603,13 @@ public class MultiAgentGraphAgent implements Agent {
     private static final String AGGREGATOR_FALLBACK_PROMPT =
             "你是聚合汇总的 AI 助手，依据多个子结果的最终回答可直接呈现给用户。";
 
-    /** lead 拆解：按 agent 表 lead 行的提示词/模型执行（无配置时回退内置兜底） */
+    /** 聚合 user 内容的子任务节头（与 {@link #aggregateUserPrompt} 的拼接格式对应） */
+    private static final Pattern AGG_SECTION_HEADER = Pattern.compile("【子任务\\d+】");
+
+    /** lead 拆解：按 agent 表 lead 行的提示词/模型执行（无配置时回退内置兜底）；目标超长尾截至 lead 预算 */
     private String predictLead(String sessionId, String objective) {
-        return chatCaller.call(sessionId, ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective);
+        return chatCaller.call(sessionId, ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective,
+                null, PromptBudgetAdvisor.tail(budgets.getLeadBudget()));
     }
 
     /** lead 拆解前日志埋点便于诊断专家指派（raw 输出统一记审计） */
@@ -610,7 +634,13 @@ public class MultiAgentGraphAgent implements Agent {
     }
 
     private String predictAggregate(String sessionId, List<String> results) {
-        return chatCaller.call(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, aggregateUserPrompt(results));
+        return chatCaller.call(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, aggregateUserPrompt(results),
+                null, aggregateBudgetAdvisor());
+    }
+
+    /** 聚合预算 advisor：按「【子任务N】」节边界等份额截断（禁止先到先得挤掉后面的子任务） */
+    private PromptBudgetAdvisor aggregateBudgetAdvisor() {
+        return PromptBudgetAdvisor.sections(budgets.getAggregateBudget(), AGG_SECTION_HEADER);
     }
 
     /** 聚合请求的 user 内容：各子任务结果顺序拼接（阻塞/流式两版共用） */

@@ -2,7 +2,9 @@ package com.dark.javaHarness.config.agent;
 
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.domain.entity.ModelProviderEntity;
@@ -52,7 +54,7 @@ class ChatClientRegistryTest {
         when(modelProviderMapper.selectList(any())).thenReturn(List.of(
                 row(1L, "gpt-4o", "dashscope", "https://dashscope.aliyuncs.com/compatible-mode", 1)));
         when(clientFactory.defaultClient(any())).thenReturn(defaultClient);
-        when(clientFactory.build("dashscope", "https://dashscope.aliyuncs.com/compatible-mode")).thenReturn(gptClient);
+        when(clientFactory.build(eq("dashscope"), eq("https://dashscope.aliyuncs.com/compatible-mode"), anyBoolean())).thenReturn(gptClient);
 
         registry = new ChatClientRegistry(dashScopeBuilder, clientFactory, modelProviderMapper);
 
@@ -67,7 +69,7 @@ class ChatClientRegistryTest {
         when(modelProviderMapper.selectList(any())).thenReturn(List.of(
                 row(2L, "qwen-plus", "dashscope", "https://dashscope.aliyuncs.com/compatible-mode", 1)));
         when(clientFactory.defaultClient(any())).thenReturn(defaultClient);
-        when(clientFactory.build(anyString(), anyString())).thenReturn(defaultClient);
+        when(clientFactory.build(anyString(), anyString(), anyBoolean())).thenReturn(defaultClient);
 
         registry = new ChatClientRegistry(dashScopeBuilder, clientFactory, modelProviderMapper);
 
@@ -95,8 +97,8 @@ class ChatClientRegistryTest {
                 row(10L, "deepseek-v4-flash", "deepseek", "https://api.deepseek.com", 1),
                 row(11L, "deepseek-v4-flash", "tecent", "https://chatapi.weixin.qq.com/openai", 1)));
         when(clientFactory.defaultClient(any())).thenReturn(defaultClient);
-        when(clientFactory.build("deepseek", "https://api.deepseek.com")).thenReturn(defaultClient);
-        when(clientFactory.build("tecent", "https://chatapi.weixin.qq.com/openai")).thenReturn(gptClient);
+        when(clientFactory.build(eq("deepseek"), eq("https://api.deepseek.com"), anyBoolean())).thenReturn(defaultClient);
+        when(clientFactory.build(eq("tecent"), eq("https://chatapi.weixin.qq.com/openai"), anyBoolean())).thenReturn(gptClient);
 
         registry = new ChatClientRegistry(dashScopeBuilder, clientFactory, modelProviderMapper);
 
@@ -112,7 +114,7 @@ class ChatClientRegistryTest {
         when(modelProviderMapper.selectList(any())).thenReturn(List.of(
                 row(1L, "gpt-4o", "dashscope", "https://old.example.com", 1)));
         when(clientFactory.defaultClient(any())).thenReturn(defaultClient);
-        when(clientFactory.build("dashscope", "https://old.example.com")).thenReturn(gptClient);
+        when(clientFactory.build(eq("dashscope"), eq("https://old.example.com"), anyBoolean())).thenReturn(gptClient);
 
         registry = new ChatClientRegistry(dashScopeBuilder, clientFactory, modelProviderMapper);
         assertSame(gptClient, registry.get(1L));
@@ -123,8 +125,8 @@ class ChatClientRegistryTest {
         when(modelProviderMapper.selectList(any())).thenReturn(List.of(
                 row(1L, "gpt-4o", "dashscope", "https://new.example.com", 1),
                 row(2L, "kimi-k2", "moonshot", "https://api.moonshot.cn/v1", 1)));
-        when(clientFactory.build("dashscope", "https://new.example.com")).thenReturn(newGpt);
-        when(clientFactory.build("moonshot", "https://api.moonshot.cn/v1")).thenReturn(kimi);
+        when(clientFactory.build(eq("dashscope"), eq("https://new.example.com"), anyBoolean())).thenReturn(newGpt);
+        when(clientFactory.build(eq("moonshot"), eq("https://api.moonshot.cn/v1"), anyBoolean())).thenReturn(kimi);
 
         registry.reload();
 

@@ -34,9 +34,10 @@ public class ChatAgentConfig {
                                               SessionService memoryStore,
                                               @Lazy AgentService agentService,
                                               ToolAssignments toolAssignments,
-                                              LlmCallRecorder recorder) {
+                                              LlmCallRecorder recorder,
+                                              com.dark.javaHarness.config.ContextBudgetProperties budgets) {
         return new GeneralAssistantAgent("general", registry, memoryStore, agentService,
-                toolAssignments, recorder);
+                toolAssignments, recorder, budgets);
     }
 
     @Bean
@@ -44,9 +45,10 @@ public class ChatAgentConfig {
                                                SessionService memoryStore,
                                                @Lazy AgentService agentService,
                                                ToolAssignments toolAssignments,
-                                               LlmCallRecorder recorder) {
+                                               LlmCallRecorder recorder,
+                                               com.dark.javaHarness.config.ContextBudgetProperties budgets) {
         return new GeneralAssistantAgent("deepseek", registry, memoryStore, agentService,
-                toolAssignments, recorder);
+                toolAssignments, recorder, budgets);
     }
 
     /**
@@ -63,14 +65,15 @@ public class ChatAgentConfig {
                 .build();
     }
 
-    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合），带 MySQL 检查点。 */
+    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合），带 MySQL 检查点与静态 prompt 预算。 */
     @Bean
     public MultiAgentGraphAgent multiAgent(ChatClientRegistry registry,
                                            @Lazy AgentService agentService,
                                            ToolAssignments toolAssignments,
                                            LlmCallRecorder recorder,
-                                           BaseCheckpointSaver graphCheckpointSaver) {
+                                           BaseCheckpointSaver graphCheckpointSaver,
+                                           com.dark.javaHarness.config.ContextBudgetProperties budgets) {
         return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService,
-                toolAssignments, recorder, graphCheckpointSaver);
+                toolAssignments, recorder, graphCheckpointSaver, budgets);
     }
 }

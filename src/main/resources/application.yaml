@@ -52,6 +52,14 @@ server:
 # 解析规则：app.providers.<provider>.api-key 优先，未配置时回退环境变量 <PROVIDER大写>_API_KEY。
 # 因此新增供应商通常零配置——设置 MOONSHOT_API_KEY 之类的环境变量即可。
 app:
+  # 上下文预算（token，全项目统一口径 TokenEstimator）：集中管理四层预算，
+  # 详见 docs/CONTEXT_OPTIMIZATION.md——调整此处即可，无需改代码
+  context:
+    history-budget: 4000      # 路径 A 会话历史裁剪（ContextAssemblingAdvisor）
+    lead-budget: 4000         # 编排 lead 拆解 prompt（超出对目标文本尾截）
+    aggregate-budget: 12000   # 编排聚合 prompt（超出按子任务等份额截断）
+    tool-result-budget: 5000  # 单次调用工具结果注入上下文的总预算
+    tool-call-limit: 12       # 单次调用工具执行次数硬上限
   providers:
     dashscope:
       api-key: ${QWEN_API_KEY:dummy-key-for-startup}

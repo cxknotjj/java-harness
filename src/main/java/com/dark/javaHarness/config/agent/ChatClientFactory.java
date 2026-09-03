@@ -1,6 +1,8 @@
 package com.dark.javaHarness.config.agent;
 
 import com.dark.javaHarness.tool.DemoTools;
+import java.net.http.HttpClient;
+import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -8,7 +10,11 @@ import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.core.env.Environment;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.http.client.reactive.JdkClientHttpConnector;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+import org.springframework.web.reactive.function.client.WebClient;
 
 /**
  * ChatClient 工厂：负责按服务商标识 + 端点 url 构建 OpenAI 兼容的 ChatClient。
@@ -23,6 +29,13 @@ import org.springframework.stereotype.Component;
 public class ChatClientFactory {
 
     private static final Logger log = LoggerFactory.getLogger(ChatClientFactory.class);
+
+    /** HTTP 连接超时：第三方端点不可达时快速失败（秒） */
+    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
+
+    /** HTTP 读超时：LLM 生成最长等待。默认 JdkClientHttpRequestFactory 无读超时，
+     * 端点不响应会永久挂起（实测：编排卡死在 CompletableFuture.get()），必须显式设置 */
+    private static final Duration READ_TIMEOUT = Duration.ofSeconds(300);
 
     private final Environment env;
 
@@ -47,8 +60,18 @@ public class ChatClientFactory {
         }
     }
 
-    /** 按服务商 + api_url 构建 OpenAI 兼容 ChatClient；参数无效或未配置 key 返回 null */
+    /** 按服务商 + api_url 构建 OpenAI 兼容 ChatClient（模型默认思考行为）；参数无效或未配置 key 返回 null */
     public ChatClient build(String provider, String apiUrl) {
+        return build(provider, apiUrl, false);
+    }
+
+    /**
+     * 按服务商 + api_url 构建 OpenAI 兼容 ChatClient；参数无效或未配置 key 返回 null。
+     *
+     * @param disableThinking true 时阻塞调用注入 enable_thinking:false（dashscope 思考模型
+     *                        非流式单轮推理数分钟/content 为空/响应截断，见 V7 迁移说明）
+     */
+    public ChatClient build(String provider, String apiUrl, boolean disableThinking) {
         if (provider == null || apiUrl == null || apiUrl.isBlank()) {
             return null;
         }
@@ -59,9 +82,29 @@ public class ChatClientFactory {
             return null;
         }
         try {
+            // 阻塞调用通道（call）：连接/读超时防端点无响应时永久挂起
+            java.net.http.HttpClient jdkClient = HttpClient.newBuilder()
+                    .connectTimeout(CONNECT_TIMEOUT)
+                    .build();
+            JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(jdkClient);
+            requestFactory.setReadTimeout(READ_TIMEOUT);
+            RestClient.Builder restBuilder = RestClient.builder().requestFactory(requestFactory);
+            WebClient.Builder webBuilder = WebClient.builder()
+                    .clientConnector(new JdkClientHttpConnector(jdkClient));
+            if (disableThinking) {
+                // 阻塞（RestClient）与流式（WebClient）两通道都要关思考：
+                // 流式通道不关的话，思考模型的输出全在 reasoning_content，
+                // .content() 一个内容 token 都收不到（实测聚合 7s 流 0 token，最终回答为空）
+                restBuilder.requestInterceptor(new DisableThinkingInterceptor());
+                webBuilder.filter(new DisableThinkingStreamFilter());
+            }
             OpenAiApi api = OpenAiApi.builder()
                     .baseUrl(apiUrl)
                     .apiKey(apiKey)
+                    .restClientBuilder(restBuilder)
+                    // 流式调用通道（stream）：连接超时同口径；读/空闲超时由 AgentChatCaller 的
+                    // Flux.timeout 兜底（JDK 连接器无响应级超时，且项目未引入 reactor-netty）
+                    .webClientBuilder(webBuilder)
                     .build();
             OpenAiChatModel model = OpenAiChatModel.builder()
                     .openAiApi(api)

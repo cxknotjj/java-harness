@@ -306,6 +306,25 @@ class MultiAgentGraphAgentTest {
         verify(requestSpec, never()).options(any());
     }
 
+    /* ---------------- 静态 prompt 预算（PromptBudgetAdvisor 挂载） ---------------- */
+
+    /**
+     * 编排链路预算防线：lead 与聚合调用请求级挂载 PromptBudgetAdvisor，
+     * 子任务调用不挂（其动态工具结果由 ToolCallBudget 管）。
+     */
+    @Test
+    void execute_leadAndAggregateCallsCarryPromptBudgetAdvisor() {
+        stubChat(fixedContent());
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
+                null, new com.dark.javaHarness.config.ContextBudgetProperties());
+
+        agent.execute(new Goal("gb1", "调研竞品并输出报告"));
+
+        // lead 1 次 + 聚合 1 次挂载预算 advisor；子任务不挂
+        verify(requestSpec, org.mockito.Mockito.times(2))
+                .advisors(any(com.dark.javaHarness.advisor.PromptBudgetAdvisor.class));
+    }
+
     /* ---------------- 断点续跑（Checkpointer） ---------------- */
 
     /** 未启用检查点存储（构造传 null）→ resume 快速失败，抛出明确异常（无需 LLM 桩） */

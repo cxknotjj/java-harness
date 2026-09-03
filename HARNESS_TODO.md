@@ -72,6 +72,20 @@
 - [ ] **异步任务治理**：`CompletableFuture.runAsync` 改为 `@Async` + 自定义线程池，或加任务表支持失败重投
   - 验收：并发提交 10 个 Goal 稳定执行，无线程池耗尽
 
+* [ ] **prompt的动态加载：**
+  - [ ] 1.skill的动态装配
+  - [ ] 2.tool的动态装配
+  - [ ] 3.mcp的动态装配
+  - [ ] 4.agent角色prompt的组装
+  - [ ] **5.记忆上下文的动态注入**
+  - [ ] 6.**工具 Schema 的延迟加载:开始只注入对于工具的描述，只有agent明确需要调用时，才会按需提升暴漏完整tool参数**
+
+- [ ] 修复目前会话无法创建goal的问题
+- [ ] 修复进入多agent时，请求卡住的问题。
+- [ ] 客户端断开后，服务端应该终止大模型请求，避免浪费token
+
+<br />
+
 ## P1 · 能力扩展主线（产品核心价值）
 
 - [ ] **Web Search 接入**：注册搜索服务商 API（博查/Tavily/SerpAPI 等任一），新增 `search` 工具归入 `WebTools`，分配给 researcher/general——补「调研」第一步空缺，浏览器组退居 JS 渲染兜底
@@ -81,6 +95,7 @@
 - [ ] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，扩展工具生态（不再逐个自研）
   - 与 Sandbox 衔接：agentscope-runtime 内置 MCP 桥接，接入时优先评估复用（见存档「Spring AI Alibaba Sandbox 接入」条目）
   - 验收：模型可调用一个外部 MCP 工具完成真实任务
+- <br />
 
 ## P2 · 编排智能化（中期，agent 从「能跑」到「聪明」）
 
