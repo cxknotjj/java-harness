@@ -6,6 +6,7 @@ import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.openai.api.OpenAiApi;
@@ -68,8 +69,8 @@ public class ChatClientFactory {
     /**
      * 按服务商 + api_url 构建 OpenAI 兼容 ChatClient；参数无效或未配置 key 返回 null。
      *
-     * @param disableThinking true 时阻塞调用注入 enable_thinking:false（dashscope 思考模型
-     *                        非流式单轮推理数分钟/content 为空/响应截断，见 V7 迁移说明）
+     * @param disableThinking true 时模型层按请求注入 enable_thinking:false（dashscope 思考模型
+     *                        非流式单轮推理数分钟/content 为空，流式 0 token，见 V7 迁移说明）
      */
     public ChatClient build(String provider, String apiUrl, boolean disableThinking) {
         if (provider == null || apiUrl == null || apiUrl.isBlank()) {
@@ -91,13 +92,6 @@ public class ChatClientFactory {
             RestClient.Builder restBuilder = RestClient.builder().requestFactory(requestFactory);
             WebClient.Builder webBuilder = WebClient.builder()
                     .clientConnector(new JdkClientHttpConnector(jdkClient));
-            if (disableThinking) {
-                // 阻塞（RestClient）与流式（WebClient）两通道都要关思考：
-                // 流式通道不关的话，思考模型的输出全在 reasoning_content，
-                // .content() 一个内容 token 都收不到（实测聚合 7s 流 0 token，最终回答为空）
-                restBuilder.requestInterceptor(new DisableThinkingInterceptor());
-                webBuilder.filter(new DisableThinkingStreamFilter());
-            }
             OpenAiApi api = OpenAiApi.builder()
                     .baseUrl(apiUrl)
                     .apiKey(apiKey)
@@ -110,7 +104,10 @@ public class ChatClientFactory {
                     .openAiApi(api)
                     .defaultOptions(OpenAiChatOptions.builder().build())
                     .build();
-            return ChatClient.builder(model)
+            // 思考端点：模型层包装器按请求注入 enable_thinking:false（defaultOptions.extraBody
+            // 在带运行时选项的调用模式下不生效，见 ThinkingSwitchChatModel 类注释）
+            ChatModel effective = disableThinking ? new ThinkingSwitchChatModel(model) : model;
+            return ChatClient.builder(effective)
                     .defaultTools(new DemoTools())
                     .build();
         } catch (Exception e) {
