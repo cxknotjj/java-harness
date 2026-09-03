@@ -92,10 +92,9 @@
   - 验收：researcher 对「近期事件」类问题能返回带来源的检索结果
 - [ ] **RAG 知识库**：引入向量库（pgvector 优先，因其已在依赖管理中）+ Spring AI `VectorStore`；文档摄取管道（切分/嵌入/入库）+ 路径 A/B 检索增强
   - 验收：能对本地文档做"知识库问答"，答案带出处
-- [ ] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，扩展工具生态（不再逐个自研）
+- [x] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，扩展工具生态（不再逐个自研）
   - 与 Sandbox 衔接：agentscope-runtime 内置 MCP 桥接，接入时优先评估复用（见存档「Spring AI Alibaba Sandbox 接入」条目）
   - 验收：模型可调用一个外部 MCP 工具完成真实任务
-- <br />
 
 ## P2 · 编排智能化（中期，agent 从「能跑」到「聪明」）
 
