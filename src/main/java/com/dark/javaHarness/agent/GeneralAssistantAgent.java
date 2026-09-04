@@ -11,7 +11,7 @@ import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
 import com.dark.javaHarness.tool.ToolCallTracer;
-import com.dark.javaHarness.tool.ToolLazyManager;
+import com.dark.javaHarness.prompt.ToolLazyManager;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;

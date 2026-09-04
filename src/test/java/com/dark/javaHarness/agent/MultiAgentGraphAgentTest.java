@@ -559,4 +559,82 @@ class MultiAgentGraphAgentTest {
         assertTrue(rows.stream().noneMatch(fixedContent()::equals),
                 "断连中止后不应产出完整最终回答, 实际帧序列: " + rows);
     }
+
+    /**
+     * 聚合流式失败自愈（Spec：聚合只有流式一条语义路径，不再回退阻塞调用）：
+     * lead + 2 子任务正常完成 → 聚合首试流式异常（0 token，模拟厂商挂死超时）→
+     * 护栏重试一次（仍走流式通道）→ 重试成功产出最终回答。
+     */
+    @Test
+    void executeStreamReactive_aggregateStreamZeroTokenFailure_retriesStreaming() {
+        java.util.concurrent.atomic.AtomicInteger contentCalls = new java.util.concurrent.atomic.AtomicInteger();
+        when(clientRegistry.get(any())).thenReturn(chatClient);
+        when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
+        lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
+        when(chatClient.prompt()).thenReturn(requestSpec);
+        when(requestSpec.system(anyString())).thenReturn(requestSpec);
+        when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        when(requestSpec.stream()).thenReturn(streamSpec);
+        when(streamSpec.content()).thenAnswer(inv -> {
+            int call = contentCalls.incrementAndGet();
+            if (call <= 3) {
+                return Flux.just(fixedContent()); // lead + 2 子任务正常完成
+            }
+            if (call == 4) {
+                return Flux.error(new RuntimeException("模拟厂商端挂死超时")); // 聚合首试失败（0 token）
+            }
+            return Flux.just(fixedContent()); // 聚合重试成功
+        });
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
+
+        java.util.List<String> rows = agent
+                .executeStreamReactive(new Goal("g11", "调研竞品并输出报告"))
+                .collectList()
+                .block(java.time.Duration.ofSeconds(10));
+
+        assertNotNull(rows);
+        assertEquals(fixedContent(), rows.get(rows.size() - 1), "重试成功应以最终回答收尾");
+        // lead(1) + 子任务(2) + 聚合首试(1) + 聚合重试(1)，无阻塞兜底调用
+        assertEquals(5, contentCalls.get(), "聚合失败应流式重试一次而非回退阻塞调用");
+    }
+
+    /**
+     * 聚合已推出部分 token 后失败：不重试（重试会造成内容重复），以已收内容为准收尾。
+     */
+    @Test
+    void executeStreamReactive_aggregatePartialTokenFailure_noRetry() {
+        java.util.concurrent.atomic.AtomicInteger contentCalls = new java.util.concurrent.atomic.AtomicInteger();
+        when(clientRegistry.get(any())).thenReturn(chatClient);
+        when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
+        lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
+        when(chatClient.prompt()).thenReturn(requestSpec);
+        when(requestSpec.system(anyString())).thenReturn(requestSpec);
+        when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        when(requestSpec.stream()).thenReturn(streamSpec);
+        when(streamSpec.content()).thenAnswer(inv -> {
+            int call = contentCalls.incrementAndGet();
+            if (call <= 3) {
+                return Flux.just(fixedContent()); // lead + 2 子任务正常完成
+            }
+            // 聚合：先推一个 token 再失败（部分输出）
+            return Flux.concat(Flux.just("部分"), Flux.error(new RuntimeException("中途失败")));
+        });
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
+
+        java.util.List<String> rows = new java.util.concurrent.CopyOnWriteArrayList<>();
+        agent.executeStreamReactive(new Goal("g12", "调研竞品并输出报告"))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                .subscribe(rows::add);
+        try {
+            Thread.sleep(800);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // lead(1) + 子任务(2) + 聚合(1)：已推 token 后失败不重试
+        assertEquals(4, contentCalls.get(), "已推出部分 token 后不得重试（内容重复风险）");
+        assertTrue(rows.contains("部分"), "已收内容应作为部分输出保留, 实际帧序列: " + rows);
+        assertTrue(rows.stream().noneMatch(fixedContent()::equals),
+                "部分输出后不应出现完整重发内容, 实际帧序列: " + rows);
+    }
 }

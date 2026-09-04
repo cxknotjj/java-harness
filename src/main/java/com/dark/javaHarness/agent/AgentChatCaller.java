@@ -14,7 +14,7 @@ import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
 import com.dark.javaHarness.tool.ToolCallBudget;
 import com.dark.javaHarness.tool.ToolCallTracer;
-import com.dark.javaHarness.tool.ToolLazyManager;
+import com.dark.javaHarness.prompt.ToolLazyManager;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
@@ -58,8 +58,13 @@ final class AgentChatCaller {
     private static final org.slf4j.Logger log =
             org.slf4j.LoggerFactory.getLogger(AgentChatCaller.class);
 
-    /** 流式调用空闲超时：相邻 token 间隔超过该时长即判定端点挂起，超时失败进入调用方回退/重试逻辑 */
-    private static final java.time.Duration STREAM_IDLE_TIMEOUT = java.time.Duration.ofSeconds(300);
+    /**
+     * 流式调用空闲超时：相邻信号间隔超过该时长即判定端点挂起，超时失败（不可重试——
+     * 实测厂商端对该类请求为稳定挂死，重试同请求只会成倍放大等待）。
+     * 取值依据：工具执行期是流上最长的正常静默（fetchUrl/browser 实测 ~8s），
+     * 120s 已有 10 倍余量；300s 旧值曾让挂死请求阻塞用户 5 分钟才失败。
+     */
+    private static final java.time.Duration STREAM_IDLE_TIMEOUT = java.time.Duration.ofSeconds(120);
 
     /** 取消异常消息（llm_call_log.error_msg 检索用）：客户端断连中止在途请求 */
     private static final String CANCELLED_MSG = "client-cancelled: 客户端断连，中止在途请求";

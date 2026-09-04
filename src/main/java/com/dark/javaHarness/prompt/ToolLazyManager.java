@@ -1,4 +1,6 @@
-package com.dark.javaHarness.tool;
+package com.dark.javaHarness.prompt;
+
+import com.dark.javaHarness.tool.ToolAssignments;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;

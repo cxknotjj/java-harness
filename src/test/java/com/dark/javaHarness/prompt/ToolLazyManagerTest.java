@@ -1,4 +1,9 @@
-package com.dark.javaHarness.tool;
+package com.dark.javaHarness.prompt;
+
+import com.dark.javaHarness.tool.McpToolProvider;
+import com.dark.javaHarness.tool.SandboxToolProvider;
+import com.dark.javaHarness.tool.ToolAssignments;
+import com.dark.javaHarness.tool.WebTools;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;

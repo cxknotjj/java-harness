@@ -20,7 +20,7 @@ import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
-import com.dark.javaHarness.tool.ToolLazyManager;
+import com.dark.javaHarness.prompt.ToolLazyManager;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
@@ -598,10 +598,13 @@ public class MultiAgentGraphAgent implements Agent {
     }
 
     /**
-     * 流式聚合：首个内容 token 前推「聚合」进度行，随后逐 token 实时发射；
-     * 流式异常或 0 个内容 token 时回退阻塞调用——已推出过 token 则以已收内容为准（避免内容重复），
-     * 一个 token 都没推过则整段回退（主干 toRows 会兜底发聚合进度+完整内容）。
-     * 例外：客户端断连中止（取消异常）不回退、部分输出不按成功返回，取消异常向上传播。
+     * 流式聚合：首个内容 token 前推「聚合」进度行，随后逐 token 实时发射（聚合只有流式一条语义路径）。
+     * 失败自愈（带护栏的流式重试，不再回退阻塞调用）：
+     * - 流式异常且未推出任何 token（挂死超时等首 token 前失败）→ 流式重试一次；
+     * - 流式成功但 0 个内容 token（思考模型输出全在 reasoning_content 等）→ 流式重试一次；
+     * - 已推出 token 后失败 → 不重试（重试会造成内容重复），以已收内容为准；
+     * - 重试后仍失败 / 仍 0 token → 上抛（编排按失败收尾，不再以阻塞调用兜底）。
+     * 例外：客户端断连中止（取消异常）不重试、部分输出不按成功返回，取消异常向上传播。
      */
     private String predictAggregateStreaming(String sessionId,
                                              List<String> results,
@@ -612,33 +615,62 @@ public class MultiAgentGraphAgent implements Agent {
                 ProgressLine.encode("聚合", "汇总子任务结果，生成最终回答"));
         StringBuilder collected = new StringBuilder();
         try {
-            chatCaller.stream(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT,
-                    aggregateUserPrompt(results),
-                    token -> {
-                        if (token == null || token.isEmpty()) {
-                            return;
-                        }
-                        collected.append(token);
-                        contentSent.set(true);
-                        BranchProgressListener.tryEmitSerialized(liveTokens, token);
-                    },
-                    null,
-                    new PromptBudgetAdvisor[]{aggregateBudgetAdvisor()},
-                    cancelled == null ? null : cancelled::get);
-            // 流式成功但 0 个内容 token（思考模型流式输出全在 reasoning_content 等）：
-            // 不能把空串当最终回答落 final（CLI 会回显目标本身），回退阻塞调用兜底
-            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results, cancelled);
+            streamAggregateOnce(sessionId, results, collected, liveTokens, contentSent, cancelled);
+            if (collected.length() > 0) {
+                return collected.toString();
+            }
+            log.warn("[multi-agent][aggregate] 流式聚合 0 个内容 token，流式重试一次");
         } catch (Exception e) {
-            // 客户端断连中止：取消不是流式失败，禁止回退阻塞调用/以部分输出充数——原样上抛
+            // 客户端断连中止：取消不是流式失败，禁止重试/以部分输出充数——原样上抛
             if (e instanceof CancellationException ce) {
                 throw ce;
             }
             if (isCancelled(cancelled)) {
                 throw AgentChatCaller.cancelException();
             }
-            log.warn("[multi-agent][aggregate] 流式聚合失败，回退阻塞调用：{}", safe(e));
-            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results, cancelled);
+            if (collected.length() > 0) {
+                // 已推 token 后失败：重试会内容重复，以已收内容为准
+                log.warn("[multi-agent][aggregate] 流式聚合失败（已推出部分 token，不重试）：{}", safe(e));
+                return collected.toString();
+            }
+            log.warn("[multi-agent][aggregate] 流式聚合失败，流式重试一次：{}", safe(e));
         }
+        // 护栏重试：到达此处必然未推出任何 token（重试零内容重复风险）
+        try {
+            streamAggregateOnce(sessionId, results, collected, liveTokens, contentSent, cancelled);
+        } catch (Exception e2) {
+            if (e2 instanceof CancellationException ce) {
+                throw ce;
+            }
+            if (isCancelled(cancelled)) {
+                throw AgentChatCaller.cancelException();
+            }
+            log.warn("[multi-agent][aggregate] 聚合流式重试仍失败：{}", safe(e2));
+            throw e2;
+        }
+        if (collected.length() == 0) {
+            throw new IllegalStateException("聚合流式重试后仍无内容输出");
+        }
+        return collected.toString();
+    }
+
+    /** 聚合单次流式尝试：token 追加进 collected 并经旁路发射（成败处置由调用方负责） */
+    private void streamAggregateOnce(String sessionId, List<String> results, StringBuilder collected,
+                                     Sinks.Many<String> liveTokens, AtomicBoolean contentSent,
+                                     AtomicBoolean cancelled) {
+        chatCaller.stream(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT,
+                aggregateUserPrompt(results),
+                token -> {
+                    if (token == null || token.isEmpty()) {
+                        return;
+                    }
+                    collected.append(token);
+                    contentSent.set(true);
+                    BranchProgressListener.tryEmitSerialized(liveTokens, token);
+                },
+                null,
+                new PromptBudgetAdvisor[]{aggregateBudgetAdvisor()},
+                cancelled == null ? null : cancelled::get);
     }
 
     /* ---------- ChatClient 单次调用 ---------- */
@@ -696,7 +728,10 @@ public class MultiAgentGraphAgent implements Agent {
                 new PromptBudgetAdvisor[0], cancelled == null ? null : cancelled::get);
     }
 
-    /** 聚合阻塞调用（同步路径 cancelled 为 null 行为不变；流式回退路径传共享断连标志） */
+    /**
+     * 聚合阻塞语义调用，仅服务同步编排路径（execute，liveTokens=null）；
+     * 流式路径的失败自愈已改为带护栏的流式重试（见 {@link #predictAggregateStreaming}），不再经此兜底。
+     */
     private String predictAggregate(String sessionId, List<String> results, AtomicBoolean cancelled) {
         return chatCaller.call(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, aggregateUserPrompt(results),
                 null, new PromptBudgetAdvisor[]{aggregateBudgetAdvisor()},
