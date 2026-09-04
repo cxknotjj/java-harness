@@ -1,5 +1,11 @@
 <div align="center">
 
+[简体中文](README.md) | [English](README_EN.md)
+
+</div>
+
+<div align="center">
+
 # ☕ javaHarness
 
 **基于 Spring AI 的 AI Agent 编排框架 —— 目标驱动的多 Agent 执行外壳**
