@@ -12,6 +12,8 @@ import com.dark.javaHarness.tool.ToolCallBudget;
 import com.dark.javaHarness.tool.ToolCallTracer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
@@ -30,8 +32,12 @@ import org.springframework.ai.tool.ToolCallback;
  * 无表配置时回退内置默认 system 并拼接兜底指令。
  *
  * <p>观测：每次调用结束（成功/失败）经 {@link LlmCallRecorder} 异步记录耗时与 token
- * 消耗——阻塞调用取响应 usage 真实值，流式调用无 usage 回包、按输出文本近似估算。
- * 观测失败不影响调用本身。
+ * 消耗——call/stream 统一走流式通道后无 usage 回包，token 按输出文本近似估算
+ * （tokensEstimated=true）。观测失败不影响调用本身。
+ *
+ * <p>取消（客户端断连防 token 浪费）：call/stream 均接受可空 {@link BooleanSupplier}
+ * 取消令牌——置位后在下一个 token 边界中止在途请求（取消向上传播关闭 HTTP 连接，
+ * 厂商端停止生成），抛 {@link CancellationException}；不重试、部分输出不按成功返回。
  */
 final class AgentChatCaller {
 
@@ -40,6 +46,14 @@ final class AgentChatCaller {
 
     /** 流式调用空闲超时：相邻 token 间隔超过该时长即判定端点挂起，超时失败进入调用方回退/重试逻辑 */
     private static final java.time.Duration STREAM_IDLE_TIMEOUT = java.time.Duration.ofSeconds(300);
+
+    /** 取消异常消息（llm_call_log.error_msg 检索用）：客户端断连中止在途请求 */
+    private static final String CANCELLED_MSG = "client-cancelled: 客户端断连，中止在途请求";
+
+    /** 取消异常工厂（包级共用：编排节点捕获后需重新抛出同语义异常） */
+    static CancellationException cancelException() {
+        return new CancellationException(CANCELLED_MSG);
+    }
 
     /** 默认系统提示词（agent 表无对应行或 prompt 为空时的兜底） */
     private static final String DEFAULT_SYSTEM_PROMPT =
@@ -95,7 +109,7 @@ final class AgentChatCaller {
 
     /** 带会话观测的单次调用（推荐入口：sessionId 用于 llm_call_log 归因） */
     String call(String sessionId, String forAgent, String fallbackSystem, String user) {
-        return call(sessionId, forAgent, fallbackSystem, user, null, new Advisor[0]);
+        return call(sessionId, forAgent, fallbackSystem, user, null, new Advisor[0], null);
     }
 
     /**
@@ -104,18 +118,40 @@ final class AgentChatCaller {
      */
     String call(String sessionId, String forAgent, String fallbackSystem, String user,
                 Consumer<String> toolEmitter, Advisor... extraAdvisors) {
+        return call(sessionId, forAgent, fallbackSystem, user, toolEmitter, extraAdvisors, null);
+    }
+
+    /**
+     * 带取消令牌的单次调用（编排节点传入共享断连标志）。
+     *
+     * <p>实现说明：底层统一走流式通道收集完整内容返回——RestClient 阻塞调用不可中断
+     * （JDK HttpClient 不响应线程中断），流式是 Spring AI 1.1.4 + JDK 连接器下唯一
+     * 能中止在途 HTTP 请求的通道；代价是 token 用量从响应 usage 真实值变为估算。
+     *
+     * <p>取消语义：cancelled 已置位时直接抛 {@link CancellationException}（零 HTTP 请求）；
+     * 执行中置位时在下一个 token 边界中止并抛出——不重试、部分输出不按成功返回。
+     */
+    String call(String sessionId, String forAgent, String fallbackSystem, String user,
+                Consumer<String> toolEmitter, Advisor[] extraAdvisors, BooleanSupplier cancelled) {
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
         // 模型调用失败自动重试（最多 3 次、指数退避）；单次调用含观测埋点
         return retry.executeWithRetry(() -> {
             long start = System.currentTimeMillis();
             try {
-                return invokeAndRecord(config, sessionId, forAgent, fallbackSystem, user,
-                        toolEmitter, false, model, start, extraAdvisors);
+                String content = streamAttempt(config, forAgent, fallbackSystem, user,
+                        toolEmitter, false, extraAdvisors, null, cancelled);
+                recordOkEstimated(sessionId, forAgent, model, start, content);
+                return content;
             } catch (RuntimeException e) {
+                // 客户端断连中止：记录后立即上抛（CancellationException 不可重试，直接放行）
+                if (e instanceof CancellationException) {
+                    recordError(sessionId, forAgent, model, true, start, e);
+                    throw e;
+                }
                 // 账户级硬错误（余额不足/配额耗尽）：重试无意义，立即转人话异常向上传播
                 if (ModelQuotaException.matches(e)) {
-                    recordError(sessionId, forAgent, model, false, start, e);
+                    recordError(sessionId, forAgent, model, true, start, e);
                     throw ModelQuotaException.from(e, model);
                 }
                 // 模型可能把提示词里的专家名（researcher 等）误当工具发起调用——
@@ -125,14 +161,16 @@ final class AgentChatCaller {
                     log.warn("[caller] {} 发起未知名工具调用，去工具重试一次：{}", forAgent, safeMsg(e));
                     long start2 = System.currentTimeMillis();
                     try {
-                        return invokeAndRecord(config, sessionId, forAgent, fallbackSystem, user,
-                                null, true, model, start2, extraAdvisors);
+                        String content = streamAttempt(config, forAgent, fallbackSystem, user,
+                                null, true, extraAdvisors, null, cancelled);
+                        recordOkEstimated(sessionId, forAgent, model, start2, content);
+                        return content;
                     } catch (RuntimeException e2) {
-                        recordError(sessionId, forAgent, model, false, start2, e2);
+                        recordError(sessionId, forAgent, model, true, start2, e2);
                         throw e2;
                     }
                 }
-                recordError(sessionId, forAgent, model, false, start, e);
+                recordError(sessionId, forAgent, model, true, start, e);
                 throw e;
             }
         });
@@ -142,12 +180,9 @@ final class AgentChatCaller {
     String invokeAndRecord(AgentConfig config, String sessionId, String forAgent,
                            String fallbackSystem, String user, Consumer<String> toolEmitter,
                            boolean disableTools, String model, long start, Advisor... extraAdvisors) {
-        org.springframework.ai.chat.model.ChatResponse resp =
-                buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
-                        .call().chatResponse();
-        String content = contentOf(resp);
-        Usage usage = usageOf(resp);
-        recordOk(sessionId, forAgent, model, false, usage, start, content);
+        String content = streamAttempt(config, forAgent, fallbackSystem, user,
+                toolEmitter, disableTools, extraAdvisors, null, null);
+        recordOkEstimated(sessionId, forAgent, model, start, content);
         return content;
     }
 
@@ -155,6 +190,53 @@ final class AgentChatCaller {
     private static boolean isUnknownToolCall(RuntimeException e) {
         String msg = e.getMessage();
         return msg != null && msg.contains("No ToolCallback found for tool name");
+    }
+
+    /**
+     * 单次流式调用尝试（不做重试——重试由 call 的 {@link LlmRetry} / stream 的循环自行处理）：
+     * 收集全部 token 阻塞至流结束，返回完整内容；onToken 可 null（无需实时回调）。
+     *
+     * <p>取消语义：cancelled 已置位时直接抛取消异常（零 HTTP 请求）；执行中置位时
+     * takeUntil 在下一个 token 边界中止订阅——取消向上传播关闭 HTTP 连接（厂商端
+     * 停止生成），部分输出不返回。
+     */
+    private String streamAttempt(AgentConfig config, String forAgent, String fallbackSystem, String user,
+                                 Consumer<String> toolEmitter, boolean disableTools, Advisor[] extraAdvisors,
+                                 Consumer<String> onToken, BooleanSupplier cancelled) {
+        if (cancelled != null && cancelled.getAsBoolean()) {
+            throw cancelException();
+        }
+        StringBuilder collected = new StringBuilder();
+        try {
+            buildSpec(config, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
+                    .stream()
+                    .content()
+                    // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
+                    .timeout(STREAM_IDLE_TIMEOUT)
+                    .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
+                    .doOnNext(token -> {
+                        if (cancelled != null && cancelled.getAsBoolean()) {
+                            // takeUntil 放行的终止前元素在此拦截；异常致流以错误终止，
+                            // Reactor cancel 向上游传播关闭 HTTP 连接
+                            throw cancelException();
+                        }
+                        collected.append(token);
+                        if (onToken != null) {
+                            onToken.accept(token);
+                        }
+                    })
+                    .blockLast();
+        } catch (RuntimeException e) {
+            // 取消置位时一律按取消归因（流取消竞态下 blockLast 可能抛出其他形态异常）
+            if (cancelled != null && cancelled.getAsBoolean()) {
+                throw cancelException();
+            }
+            throw e;
+        }
+        if (cancelled != null && cancelled.getAsBoolean()) {
+            throw cancelException();
+        }
+        return collected.toString();
     }
 
     /** 模型空响应防御：逐层取 assistant 文本，任一层缺失返回 null（call/stream 记录与展示共用） */
@@ -192,10 +274,27 @@ final class AgentChatCaller {
      */
     String stream(String sessionId, String forAgent, String fallbackSystem, String user,
                   Consumer<String> onToken, Consumer<String> toolEmitter, Advisor... extraAdvisors) {
+        return stream(sessionId, forAgent, fallbackSystem, user, onToken, toolEmitter, extraAdvisors, null);
+    }
+
+    /**
+     * 带取消令牌的流式调用（编排节点传入共享断连标志）：取消已置位时立即抛取消异常
+     * （零 HTTP 请求）；执行中置位时在下一个 token 边界中止（takeUntil 取消向上传播
+     * 关闭 HTTP 连接），抛取消异常——不重试、部分输出不按成功返回。
+     */
+    String stream(String sessionId, String forAgent, String fallbackSystem, String user,
+                  Consumer<String> onToken, Consumer<String> toolEmitter, Advisor[] extraAdvisors,
+                  BooleanSupplier cancelled) {
+        if (cancelled != null && cancelled.getAsBoolean()) {
+            recordError(sessionId, forAgent, null, true, System.currentTimeMillis(),
+                    cancelException());
+            throw cancelException();
+        }
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
         // 流式重试约束：仅「首个 token 尚未发出」的失败才允许重试（一旦开始输出，
         // onToken 已回调、无法回滚，重试会造成重复输出）；已产生输出则立即抛出。
+        // 取消异常永不重试（取消不是可重试错误，是断连语义）。
         for (int attempt = 1; attempt <= retry.maxAttempts(); attempt++) {
             long start = System.currentTimeMillis();
             StringBuilder collected = new StringBuilder();
@@ -205,12 +304,24 @@ final class AgentChatCaller {
                         .content()
                         // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
                         .timeout(STREAM_IDLE_TIMEOUT)
+                        .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
                         .doOnNext(token -> {
+                            if (cancelled != null && cancelled.getAsBoolean()) {
+                                // takeUntil 放行的终止前元素在此拦截，取消向上传播关连接
+                                throw cancelException();
+                            }
                             collected.append(token);
                             onToken.accept(token);
                         })
                         .blockLast();
             } catch (RuntimeException e) {
+                boolean isCancel = e instanceof CancellationException
+                        || (cancelled != null && cancelled.getAsBoolean());
+                if (isCancel) {
+                    recordError(sessionId, forAgent, model, true, start,
+                            cancelException());
+                    throw cancelException();
+                }
                 recordError(sessionId, forAgent, model, true, start, e);
                 // 账户级硬错误：与阻塞（call）路径同口径转换，不重试直接抛人话异常
                 if (ModelQuotaException.matches(e)) {
@@ -223,6 +334,12 @@ final class AgentChatCaller {
                     continue;
                 }
                 throw e;
+            }
+            if (cancelled != null && cancelled.getAsBoolean()) {
+                // 流正常结束但取消竞态置位：不按成功返回
+                recordError(sessionId, forAgent, model, true, start,
+                        cancelException());
+                throw cancelException();
             }
             // 流式无 usage 回包：按已收输出文本近似估算（与 ContextAssemblingAdvisor 同口径）
             String out = collected.toString();
@@ -300,6 +417,12 @@ final class AgentChatCaller {
     private AgentConfig configOf(String forAgent) {
         return agentService == null ? null
                 : agentService.getAgentConfig(forAgent).orElse(null);
+    }
+
+    /** 成功记录（流式估算口径）：call 统一走流式通道无 usage 回包，按输出文本近似估算 token */
+    private void recordOkEstimated(String sessionId, String agentName, String model, long start, String content) {
+        int tokens = LlmCallRecorder.estimateTokens(content);
+        record(sessionId, agentName, model, true, true, null, tokens, tokens, start, null);
     }
 
     /** 成功记录：usage 可解析则记真实 token，否则留空 */

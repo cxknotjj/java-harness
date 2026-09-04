@@ -25,6 +25,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
@@ -471,7 +472,7 @@ public class MultiAgentGraphAgent implements Agent {
         }
         String objective = state.value(K_OBJECTIVE, String.class).orElse("");
         String sessionId = state.value(K_SESSION_ID, String.class).orElse(null);
-        String content = predictLeadLogged(sessionId, objective);
+        String content = predictLeadLogged(sessionId, objective, cancelled);
         List<Subtask> items = parseSubtasks(content);
         if (items.isEmpty()) {
             items.add(new Subtask(objective, null)); // 拆解失败：退化为单个子任务=objective
@@ -503,7 +504,7 @@ public class MultiAgentGraphAgent implements Agent {
         }
         String expert = state.value(K_SUBTASK_AGENT_PREFIX + idx, String.class).orElse(null);
         String sessionId = state.value(K_SESSION_ID, String.class).orElse(null);
-        String result = predictSubtask(sessionId, task, expert, toolEmitter);
+        String result = predictSubtask(sessionId, task, expert, toolEmitter, cancelled);
         Map<String, Object> updates = new HashMap<>();
         updates.put(K_RESULT_PREFIX + idx, result);
         log.info("[multi-agent][subtask-{}] 完成（专家={}），结果长度={}", idx, expert, result.length());
@@ -542,9 +543,10 @@ public class MultiAgentGraphAgent implements Agent {
             // 子任务全失败：兜底
             finalAnswer = state.value(K_FINAL, String.class).orElse("（未生成最终回答）");
         } else if (liveTokens == null) {
-            finalAnswer = predictAggregate(sessionId, results);
+            // 同步路径 cancelled 为 null（无取消语义），流式路径传共享断连标志
+            finalAnswer = predictAggregate(sessionId, results, cancelled);
         } else {
-            finalAnswer = predictAggregateStreaming(sessionId, results, liveTokens, contentSent);
+            finalAnswer = predictAggregateStreaming(sessionId, results, liveTokens, contentSent, cancelled);
         }
         Map<String, Object> updates = new HashMap<>();
         updates.put(K_FINAL, finalAnswer);
@@ -556,11 +558,13 @@ public class MultiAgentGraphAgent implements Agent {
      * 流式聚合：首个内容 token 前推「聚合」进度行，随后逐 token 实时发射；
      * 流式异常或 0 个内容 token 时回退阻塞调用——已推出过 token 则以已收内容为准（避免内容重复），
      * 一个 token 都没推过则整段回退（主干 toRows 会兜底发聚合进度+完整内容）。
+     * 例外：客户端断连中止（取消异常）不回退、部分输出不按成功返回，取消异常向上传播。
      */
     private String predictAggregateStreaming(String sessionId,
                                              List<String> results,
                                              Sinks.Many<String> liveTokens,
-                                             AtomicBoolean contentSent) {
+                                             AtomicBoolean contentSent,
+                                             AtomicBoolean cancelled) {
         BranchProgressListener.tryEmitSerialized(liveTokens,
                 ProgressLine.encode("聚合", "汇总子任务结果，生成最终回答"));
         StringBuilder collected = new StringBuilder();
@@ -576,13 +580,21 @@ public class MultiAgentGraphAgent implements Agent {
                         BranchProgressListener.tryEmitSerialized(liveTokens, token);
                     },
                     null,
-                    aggregateBudgetAdvisor());
+                    new PromptBudgetAdvisor[]{aggregateBudgetAdvisor()},
+                    cancelled == null ? null : cancelled::get);
             // 流式成功但 0 个内容 token（思考模型流式输出全在 reasoning_content 等）：
             // 不能把空串当最终回答落 final（CLI 会回显目标本身），回退阻塞调用兜底
-            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results);
+            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results, cancelled);
         } catch (Exception e) {
+            // 客户端断连中止：取消不是流式失败，禁止回退阻塞调用/以部分输出充数——原样上抛
+            if (e instanceof CancellationException ce) {
+                throw ce;
+            }
+            if (isCancelled(cancelled)) {
+                throw AgentChatCaller.cancelException();
+            }
             log.warn("[multi-agent][aggregate] 流式聚合失败，回退阻塞调用：{}", safe(e));
-            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results);
+            return collected.length() > 0 ? collected.toString() : predictAggregate(sessionId, results, cancelled);
         }
     }
 
@@ -606,21 +618,31 @@ public class MultiAgentGraphAgent implements Agent {
     /** 聚合 user 内容的子任务节头（与 {@link #aggregateUserPrompt} 的拼接格式对应） */
     private static final Pattern AGG_SECTION_HEADER = Pattern.compile("【子任务\\d+】");
 
-    /** lead 拆解：按 agent 表 lead 行的提示词/模型执行（无配置时回退内置兜底）；目标超长尾截至 lead 预算 */
-    private String predictLead(String sessionId, String objective) {
+    /**
+     * lead 拆解：按 agent 表 lead 行的提示词/模型执行（无配置时回退内置兜底）；目标超长尾截至 lead 预算。
+     * cancelled 传节点共享断连标志（同步路径为 null）：调用前已置位直接抛取消异常（零 HTTP 请求），
+     * 执行中置位在下一个 token 边界中止在途请求。
+     */
+    private String predictLead(String sessionId, String objective, AtomicBoolean cancelled) {
         return chatCaller.call(sessionId, ROLE_LEAD, LEAD_FALLBACK_PROMPT, "拆解目标：" + objective,
-                null, PromptBudgetAdvisor.tail(budgets.getLeadBudget()));
+                null, new PromptBudgetAdvisor[]{PromptBudgetAdvisor.tail(budgets.getLeadBudget())},
+                cancelled == null ? null : cancelled::get);
     }
 
     /** lead 拆解前日志埋点便于诊断专家指派（raw 输出统一记审计） */
-    private String predictLeadLogged(String sessionId, String objective) {
-        String raw = predictLead(sessionId, objective);
+    private String predictLeadLogged(String sessionId, String objective, AtomicBoolean cancelled) {
+        String raw = predictLead(sessionId, objective, cancelled);
         log.info("[multi-agent][lead] raw 拆解输出: {}", raw.length() > 300 ? raw.substring(0, 300) + "..." : raw);
         return raw;
     }
 
+    /**
+     * 子任务执行：按指派专家查配置调用（cancelled 传节点共享断连标志，同步路径为 null——
+     * 执行中置位时在途调用随令牌中止，不再烧完剩余 token）。
+     */
     private String predictSubtask(String sessionId, String task, String expert,
-                                  java.util.function.Consumer<String> toolEmitter) {
+                                  java.util.function.Consumer<String> toolEmitter,
+                                  AtomicBoolean cancelled) {
         // 未指派（lead 输出旧格式或漏 agent 字段）→ 回退 general：通用兜底且持有全量工具
         String resolved = (expert == null || expert.isBlank())
                 ? AgentConstants.DEFAULT_AGENT : expert;
@@ -630,12 +652,15 @@ public class MultiAgentGraphAgent implements Agent {
                 + "只是你的身份标识，绝不是可调用的工具。"
                 + "工具使用纪律：网络类工具（fetchUrl/browser_navigate 等抓取与浏览）合计调用不超过 8 次；"
                 + "同一 URL 只抓取一次；优先一次抓取多角度提取信息，材料足以支撑结论时立即停止调用工具并输出结果。";
-        return chatCaller.call(sessionId, resolved, persona, task, toolEmitter);
+        return chatCaller.call(sessionId, resolved, persona, task, toolEmitter,
+                new PromptBudgetAdvisor[0], cancelled == null ? null : cancelled::get);
     }
 
-    private String predictAggregate(String sessionId, List<String> results) {
+    /** 聚合阻塞调用（同步路径 cancelled 为 null 行为不变；流式回退路径传共享断连标志） */
+    private String predictAggregate(String sessionId, List<String> results, AtomicBoolean cancelled) {
         return chatCaller.call(sessionId, ROLE_AGGREGATOR, AGGREGATOR_FALLBACK_PROMPT, aggregateUserPrompt(results),
-                null, aggregateBudgetAdvisor());
+                null, new PromptBudgetAdvisor[]{aggregateBudgetAdvisor()},
+                cancelled == null ? null : cancelled::get);
     }
 
     /** 聚合预算 advisor：按「【子任务N】」节边界等份额截断（禁止先到先得挤掉后面的子任务） */

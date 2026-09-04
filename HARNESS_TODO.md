@@ -80,9 +80,10 @@
   - [ ] **5.记忆上下文的动态注入**
   - [ ] 6.**工具 Schema 的延迟加载:开始只注入对于工具的描述，只有agent明确需要调用时，才会按需提升暴漏完整tool参数**
 
-- [ ] 修复目前会话无法创建goal的问题
+- [x] 修复目前会话无法创建goal的问题
 - [ ] 修复进入多agent时，请求卡住的问题。
-- [ ] 客户端断开后，服务端应该终止大模型请求，避免浪费token
+- [x] 客户端断开后，服务端应该终止大模型请求，避免浪费token
+  - 实现：`AgentChatCaller.call()` 统一流式背书（RestClient 阻塞调用不可中断，流式是唯一可中止通道），`BooleanSupplier` 取消令牌贯穿 call/stream，`takeUntil` 在 token 边界中止在途请求；详见存档「并发断连的可观测处理」
 
 <br />
 
@@ -157,7 +158,8 @@
 - [x] **并发断连的可观测处理**：闭环「降噪 + 及时终止编排」：
   - 降噪：`ClientAbortLogFilter`（logback TurboFilter）DENY 框架 logger 的断连 ERROR；`GlobalExceptionHandler` 专 handler（AsyncRequestNotUsableException）+ 兜底 `isClientAbort` 均降级 warn 单行，业务异常不误杀
   - 取消传播：`ChatServiceImpl.doOnCancel` warn 单行（sid）→ `AgentServiceImpl.doOnCancel` goal 落库 FAILED，不残留 RUNNING
-  - 编排终止：`MultiAgentGraphAgent` 主干 `doFinally(CANCEL)` 置位 cancelled → lead/子任务/聚合节点执行前短路，cancel 后零次新 LLM 调用（进行中阻塞调用自然结束是已知限制）；路径 A 响应式 cancel 天然终止
+  - 编排终止：`MultiAgentGraphAgent` 主干 `doFinally(CANCEL)` 置位 cancelled → lead/子任务/聚合节点执行前短路，cancel 后零次新 LLM 调用；路径 A 响应式 cancel 天然终止
+  - 在途中止（2026-09 补齐）：`AgentChatCaller.call()` 改为流式通道背书（RestClient 阻塞调用不可中断，JDK HttpClient 不响应线程中断，流式是 Spring AI 1.1.4 + JDK 连接器下唯一可中止通道）——`BooleanSupplier` 取消令牌贯穿 call/stream：置位后调用直接抛取消异常（零 HTTP 请求），执行中置位经 `takeUntil` 在下一个 token 边界中止订阅（取消向上传播关闭 HTTP 连接，厂商端停止生成）。取消不重试、部分输出不按成功返回、`llm_call_log` 记 `ok=false` 且 `error_msg` 含 `client-cancelled`；编排三节点传入共享断连标志（同步路径维持 null），聚合流式中止不回退阻塞调用。副作用：该路径 token 用量从响应 usage 真实值变为按输出文本估算（`tokensEstimated=true`）。测试：`AgentChatCallerTest`/`AgentChatCallerRetryTest` 取消用例 + `MultiAgentGraphAgentTest` 断连中止/零新增调用用例（全量 202 用例通过）
   - 测试：`ClientAbortLogFilterTest` 7 用例 + `GlobalExceptionHandlerTest` 3 用例 + cancel 落库/编排短路守护用例
 
 ## 工具与沙箱（2026-08 完成）

@@ -24,7 +24,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.ChatClient.CallResponseSpec;
 import org.springframework.ai.chat.client.ChatClient.ChatClientRequestSpec;
 import org.springframework.ai.chat.client.ChatClient.StreamResponseSpec;
 import reactor.core.publisher.Flux;
@@ -47,8 +46,6 @@ class MultiAgentGraphAgentTest {
     @Mock
     private ChatClientRequestSpec requestSpec;
     @Mock
-    private CallResponseSpec responseSpec;
-    @Mock
     private StreamResponseSpec streamSpec;
     @Mock
     private AgentService agentService;
@@ -69,34 +66,22 @@ class MultiAgentGraphAgentTest {
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
-        when(requestSpec.call()).thenReturn(responseSpec);
-        when(responseSpec.chatResponse()).thenReturn(chatResponseOf(content));
-        // 流式执行时聚合节点走 stream 通道（lead/子任务仍走 call）
-        lenient().when(requestSpec.stream()).thenReturn(streamSpec);
-        lenient().when(streamSpec.content()).thenReturn(Flux.just(content));
+        // call() 已统一流式背书：lead/子任务/聚合全部走 stream().content() 通道
+        when(requestSpec.stream()).thenReturn(streamSpec);
+        when(streamSpec.content()).thenReturn(Flux.just(content));
     }
 
     /** 独立 stub 的客户端：专家子任务使用，内容固定（避免与共享 mock 的 stub 冲突） */
     private ChatClient newStubbedClient(String content) {
         ChatClient c = mock(ChatClient.class);
         ChatClientRequestSpec rs = mock(ChatClientRequestSpec.class);
-        CallResponseSpec cs = mock(CallResponseSpec.class);
         StreamResponseSpec ss = mock(StreamResponseSpec.class);
         when(c.prompt()).thenReturn(rs);
         when(rs.system(anyString())).thenReturn(rs);
         when(rs.user(anyString())).thenReturn(rs);
-        when(rs.call()).thenReturn(cs);
-        when(cs.chatResponse()).thenReturn(chatResponseOf(content));
-        lenient().when(rs.stream()).thenReturn(ss);
-        lenient().when(ss.content()).thenReturn(Flux.just(content));
+        when(rs.stream()).thenReturn(ss);
+        when(ss.content()).thenReturn(Flux.just(content));
         return c;
-    }
-
-    /** 构造带固定文本的真实 ChatResponse（AgentChatCaller 经 chatResponse() 取内容） */
-    private static org.springframework.ai.chat.model.ChatResponse chatResponseOf(String content) {
-        return new org.springframework.ai.chat.model.ChatResponse(java.util.List.of(
-                new org.springframework.ai.chat.model.Generation(
-                        new org.springframework.ai.chat.messages.AssistantMessage(content))));
     }
 
     @Test
@@ -358,7 +343,7 @@ class MultiAgentGraphAgentTest {
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
                 new com.alibaba.cloud.ai.graph.checkpoint.savers.MemorySaver());
 
-        // 首跑：lead + 2 子任务（call）+ 聚合（stream）= 检查点逐 superstep 落库
+        // 首跑：lead + 2 子任务 + 聚合 = 4 次流式调用（call 已统一流式背书），检查点逐 superstep 落库
         java.util.List<String> first = agent
                 .executeStreamReactive(new Goal("gr3", "调研竞品并输出报告"))
                 .collectList()
@@ -375,51 +360,48 @@ class MultiAgentGraphAgentTest {
         assertEquals(fixedContent(), resumed.get(resumed.size() - 1),
                 "续跑应从检查点状态取回最终回答, 实际帧序列: " + resumed);
 
-        // call 只发生 3 次（lead+2 子任务）、stream 只 1 次（聚合），resume 零新增
-        verify(requestSpec, org.mockito.Mockito.times(3)).call();
-        verify(requestSpec, org.mockito.Mockito.times(1)).stream();
+        // stream 共 4 次（lead + 2 子任务 + 聚合），resume 零新增
+        verify(requestSpec, org.mockito.Mockito.times(4)).stream();
     }
 
     /**
      * 中途断开后 resume 补执行缺口：
-     * 时序：lead 正常完成落检查点 → 子任务批 call() 阻塞 → dispose（cancel 后图执行停止，
-     * 进行中的子任务结果不被接收、子任务批 superstep 无检查点）
+     * 时序：lead 正常完成落检查点 → 子任务批流式调用阻塞（在途）→ dispose（cancel 后图执行停止，
+     * 取消置位后子任务在途调用随令牌中止并抛取消异常，子任务批 superstep 无检查点）
      * → resume 只能恢复到 lead 检查点（nextNodeId=__PARALLEL__(lead)）→ lead 不重跑（结果已复用），
-     * 子任务批作为执行缺口补跑（call +2），聚合补跑（stream 1 次）。
-     * call 共 5 次 = 首跑（lead 1 + 子任务 2）+ 续跑子任务 2。
+     * 子任务批作为执行缺口补跑（+2），聚合补跑（+1）。
+     * stream 共 6 次 = 首跑（lead 1 + 子任务 2）+ 续跑（子任务 2 + 聚合 1）。
      */
     @Test
     void resume_afterLeadCheckpoint_reusesLeadResult() throws Exception {
         java.util.concurrent.CountDownLatch releaseSubtasks = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.atomic.AtomicInteger callCount = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger contentCalls = new java.util.concurrent.atomic.AtomicInteger();
         when(clientRegistry.get(any())).thenReturn(chatClient);
         when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
         lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
-        // lead（第 1 次 call）立即返回拆解 JSON；子任务（第 2、3 次 call）阻塞到放行
-        when(requestSpec.call()).thenAnswer(inv -> {
-            if (callCount.incrementAndGet() == 1) {
-                return responseSpec;
+        // lead（第 1 次）立即返回拆解 JSON；子任务（第 2、3 次）在途阻塞到放行
+        when(requestSpec.stream()).thenReturn(streamSpec);
+        when(streamSpec.content()).thenAnswer(inv -> {
+            if (contentCalls.incrementAndGet() == 1) {
+                return Flux.just(fixedContent());
             }
             releaseSubtasks.await(10, java.util.concurrent.TimeUnit.SECONDS);
-            return responseSpec;
+            return Flux.just(fixedContent());
         });
-        when(responseSpec.chatResponse()).thenReturn(chatResponseOf(fixedContent()));
-        lenient().when(requestSpec.stream()).thenReturn(streamSpec);
-        lenient().when(streamSpec.content()).thenReturn(Flux.just(fixedContent()));
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
                 new com.alibaba.cloud.ai.graph.checkpoint.savers.MemorySaver());
 
-        // lead 完成（检查点已落库）→ 子任务批阻塞中 → 模拟客户端断开
+        // lead 完成（检查点已落库）→ 子任务批在途阻塞中 → 模拟客户端断开
         reactor.core.Disposable disposable = agent
                 .executeStreamReactive(new Goal("gr4", "调研竞品并输出报告"))
                 .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
                 .subscribe();
         Thread.sleep(500);
-        disposable.dispose();       // cancel → 置位短路标志
-        releaseSubtasks.countDown(); // 放行：子任务返回 → 聚合短路（不写 final）
+        disposable.dispose();        // cancel → 置位取消令牌：在途子任务调用随令牌中止
+        releaseSubtasks.countDown(); // 放行：子任务流的下一 token 边界中止（取消异常上抛）
         Thread.sleep(300);
 
         // 续跑：从 lead 检查点恢复 → lead 不重跑（复用拆解），子任务批补跑 + 聚合补跑
@@ -429,18 +411,18 @@ class MultiAgentGraphAgentTest {
                 .block();
         assertNotNull(resumed);
         assertEquals(fixedContent(), resumed.get(resumed.size() - 1), "续跑应以最终回答收尾");
-        verify(requestSpec, org.mockito.Mockito.times(5)).call();
-        verify(requestSpec, org.mockito.Mockito.times(1)).stream();
+        verify(requestSpec, org.mockito.Mockito.times(6)).stream();
     }
 
     /**
-     * 客户端断连（cancel）→ doFinally 置位短路标志 → 后续节点不再发起新的 LLM 调用：
-     * lead 调用阻塞期间 dispose，释放后除 lead 外不应有任何新调用（子任务/聚合全部短路）。
+     * 客户端断连（cancel）→ doOnCancel 置位取消令牌 → 后续节点不再发起新的 LLM 调用：
+     * lead 流式调用在途阻塞期间 dispose，释放后 lead 在 token 边界中止（取消异常上抛，
+     * 图终止），除 lead 外不应有任何新调用（子任务/聚合全部短路）。
      * subscribeOn 模拟 AgentServiceImpl 的真实订阅方式（图执行与 cancel 分属不同线程）。
      */
     @Test
     void executeStreamReactive_cancelDuringLead_skipsRemainingLlmCalls() throws Exception {
-        // 独立 stub：lead 的 call() 阻塞在闩锁上，模拟「调用进行中客户端断开」
+        // 独立 stub：lead 的流式调用阻塞在闩锁上，模拟「调用进行中客户端断开」
         java.util.concurrent.CountDownLatch releaseLead = new java.util.concurrent.CountDownLatch(1);
         when(clientRegistry.get(any())).thenReturn(chatClient);
         when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
@@ -449,13 +431,11 @@ class MultiAgentGraphAgentTest {
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         // lenient：短路生效时 lead 可能一次都不调用（UnnecessaryStubbing 免检）
-        lenient().when(requestSpec.call()).thenAnswer(inv -> {
-            releaseLead.await(10, java.util.concurrent.TimeUnit.SECONDS);
-            return responseSpec;
-        });
-        lenient().when(responseSpec.chatResponse()).thenReturn(chatResponseOf(fixedContent()));
         lenient().when(requestSpec.stream()).thenReturn(streamSpec);
-        lenient().when(streamSpec.content()).thenReturn(Flux.just(fixedContent()));
+        lenient().when(streamSpec.content()).thenAnswer(inv -> {
+            releaseLead.await(10, java.util.concurrent.TimeUnit.SECONDS);
+            return Flux.just(fixedContent());
+        });
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         // subscribeOn 让图执行离开测试线程（否则同步图驱动会把 subscribe() 卡在 lead 阻塞上）
@@ -463,14 +443,70 @@ class MultiAgentGraphAgentTest {
                 .executeStreamReactive(new Goal("g9", "调研竞品并输出报告"))
                 .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
                 .subscribe();
-        Thread.sleep(300);                    // 等图启动、lead 进入 call() 阻塞
+        Thread.sleep(300);                    // 等图启动、lead 进入在途流式调用
 
-        disposable.dispose();                 // 模拟客户端断开 → cancel → 置位短路标志
-        releaseLead.countDown();              // 进行中的 lead 调用自然结束
+        disposable.dispose();                 // 模拟客户端断开 → cancel → 置位取消令牌
+        releaseLead.countDown();              // 供给恢复：lead 在下一个 token 边界中止
         Thread.sleep(500);                    // 给「短路失效则子任务会发起新调用」留暴露窗口
 
-        // 时序兼容：lead 或在置位前已发起调用（1 次）、或被更早短路（0 次），但绝不能再多
-        verify(requestSpec, org.mockito.Mockito.atMost(1)).call();
-        verify(requestSpec, never()).stream(); // 聚合流式调用也不应发起
+        // 时序兼容：lead 或在置位前已发起调用（1 次）、或被更早短路（0 次），但绝不能再多；
+        // call 已统一流式背书，子任务/聚合的调用同样走 stream——断连后零新增
+        verify(requestSpec, org.mockito.Mockito.atMost(1)).stream();
+    }
+
+    /**
+     * 客户端断连中止在途聚合流式调用（Spec：在途 LLM 请求随断连中止）：
+     * lead + 2 子任务正常完成 → 聚合首 token 已产出（在途）→ dispose 置位 →
+     * 尾 token 供给恢复 → 聚合在下一个 token 边界中止（取消异常不可重试、图终止），
+     * 不产生任何新增调用、部分输出不按成功收尾。
+     */
+    @Test
+    void executeStreamReactive_cancelDuringAggregateStream_abortsInFlightCall() throws Exception {
+        java.util.concurrent.CountDownLatch aggStarted = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseTail = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger contentCalls = new java.util.concurrent.atomic.AtomicInteger();
+        when(clientRegistry.get(any())).thenReturn(chatClient);
+        when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
+        lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
+        when(chatClient.prompt()).thenReturn(requestSpec);
+        when(requestSpec.system(anyString())).thenReturn(requestSpec);
+        when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        when(requestSpec.stream()).thenReturn(streamSpec);
+        when(streamSpec.content()).thenAnswer(inv -> {
+            if (contentCalls.incrementAndGet() <= 3) {
+                return Flux.just(fixedContent()); // lead + 2 子任务正常完成
+            }
+            // 聚合：首 token 已产出（在途），尾 token 等放行
+            aggStarted.countDown();
+            return Flux.concat(
+                    Flux.just("首token"),
+                    Flux.defer(() -> {
+                        try {
+                            releaseTail.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                        return Flux.just("尾token");
+                    }));
+        });
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
+
+        java.util.List<String> rows = new java.util.concurrent.CopyOnWriteArrayList<>();
+        reactor.core.Disposable disposable = agent
+                .executeStreamReactive(new Goal("g10", "调研竞品并输出报告"))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                .subscribe(rows::add);
+        assertTrue(aggStarted.await(10, java.util.concurrent.TimeUnit.SECONDS),
+                "聚合应在超时前进入流式输出");
+
+        disposable.dispose();     // 模拟客户端断开：取消置位，在途聚合调用随令牌中止
+        releaseTail.countDown();  // 尾 token 供给恢复：验证在下一个 token 边界中止
+        Thread.sleep(500);        // 留暴露窗口：若无中止/短路，会有新增调用
+
+        // lead+2 子任务+聚合共 4 次调用，断连后零新增（取消异常不可重试、无后续节点）
+        assertEquals(4, contentCalls.get(), "断连后不得发起新增 LLM 调用");
+        // 部分输出不按成功返回：断连中止后收集到的帧不含完整最终回答
+        assertTrue(rows.stream().noneMatch(fixedContent()::equals),
+                "断连中止后不应产出完整最终回答, 实际帧序列: " + rows);
     }
 }
