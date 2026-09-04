@@ -1,6 +1,7 @@
 package com.dark.javaHarness.service.impl;
 
 import com.dark.javaHarness.agent.Agent;
+import com.dark.javaHarness.agent.AgentRegistry;
 import com.dark.javaHarness.agent.ProgressLine;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
@@ -8,15 +9,12 @@ import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.service.AgentConfigProvider;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.GoalService;
-import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
@@ -24,6 +22,9 @@ import reactor.core.scheduler.Schedulers;
 /**
  * Agent 编排服务实现：接收一个请求，路由到对应 Agent，
  * 执行目标并回写 Goal 生命周期状态（RUNNING -> SUCCEEDED/FAILED）。
+ *
+ * <p>路由表由 {@link AgentRegistry} 表驱动维护（agent 表 is_internal=0 行自动注册 +
+ * multi-agent 编排 bean 预注入），本类仅做路由委托，不再自建 bean 列表路由表。
  */
 @Service
 public class AgentServiceImpl implements AgentService {
@@ -32,19 +33,16 @@ public class AgentServiceImpl implements AgentService {
 
     private final GoalService goalService;
     private final AgentConfigProvider agentConfigProvider;
-    private final ConcurrentMap<String, Agent> agents;
+    private final AgentRegistry agentRegistry;
 
     public AgentServiceImpl(GoalService goalService,
                             AgentConfigProvider agentConfigProvider,
-                            List<Agent> agentList) {
+                            @Lazy AgentRegistry agentRegistry) {
         this.goalService = goalService;
         this.agentConfigProvider = agentConfigProvider;
-        // 以 name() 为 key 建立路由表
-        ConcurrentMap<String, Agent> map = new ConcurrentHashMap<>();
-        for (Agent agent : agentList) {
-            map.put(agent.name(), agent);
-        }
-        this.agents = map;
+        // @Lazy 代理断环：AgentRegistry bean 创建期 init() 会经 ObjectProvider 现取本 bean，
+        // 双方在创建期互等，代理注入推迟解析到首次路由调用（届时 Registry 已装配完成）
+        this.agentRegistry = agentRegistry;
     }
 
     /** 提交目标给指定 Agent 异步执行（立即返回，后台执行） */
@@ -144,10 +142,10 @@ public class AgentServiceImpl implements AgentService {
         return executeStreamReactive(agentName, objective, sessionId);
     }
 
-    /** 列出已注册的 Agent 名称 */
+    /** 列出已注册的 Agent 名称（委托 AgentRegistry 动态路由表） */
     @Override
     public Set<String> agentNames() {
-        return agents.keySet();
+        return agentRegistry.agentNames();
     }
 
     /** 按 agentId 从 agent 表查询 agentName（委托 AgentConfigProvider，CLI 传入 agentId 时用于路由映射） */
@@ -162,13 +160,9 @@ public class AgentServiceImpl implements AgentService {
         return agentConfigProvider.getAgentConfig(agentName);
     }
 
-    /** 按名称查找 Agent，不存在则抛出异常 */
+    /** 按名称查找 Agent（委托 AgentRegistry 表驱动路由表，未命中走惰性热注册），不存在则抛出异常 */
     private Agent requireAgent(String agentName) {
-        Agent agent = agents.get(agentName);
-        if (agent == null) {
-            throw new IllegalArgumentException("未知 Agent: " + agentName + "，可用: " + agents.keySet());
-        }
-        return agent;
+        return agentRegistry.require(agentName);
     }
 
     /** 同步执行目标并更新其生命周期状态（RUNNING -> SUCCEEDED/FAILED） */

@@ -33,6 +33,9 @@ public class AgentEntity {
     /** 状态：1-启用 0-禁用 */
     private Integer status;
 
+    /** 内部角色标志：1-编排内部角色（不作为对话 Agent 注册） 0-对话 Agent */
+    private Integer isInternal;
+
     /** 创建时间 */
     private LocalDateTime createdAt;
 

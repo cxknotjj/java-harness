@@ -6,6 +6,7 @@ import com.dark.javaHarness.domain.entity.AgentEntity;
 import com.dark.javaHarness.domain.entity.ModelProviderEntity;
 import com.dark.javaHarness.mapper.AgentMapper;
 import com.dark.javaHarness.mapper.ModelProviderMapper;
+import java.util.List;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,6 +45,24 @@ public class AgentConfigProvider {
             log.warn("按 agentId 查询 agent 表失败 agentId={}", agentId, e);
         }
         return Optional.empty();
+    }
+
+    /**
+     * 列出可注册为对话 Agent 的行名：仅返回 is_internal=0 的行（内部角色行 is_internal=1
+     * 不返回，注册表据此排除 lead/aggregator/multi-agent 等编排内部角色）；
+     * 行名 null/空白过滤，异常时返回空列表不抛出（与既有容错风格一致）。
+     */
+    public List<String> listAgentNames() {
+        try {
+            return agentMapper.selectList(new LambdaQueryWrapper<AgentEntity>()
+                            .eq(AgentEntity::getIsInternal, 0)).stream()
+                    .map(AgentEntity::getAgentName)
+                    .filter(name -> name != null && !name.isBlank())
+                    .toList();
+        } catch (Exception e) {
+            log.warn("列出 agent 表行名失败，返回空列表", e);
+            return List.of();
+        }
     }
 
     /** 从 agent 表读取指定 Agent 的运行配置（部署模型 + 系统提示词；模型名经 model_provider 表解析） */

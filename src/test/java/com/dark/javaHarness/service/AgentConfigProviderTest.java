@@ -9,6 +9,7 @@ import com.dark.javaHarness.domain.entity.AgentEntity;
 import com.dark.javaHarness.domain.entity.ModelProviderEntity;
 import com.dark.javaHarness.mapper.AgentMapper;
 import com.dark.javaHarness.mapper.ModelProviderMapper;
+import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -114,5 +115,39 @@ class AgentConfigProviderTest {
         Optional<AgentConfig> cfg = provider.getAgentConfig("general");
         assertTrue(cfg.isPresent());
         assertEquals(null, cfg.get().model(), "部署模型行不存在应回退 null（走默认客户端）");
+    }
+
+    @Test
+    void listAgentNames_multiRows_shouldFilterBlankNames() {
+        provider = newProvider();
+        AgentEntity general = new AgentEntity();
+        general.setAgentName("general");
+        AgentEntity writer = new AgentEntity();
+        writer.setAgentName("writer");
+        AgentEntity blank = new AgentEntity();
+        blank.setAgentName("  ");
+        when(agentMapper.selectList(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(List.of(general, writer, blank));
+
+        List<String> names = provider.listAgentNames();
+
+        assertEquals(List.of("general", "writer"), names, "应返回行名并过滤空白名");
+    }
+
+    @Test
+    void listAgentNames_emptyTable_shouldReturnEmptyList() {
+        provider = newProvider();
+        when(agentMapper.selectList(org.mockito.ArgumentMatchers.any())).thenReturn(List.of());
+
+        assertTrue(provider.listAgentNames().isEmpty(), "空表应返回空列表");
+    }
+
+    @Test
+    void listAgentNames_queryError_shouldReturnEmptyListNotThrow() {
+        provider = newProvider();
+        when(agentMapper.selectList(org.mockito.ArgumentMatchers.any()))
+                .thenThrow(new RuntimeException("db down"));
+
+        assertTrue(provider.listAgentNames().isEmpty(), "查询异常应返回空列表而非抛出");
     }
 }
