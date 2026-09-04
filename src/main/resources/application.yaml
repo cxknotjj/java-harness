@@ -41,6 +41,8 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+    # 显式声明 UTF-8：迁移文件统一按 UTF-8 解析，防止系统默认编码（Windows GBK）介入导致中文注释乱码
+    encoding: UTF-8
     # 存量库（表已存在但无 flyway_schema_history）首次接入时先打基线：
     # baseline 版本=1，V1 跳过，从 V2 起执行增量；全新空库则 V1 起完整执行
     baseline-on-migrate: true
