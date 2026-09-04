@@ -61,7 +61,7 @@ app:
     lead-budget: 4000         # 编排 lead 拆解 prompt（超出对目标文本尾截）
     aggregate-budget: 12000   # 编排聚合 prompt（超出按子任务等份额截断）
     tool-result-budget: 5000  # 单次调用工具结果注入上下文的总预算
-    tool-call-limit: 12       # 单次调用工具执行次数硬上限
+    tool-call-limit: 8       # 单次调用工具执行次数硬上限
   # 工具 Schema 延迟加载（两段式工具暴露）：开启后请求级工具面轻量注入（名称+用途，schema 置空），
   # system 附工具索引段，模型经 expand_tool 元工具按需展开获取完整参数说明；
   # 关闭后回退全量注入现状（expand_tool 不注册）
