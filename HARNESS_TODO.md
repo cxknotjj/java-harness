@@ -76,9 +76,9 @@
   - [ ] 1.skill的动态装配
   - [ ] 2.tool的动态装配
   - [ ] 3.mcp的动态装配
-  - [ ] 4.agent角色prompt的组装
-  - [ ] **5.记忆上下文的动态注入**
-  - [ ] 6.**工具 Schema 的延迟加载:开始只注入对于工具的描述，只有agent明确需要调用时，才会按需提升暴漏完整tool参数**
+  - [x] 4.agent角色prompt的组装
+  - [x] **5.记忆上下文的动态注入**
+  - [x] 6.**工具 Schema 的延迟加载:开始只注入对于工具的描述，只有agent明确需要调用时，才会按需提升暴漏完整tool参数**
 
 - [x] 修复目前会话无法创建goal的问题
 - [ ] 修复进入多agent时，请求卡住的问题。
@@ -162,6 +162,12 @@
   - 在途中止（2026-09 补齐）：`AgentChatCaller.call()` 改为流式通道背书（RestClient 阻塞调用不可中断，JDK HttpClient 不响应线程中断，流式是 Spring AI 1.1.4 + JDK 连接器下唯一可中止通道）——`BooleanSupplier` 取消令牌贯穿 call/stream：置位后调用直接抛取消异常（零 HTTP 请求），执行中置位经 `takeUntil` 在下一个 token 边界中止订阅（取消向上传播关闭 HTTP 连接，厂商端停止生成）。取消不重试、部分输出不按成功返回、`llm_call_log` 记 `ok=false` 且 `error_msg` 含 `client-cancelled`；编排三节点传入共享断连标志（同步路径维持 null），聚合流式中止不回退阻塞调用。副作用：该路径 token 用量从响应 usage 真实值变为按输出文本估算（`tokensEstimated=true`）。测试：`AgentChatCallerTest`/`AgentChatCallerRetryTest` 取消用例 + `MultiAgentGraphAgentTest` 断连中止/零新增调用用例（全量 202 用例通过）
   - 测试：`ClientAbortLogFilterTest` 7 用例 + `GlobalExceptionHandlerTest` 3 用例 + cancel 落库/编排短路守护用例
 
+## Prompt 动态装配（2026-09 完成）
+
+- [x] **Prompt 组装管线（prompt的动态加载·子项 4）**：新增 `prompt` 包 `PromptAssembler`——每请求按 agent 名段落化组装 system prompt（角色段→工具索引段→工具纪律段→输出约定段→skill 段），两路径（`GeneralAssistantAgent`/`AgentChatCaller.buildSpec`）统一接入；`predictSubtask` 的硬编码 persona/工具纪律拼接删除、收敛为组装段。角色段优先级保持：agent 表 prompt > 角色兜底 > 默认。skill 段为扩展点接口 `SkillSectionProvider`（当前空实现）——后续子项 1「skill Markdown 目录装配」只需实现该接口注入即可，不改组装管线；子项 2/3（tool/mcp 装配数据化）可复用 `ToolAssignments.purposeOf` 元数据与工具索引段机制。测试 `PromptAssemblerTest`
+- [x] **记忆上下文动态注入（prompt的动态加载·子项 5）**：`MemoryPolicy` 按角色策略注入——编排 `lead` 注入会话记忆（与路径 A general 完全同口径：`SessionService` 同源 memoryStore + `MessageChatMemoryAdvisor` + `ContextAssemblingAdvisor` 预算裁剪，无会话 ID 跳过）；聚合节点与子任务专家不注入（聚合忠实于各子任务结果，子任务上下文由 lead 在子任务描述中传递）；编排内 general 兜底专家（未指派落点）不注入。测试 `MemoryPolicyTest` + `MultiAgentGraphAgentTest` 编排注入断言
+- [x] **工具 Schema 延迟加载（prompt的动态加载·子项 6）**：`ToolLazyManager` 会话级两段式暴露——首轮未展开工具仅注入轻量态（名称+用途，inputSchema 置空，直接调用返回中文引导文本不执行真实逻辑），system 经工具索引段给全量工具清单；模型调 `expand_tool(toolName)` 后工具加入会话级展开集合并返回完整参数说明，其后请求按完整 schema 注入并可执行（同请求内 expand 后自动放行，避免自愈循环）；expand_tool 元工具不经 tracer/预算（零工具行噪声、不占执行额度）；越权展开未分配工具被拒绝。开关 `app.prompt.lazy-tools.enabled`（默认 true）关闭即回退全量注入现状。测试 `ToolLazyManagerTest`（13 用例）
+
 ## 工具与沙箱（2026-08 完成）
 
 - [x] **Agent 工具库扩充**：`tool` 包落地真实工具体系（对标 DeepSeek Harness 内置工具面），按专家分配、统一治理（宿主机自研工具后被 Sandbox 容器级隔离替代并退役）：
@@ -195,11 +201,12 @@
 - [x] **统一参数校验**：`spring-boot-starter-validation` 注解校验，非法请求返回统一 400 错误体
 - [x] **全局异常处理**：`@RestControllerAdvice` 统一 `{code, message}` 响应
 - [x] **单 agent 系统**：创建 agent 表并引入项目
-- [x] **多模型接入**：`ChatAgentConfig` 按 agent 表装配多个 Agent（qwen-plus/max/turbo），新增 Agent = 注册一个 bean + agent 表一行
+- [x] **多模型接入**：`ChatAgentConfig` 按 agent 表装配多个 Agent（qwen-plus/max/turbo），新增 Agent = agent 表一行（2026-09 起表驱动自动注册，见下条）
 - [x] **多 Agent 编排（初版）**：主 Agent 判定 COMPLEX 路由到 `multi-agent` 完成 lead→并行→聚合闭环
 - [x] **响应式流式改造**：流式端点已直接返回 `Flux<String>`（text/event-stream），DB 阻塞操作经 `Schedulers.boundedElastic()` 边界隔离；同步 `/api/chat` 保留
 - [x] **会话上下文管理与 Token 裁剪**：`ContextAssemblingAdvisor` 按 token 预算裁剪，长对话体积受控
 - [x] **Mockito 单测（核心场景）**：10 个测试类 / 50 用例覆盖路由判定、双路径执行、进度协议、SSE 契约（详见 docs/functional-testing.md）
+- [x] **Agent 表驱动自动注册（2026-09）**：新增 `AgentRegistry`——启动时读 agent 表把全部 `is_internal=0` 行自动注册为对话 Agent（`GeneralAssistantAgent` 按行配置生效），路由未命中惰性查表热注册（`ConcurrentHashMap.computeIfAbsent` 原子构造，运行中插行免重启）；V9 迁移加 `is_internal` 列（multi-agent/lead/aggregator 置 1，排除逻辑纯数据驱动，新增内部角色免改代码）；启动逐行 fail-safe（脏行 warn 跳过）；`general` 行缺失时代码兜底注册并 warn（DB 行存在则完全按 DB，两来源不合并）。`ChatAgentConfig` 删除 generalAgent/deepseekAgent 手工 bean，`AgentServiceImpl` 路由委托 Registry（构造 `@Lazy` 解创建期循环）。注册口径收敛为：**新增 Agent = agent 表一行（is_internal=0）**。测试：`AgentRegistryTest` 9 用例 + `AgentServiceImplTest` 适配扩展（全量 249 用例通过）
 
 ***
 
