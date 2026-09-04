@@ -15,9 +15,12 @@ import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
+import com.dark.javaHarness.prompt.PromptAssembler;
 import com.dark.javaHarness.service.AgentService;
+import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
+import com.dark.javaHarness.tool.ToolLazyManager;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
@@ -93,6 +96,8 @@ public class MultiAgentGraphAgent implements Agent {
     }
 
     private final String agentName;
+    /** Prompt 组装器：子任务专家 persona 与各环节 system 段统一经此组装 */
+    private final PromptAssembler promptAssembler;
     /** 编排环节 LLM 调用器：封装查表配置 / 客户端获取 / 请求组装 / 工具注入 */
     private final AgentChatCaller chatCaller;
     /** 图拓扑（构建一次）：同步执行缓存编译 {@link #graph}；流式执行每次带监听器重新编译 */
@@ -131,8 +136,46 @@ public class MultiAgentGraphAgent implements Agent {
                                 LlmCallRecorder recorder,
                                 BaseCheckpointSaver checkpointSaver,
                                 ContextBudgetProperties budgets) {
+        this(agentName, clientRegistry, agentService, toolAssignments, recorder, checkpointSaver, budgets, null);
+    }
+
+    /**
+     * @param memoryStore 会话记忆源（SessionService，与路径 A GeneralAssistantAgent 同源同口径）：
+     *                    lead 拆解节点据此注入会话记忆，null 时不注入（单测场景）
+     */
+    public MultiAgentGraphAgent(String agentName,
+                                ChatClientRegistry clientRegistry,
+                                AgentService agentService,
+                                ToolAssignments toolAssignments,
+                                LlmCallRecorder recorder,
+                                BaseCheckpointSaver checkpointSaver,
+                                ContextBudgetProperties budgets,
+                                SessionService memoryStore) {
+        this(agentName, clientRegistry, agentService, toolAssignments, recorder,
+                checkpointSaver, budgets, memoryStore, null);
+    }
+
+    /**
+     * 全参构造：lazyTools 为 null 时构造禁用态实例（旧构造链/单测场景，工具面全量注入现状）。
+     * 正式装配由 ChatAgentConfig 注入共享实例（app.prompt.lazy-tools.enabled 开关）——
+     * 编排三节点（lead/子任务/聚合）共用本实例的 {@link AgentChatCaller} → 同一 sessionId
+     * 的会话展开集共享。
+     */
+    public MultiAgentGraphAgent(String agentName,
+                                ChatClientRegistry clientRegistry,
+                                AgentService agentService,
+                                ToolAssignments toolAssignments,
+                                LlmCallRecorder recorder,
+                                BaseCheckpointSaver checkpointSaver,
+                                ContextBudgetProperties budgets,
+                                SessionService memoryStore,
+                                ToolLazyManager lazyTools) {
+        ToolLazyManager lazy = lazyTools != null ? lazyTools : new ToolLazyManager(toolAssignments, false);
         this.agentName = agentName;
-        this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments, recorder);
+        // 工具索引段与延迟加载同源：开启时索引段追加 expand_tool 使用引导（与轻量态工具面对齐）
+        this.promptAssembler = new PromptAssembler(agentService, toolAssignments, List.of(), lazy.isEnabled());
+        this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments, recorder,
+                new LlmRetry(), null, promptAssembler, memoryStore, lazy);
         this.checkpointSaver = checkpointSaver;
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
         try {
@@ -646,12 +689,9 @@ public class MultiAgentGraphAgent implements Agent {
         // 未指派（lead 输出旧格式或漏 agent 字段）→ 回退 general：通用兜底且持有全量工具
         String resolved = (expert == null || expert.isBlank())
                 ? AgentConstants.DEFAULT_AGENT : expert;
-        // 提示词明确「专家名只是身份不是工具」：防止模型把 researcher 等名字误当工具调用
-        String persona = "你是「" + resolved + "」专家 Agent，以该领域专家的方式执行子任务，直接给出完成结果。"
-                + "只能调用系统提供的工具列表中的工具；专家名（researcher/coder/analyst/writer 等）"
-                + "只是你的身份标识，绝不是可调用的工具。"
-                + "工具使用纪律：网络类工具（fetchUrl/browser_navigate 等抓取与浏览）合计调用不超过 8 次；"
-                + "同一 URL 只抓取一次；优先一次抓取多角度提取信息，材料足以支撑结论时立即停止调用工具并输出结果。";
+        // 专家 persona 与工具使用纪律经 PromptAssembler 统一组装（原硬编码拼接已删除）：
+        // persona 作角色段兜底传入，工具索引/工具纪律/输出约定等段由调用器组装时追加
+        String persona = promptAssembler.subtaskPersona(resolved);
         return chatCaller.call(sessionId, resolved, persona, task, toolEmitter,
                 new PromptBudgetAdvisor[0], cancelled == null ? null : cancelled::get);
     }

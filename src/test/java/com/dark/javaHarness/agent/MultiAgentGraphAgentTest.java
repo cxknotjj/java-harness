@@ -9,16 +9,20 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
+import com.dark.javaHarness.advisor.ContextAssemblingAdvisor;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
+import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.tool.ToolAssignments;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -26,6 +30,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClient.ChatClientRequestSpec;
 import org.springframework.ai.chat.client.ChatClient.StreamResponseSpec;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import reactor.core.publisher.Flux;
 
 /**
@@ -51,6 +56,8 @@ class MultiAgentGraphAgentTest {
     private AgentService agentService;
     @Mock
     private ToolAssignments toolAssignments;
+    @Mock
+    private SessionService memoryStore;
 
     private MultiAgentGraphAgent agent;
 
@@ -94,9 +101,10 @@ class MultiAgentGraphAgentTest {
 
         assertNotNull(reply);
         assertFalse(reply.isBlank(), "execute 应产出最终回答");
-        // lead 拆解与聚合按独立角色行查配置（与编排器 multi-agent 解耦）
-        verify(agentService).getAgentConfig("lead");
-        verify(agentService).getAgentConfig("aggregator");
+        // lead 拆解与聚合按独立角色行查配置（与编排器 multi-agent 解耦）；
+        // system 经 PromptAssembler 组装，角色段查表 + 调用器查表共至少两次
+        verify(agentService, atLeastOnce()).getAgentConfig("lead");
+        verify(agentService, atLeastOnce()).getAgentConfig("aggregator");
         verify(agentService, never()).getAgentConfig("multi-agent");
     }
 
@@ -255,9 +263,9 @@ class MultiAgentGraphAgentTest {
 
         assertNotNull(reply);
         assertFalse(reply.isBlank(), "专家派遣后仍应产出聚合最终回答");
-        // 子任务按指派查询专家配置并取对应部署模型的客户端
-        verify(agentService).getAgentConfig("researcher");
-        verify(agentService).getAgentConfig("analyst");
+        // 子任务按指派查询专家配置并取对应部署模型的客户端（persona/请求组装各查一次）
+        verify(agentService, atLeastOnce()).getAgentConfig("researcher");
+        verify(agentService, atLeastOnce()).getAgentConfig("analyst");
         verify(clientRegistry).get(101L);
         verify(clientRegistry).get(102L);
     }
@@ -308,6 +316,48 @@ class MultiAgentGraphAgentTest {
         // lead 1 次 + 聚合 1 次挂载预算 advisor；子任务不挂
         verify(requestSpec, org.mockito.Mockito.times(2))
                 .advisors(any(com.dark.javaHarness.advisor.PromptBudgetAdvisor.class));
+    }
+
+    /* ---------------- 记忆动态注入（MemoryPolicy） ---------------- */
+
+    /**
+     * 记忆动态注入：lead 拆解带会话记忆 advisor（与路径 A 同口径：MessageChatMemoryAdvisor +
+     * CONVERSATION_ID 参数 + ContextAssemblingAdvisor 预算裁剪），子任务专家（含未指派回退的
+     * general 兜底专家身份）与聚合节点不挂任何记忆 advisor。
+     */
+    @Test
+    void execute_leadWithSession_carriesMemoryAdvisor_subtasksAndAggregateDoNot() {
+        // 一条指派 researcher、一条未指派（执行时回退 general 兜底专家身份）：两路子任务都不得挂记忆
+        String leadJson = "{\"subtasks\":[{\"desc\":\"调研竞品\",\"agent\":\"researcher\"},{\"desc\":\"撰写摘要\"}]}";
+        stubChat(leadJson);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
+                null, null, memoryStore);
+
+        agent.execute(new Goal("gm1", "调研竞品并撰写摘要", "sess-1"));
+
+        // 仅 lead 1 次调用挂载：记忆 advisor + 会话 ID 参数 + 上下文裁剪
+        verify(requestSpec, org.mockito.Mockito.times(1)).advisors(any(MessageChatMemoryAdvisor.class));
+        verify(requestSpec, org.mockito.Mockito.times(1)).advisors(anyConsumer());
+        verify(requestSpec, org.mockito.Mockito.times(1)).advisors(any(ContextAssemblingAdvisor.class));
+    }
+
+    /** 无会话 ID（Goal 未关联会话）→ lead 也不挂记忆 advisor（策略：无会话 ID 场景一律不注入） */
+    @Test
+    void execute_withoutSessionId_skipsMemoryAdvisor() {
+        stubChat(fixedContent());
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
+                null, null, memoryStore);
+
+        agent.execute(new Goal("gm2", "调研竞品并输出报告"));
+
+        verify(requestSpec, never()).advisors(any(MessageChatMemoryAdvisor.class));
+        verify(requestSpec, never()).advisors(anyConsumer());
+        verify(requestSpec, never()).advisors(any(ContextAssemblingAdvisor.class));
+    }
+
+    /** 泛型辅助：匹配 Consumer 重载的 advisors(...)（记忆 advisor 的 CONVERSATION_ID 参数挂载），避免依赖具体嵌套类型名 */
+    private static <T> Consumer<T> anyConsumer() {
+        return any();
     }
 
     /* ---------------- 断点续跑（Checkpointer） ---------------- */

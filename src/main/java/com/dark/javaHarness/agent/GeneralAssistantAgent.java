@@ -5,11 +5,13 @@ import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.domain.LlmCallLog;
+import com.dark.javaHarness.prompt.PromptAssembler;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
 import com.dark.javaHarness.tool.ToolCallTracer;
+import com.dark.javaHarness.tool.ToolLazyManager;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
@@ -19,6 +21,7 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.openai.OpenAiChatOptions;
+import org.springframework.ai.support.ToolCallbacks;
 import org.springframework.ai.tool.ToolCallback;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
@@ -50,6 +53,10 @@ public class GeneralAssistantAgent implements Agent {
     private final AgentService agentService;
     /** 工具分配表：general 注入全量工具（deepseek 等其他实例未登记则仅默认工具） */
     private final ToolAssignments toolAssignments;
+    /** Prompt 组装器：system prompt 按段组装（角色段沿用 agent 表 prompt 优先级） */
+    private final PromptAssembler promptAssembler;
+    /** 工具 Schema 延迟加载管理器（开关关闭时 process 全量透传，行为与现状一致） */
+    private final ToolLazyManager lazyTools;
     /** LLM 调用观测记录器（可 null：无观测场景下直通） */
     private final LlmCallRecorder recorder;
     /** 模型调用重试策略（最多 3 次、指数退避） */
@@ -74,11 +81,30 @@ public class GeneralAssistantAgent implements Agent {
                                  ToolAssignments toolAssignments,
                                  LlmCallRecorder recorder,
                                  com.dark.javaHarness.config.ContextBudgetProperties budgets) {
+        this(agentName, clientRegistry, memoryStore, agentService, toolAssignments, recorder, budgets, null);
+    }
+
+    /**
+     * 全参构造：lazyTools 为 null 时构造禁用态实例（旧构造链/单测场景，工具面全量注入现状）。
+     * 正式装配由 ChatAgentConfig 注入共享实例（app.prompt.lazy-tools.enabled 开关）。
+     */
+    public GeneralAssistantAgent(String agentName,
+                                 ChatClientRegistry clientRegistry,
+                                 SessionService memoryStore,
+                                 AgentService agentService,
+                                 ToolAssignments toolAssignments,
+                                 LlmCallRecorder recorder,
+                                 com.dark.javaHarness.config.ContextBudgetProperties budgets,
+                                 ToolLazyManager lazyTools) {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.memoryStore = memoryStore;
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
+        this.lazyTools = lazyTools != null ? lazyTools : new ToolLazyManager(toolAssignments, false);
+        // 工具索引段与延迟加载同源：开启时索引段追加 expand_tool 使用引导（与轻量态工具面对齐）
+        this.promptAssembler = new PromptAssembler(agentService, toolAssignments, List.of(),
+                this.lazyTools.isEnabled());
         this.recorder = recorder;
         this.historyBudget = budgets != null ? budgets.getHistoryBudget() : 4000;
         this.retry = new LlmRetry();
@@ -203,7 +229,7 @@ public class GeneralAssistantAgent implements Agent {
                 System.currentTimeMillis() - start, msg));
     }
 
-    /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪 */
+    /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪；system 经 PromptAssembler 按段组装 */
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective) {
         return buildChatRequestSpec(sessionId, objective, null);
     }
@@ -212,7 +238,7 @@ public class GeneralAssistantAgent implements Agent {
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective,
                                                                   Consumer<String> toolEmitter) {
         AgentConfig config = agentService.getAgentConfig(agentName)
-                .orElse(new AgentConfig(null, null, DEFAULT_SYSTEM_PROMPT));
+                .orElse(new AgentConfig(null, null, null));
         String model = config.model();
         // Registry 模式：凭部署模型 id 取对应厂商的 ChatClient（未绑定/未命中回退默认 DashScope）
         ChatClient client = clientRegistry.get(config.modelProviderId());
@@ -224,29 +250,30 @@ public class GeneralAssistantAgent implements Agent {
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
                 // 上下义组装拦截器：对注入后的序列做过滤/截断/role 归一化（token 预算控制）
                 .advisors(new ContextAssemblingAdvisor(historyBudget))
-                .system(config.prompt() != null ? config.prompt() : DEFAULT_SYSTEM_PROMPT)
+                // system 经 PromptAssembler 按段组装：角色段沿用 agent 表 prompt > 默认兜底，
+                // 其后按固定次序追加工具索引/工具纪律/输出约定/skill（扩展点）段
+                .system(promptAssembler.assemble(agentName, DEFAULT_SYSTEM_PROMPT))
                 .user(objective);
-        // 请求级工具注入（本 agent 名分配到的工具集，general=全量；与客户端 defaultTools 合并）
+        // 请求级工具注入（本 agent 名分配到的工具集，general=全量；与客户端 defaultTools 合并）：
+        // 双通道统一为 ToolCallback 单通道（@Tool 注解对象经 ToolCallbacks.from 转回调，与
+        // .tools 注入等价），便于 tracer 装饰与延迟加载统一加工
         ToolAssignments.ToolSet toolSet = toolAssignments == null
                 ? ToolAssignments.ToolSet.EMPTY
                 : toolAssignments.forAgent(agentName);
+        List<ToolCallback> tools = new ArrayList<>(toolSet.callbacks());
+        if (!toolSet.annotated().isEmpty()) {
+            tools.addAll(List.of(ToolCallbacks.from(toolSet.annotated().toArray())));
+        }
         if (toolEmitter != null) {
-            // 追踪模式：双通道统一为「装饰后的 ToolCallback」单通道，工具执行起止经 emitter 发进度行
-            List<ToolCallback> traced = new ArrayList<>(
-                    ToolCallTracer.trace(toolSet.callbacks(), toolEmitter));
-            traced.addAll(ToolCallTracer.traceAnnotated(toolSet.annotated(), toolEmitter));
-            if (!traced.isEmpty()) {
-                spec.toolCallbacks(traced.toArray(new ToolCallback[0]));
-            }
-        } else {
-            if (!toolSet.annotated().isEmpty()) {
-                // 必须 toArray 走 varargs Object... 重载（@Tool 对象解析）；传 List 会匹配
-                // List<ToolCallback> 重载导致「No @Tool annotated methods found」异常
-                spec.tools(toolSet.annotated().toArray());
-            }
-            if (!toolSet.callbacks().isEmpty()) {
-                spec.toolCallbacks(toolSet.callbacks().toArray(new ToolCallback[0]));
-            }
+            // 追踪模式：tracer 装饰真实工具，工具执行起止经 emitter 发进度行
+            tools = ToolCallTracer.trace(tools, toolEmitter);
+        }
+        // 延迟加载加工（最外层，包 tracer 装饰后的 callback）：未展开→轻量包装、已展开→透传，
+        // 末尾追加 expand_tool 元工具（不经 tracer——元工具不产生工具行噪声，真实工具行正常）；
+        // 开关关闭/无会话 ID 时全量透传现状
+        tools = lazyTools.process(sessionId, tools);
+        if (!tools.isEmpty()) {
+            spec.toolCallbacks(tools.toArray(new ToolCallback[0]));
         }
         if (model != null && !model.isBlank()) {
             spec.options(OpenAiChatOptions.builder().model(model).build());

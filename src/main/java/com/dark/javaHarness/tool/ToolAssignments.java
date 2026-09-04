@@ -36,6 +36,40 @@ public class ToolAssignments {
     private static final java.util.Set<String> MCP_TOOL_WHITELIST = java.util.Set.of(
             "browser_click", "browser_type", "browser_press_key", "browser_scroll");
 
+    /**
+     * 工具用途元数据：工具名 → 一句话用途，供 PromptAssembler 工具索引段渲染复用
+     * （覆盖自研 WebTools/演示工具、沙箱执行/读写文件/浏览器类与 MCP 白名单工具；
+     * 沙箱与 MCP 同名工具共用一条用途，如 browser_click/browser_type）。
+     */
+    private static final java.util.Map<String, String> TOOL_PURPOSES = java.util.Map.ofEntries(
+            // 自研 WebTools / 演示工具
+            java.util.Map.entry("fetchUrl", "抓取网页正文（去噪并按查询意图提取相关段落，仅 http/https）"),
+            java.util.Map.entry("getCurrentTime", "获取服务器当前本地时间"),
+            java.util.Map.entry("add", "计算两个整数相加"),
+            // 沙箱执行类（base 容器）
+            java.util.Map.entry("run_ipython_cell", "在沙箱容器内执行 Python 代码并返回输出"),
+            java.util.Map.entry("run_shell_command", "在沙箱容器内执行 Shell 命令并返回输出"),
+            // 沙箱只读文件类
+            java.util.Map.entry("fs_read_file", "读取容器内单个文件内容"),
+            java.util.Map.entry("fs_read_multiple_files", "批量读取容器内多个文件内容"),
+            java.util.Map.entry("fs_list_directory", "列出容器内目录内容"),
+            java.util.Map.entry("fs_directory_tree", "查看容器内目录树结构"),
+            java.util.Map.entry("fs_search_files", "按模式在容器内搜索文件"),
+            java.util.Map.entry("fs_get_file_info", "查看容器内文件/目录元信息"),
+            // 沙箱写入类
+            java.util.Map.entry("fs_write_file", "写入/新建容器内文件"),
+            java.util.Map.entry("fs_edit_file", "按查找替换编辑容器内文件"),
+            java.util.Map.entry("fs_create_directory", "在容器内创建目录"),
+            java.util.Map.entry("fs_move_file", "移动/重命名容器内文件或目录"),
+            // 沙箱浏览器类（browser 容器）+ MCP 白名单页面交互类
+            java.util.Map.entry("browser_navigate", "浏览器导航打开 URL（可获取 JS 渲染后的页面）"),
+            java.util.Map.entry("browser_snapshot", "获取浏览器页面无障碍快照（当前结构与文本）"),
+            java.util.Map.entry("browser_click", "点击浏览器页面元素"),
+            java.util.Map.entry("browser_type", "向浏览器页面元素输入文本"),
+            java.util.Map.entry("browser_press_key", "在浏览器页面按键"),
+            java.util.Map.entry("browser_scroll", "滚动浏览器页面"),
+            java.util.Map.entry("browser_close", "关闭浏览器"));
+
     /** 双通道工具集：@Tool 注解对象（.tools 注入）+ ToolCallback（.toolCallbacks 注入） */
     public record ToolSet(List<Object> annotated, List<ToolCallback> callbacks) {
 
@@ -74,6 +108,14 @@ public class ToolAssignments {
                             sandbox.browserTools(), mcpTools()));
             default -> ToolSet.EMPTY;
         };
+    }
+
+    /** 查工具一句话用途；未登记返回空串 */
+    public String purposeOf(String toolName) {
+        if (toolName == null) {
+            return "";
+        }
+        return TOOL_PURPOSES.getOrDefault(toolName, "");
     }
 
     /** MCP 工具经白名单过滤后再参与分配（收窄 schema 开销 + 维持最小权限） */
