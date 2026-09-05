@@ -20,7 +20,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.stereotype.Service;
 
@@ -33,6 +32,8 @@ import org.springframework.stereotype.Service;
  *   【完整会话上下文】：
  *   [{"role":"user","content":"..."},{"role":"assistant","content":"..."},...]
  *   每条新消息追加进该行 content；读取时还原全部历史。
+ *   只存 user/assistant 两类角色：system 角色提示词每次请求现组装，一旦落库，
+ *   旧提示词会在后续轮次抢占上下文头部，导致角色错位。
  *
  * sessionId 使用 session 表自增主键的字符串形式，与 session_messages.session_id（varchar）对齐。
  */
@@ -230,24 +231,14 @@ public class SessionServiceImpl implements SessionService {
         }
     }
 
-    /** 由 role 字符串还原 Spring AI Message */
+    /** 由 role 字符串还原 Spring AI Message（会话快照只存 user/assistant，未知角色按 user 还原） */
     private Message toMessage(String role, String content) {
-        return switch (role == null ? "user" : role) {
-            case "assistant" -> new AssistantMessage(content);
-            case "system" -> new SystemMessage(content);
-            default -> new UserMessage(content);
-        };
+        return "assistant".equals(role) ? new AssistantMessage(content) : new UserMessage(content);
     }
 
-    /** 由 Spring AI Message 得到 role 字符串 */
+    /** 由 Spring AI Message 得到 role 字符串（system 角色提示词不入库：每次请求现组装，落库会造成角色错位） */
     private String roleOf(Message message) {
-        if (message instanceof AssistantMessage) {
-            return "assistant";
-        }
-        if (message instanceof SystemMessage) {
-            return "system";
-        }
-        return "user";
+        return message instanceof AssistantMessage ? "assistant" : "user";
     }
 
     /** 字符串截断到指定最大长度（null 返回空串） */

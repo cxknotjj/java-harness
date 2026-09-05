@@ -12,7 +12,6 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import java.util.List;
-import java.util.function.Consumer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -61,7 +60,6 @@ class GeneralAssistantAgentTest {
     void executeStreamReactive_shouldEmitTokensProgressively() {
         List<String> tokens = List.of("你好", "，", "\n", "世界");
         when(requestSpec.advisors(any(Advisor.class))).thenReturn(requestSpec);
-        when(requestSpec.advisors(anyConsumer())).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.stream()).thenReturn(streamSpec);
@@ -72,10 +70,5 @@ class GeneralAssistantAgentTest {
                 .block();
 
         assertEquals(tokens, out, "应逐 token 原样透传，元素数量与顺序不变");
-    }
-
-    /** 泛型辅助：匹配 Consumer 重载的 advisors(...)，避免依赖具体嵌套类型名 */
-    private static <T> Consumer<T> anyConsumer() {
-        return any();
     }
 }

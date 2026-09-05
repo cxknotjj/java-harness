@@ -18,8 +18,7 @@ import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
-import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.support.ToolCallbacks;
 import org.springframework.ai.tool.ToolCallback;
@@ -116,7 +115,7 @@ public class GeneralAssistantAgent implements Agent {
         return agentName;
     }
 
-    /** 同步执行目标：调用大模型返回完整回复（历史由 MessageChatMemoryAdvisor 注入） */
+    /** 同步执行目标：调用大模型返回完整回复（历史只读注入，写入由 ChatService 统一负责） */
     @Override
     public String execute(Goal goal) {
         log.info("AI agent '{}' 开始处理目标: {}", name(), goal.objective());
@@ -176,7 +175,7 @@ public class GeneralAssistantAgent implements Agent {
      * 响应式流式执行：真·逐 token 发射（ChatClient.stream().content()）。
      * 覆写接口 default——否则会退化为「同步 execute 阻塞生成完 → 一次性产出」，CLI 将全程无输出干等。
      * 工具调用起止经旁路 sink 合并进同一 Flux（ProgressLine 进度行，与路径 B 通道一致），
-     * CLI 据此展示工具调用行；会话记忆持久化由框架 Advisor 与 ChatService 在流结束后统一负责，此处不做。
+     * CLI 据此展示工具调用行；会话记忆写入统一由 ChatService 在流结束后负责，此处不做。
      */
     @Override
     public Flux<String> executeStreamReactive(Goal goal) {
@@ -229,7 +228,7 @@ public class GeneralAssistantAgent implements Agent {
                 System.currentTimeMillis() - start, msg));
     }
 
-    /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史由 MessageChatMemoryAdvisor 注入，上下文由组装拦截器裁剪；system 经 PromptAssembler 按段组装 */
+    /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史只读注入，上下文由组装拦截器裁剪；system 经 PromptAssembler 按段组装 */
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective) {
         return buildChatRequestSpec(sessionId, objective, null);
     }
@@ -245,15 +244,20 @@ public class GeneralAssistantAgent implements Agent {
         log.info("[agent请求] agentName='{}' -> 配置 modelProviderId={}, model='{}'，实际使用 client={}",
                 name(), config.modelProviderId(), model, client == null ? "null" : client.getClass().getSimpleName());
         ChatClient.ChatClientRequestSpec spec = client.prompt()
-                // 官方记忆 Advisor：从 SessionService(ChatMemory) 按会话ID注入历史
-                .advisors(MessageChatMemoryAdvisor.builder(memoryStore).build())
-                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId))
-                // 上下义组装拦截器：对注入后的序列做过滤/截断/role 归一化（token 预算控制）
+                // 只读注入历史：手动加载会话上下文拼进请求消息。不挂 MessageChatMemoryAdvisor——
+                // 该 advisor 会自动写回（before 写 user、after 写 assistant），与 ChatService 的
+                // 统一写回双写污染会话；只读注入同时让 ContextAssemblingAdvisor 对「历史 + 本轮」
+                // 整体做 role 归一化与预算裁剪（advisor 方式下历史在裁剪之后才合并，不受控）
                 .advisors(new ContextAssemblingAdvisor(historyBudget))
                 // system 经 PromptAssembler 按段组装：角色段沿用 agent 表 prompt > 默认兜底，
                 // 其后按固定次序追加工具索引/工具纪律/输出约定/skill（扩展点）段
                 .system(promptAssembler.assemble(agentName, DEFAULT_SYSTEM_PROMPT))
                 .user(objective);
+        // 会话历史只读注入（空会话/空历史跳过；写入由 ChatService 统一负责，本类不写）
+        List<Message> history = memoryStore.get(sessionId);
+        if (history != null && !history.isEmpty()) {
+            spec.messages(history);
+        }
         // 请求级工具注入（本 agent 名分配到的工具集，general=全量；与客户端 defaultTools 合并）：
         // 双通道统一为 ToolCallback 单通道（@Tool 注解对象经 ToolCallbacks.from 转回调，与
         // .tools 注入等价），便于 tracer 装饰与延迟加载统一加工

@@ -7,8 +7,9 @@ import java.util.Set;
  *
  * <p>角色策略全集：
  * <ul>
- *   <li>{@code lead}（编排拆解）：注入——经编排调用器 AgentChatCaller 挂载，
- *       装配与路径 A 完全同口径（MessageChatMemoryAdvisor + ContextAssemblingAdvisor 预算裁剪）</li>
+ *   <li>{@code lead}（编排拆解）：注入——经编排调用器 AgentChatCaller 只读拼入请求消息
+ *       （与路径 A 同口径：同一 SessionService 记忆源 + ContextAssemblingAdvisor 预算裁剪），
+ *       不挂 MessageChatMemoryAdvisor（其自动写回会把编排中间产物入库，污染后续轮次）</li>
  *   <li>{@code general}（简单路径）：注入——路径 A 现状，由 GeneralAssistantAgent 自行装配，不经编排调用器</li>
  *   <li>{@code aggregator} 与子任务专家（researcher/coder/analyst/writer 等）：不注入——
  *       聚合忠实于各子任务结果，子任务上下文由 lead 在子任务描述中传递</li>

@@ -21,9 +21,8 @@ import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
-import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import org.springframework.ai.support.ToolCallbacks;
@@ -40,10 +39,10 @@ import org.springframework.ai.tool.ToolCallback;
  * 输出约定等段随后按固定次序追加。兜底角色指令不再拼进 user（原双段拼接由
  * 组装管线收敛为 system 段）。
  *
- * <p>记忆注入（spec 子项 5）：经 {@link MemoryPolicy} 按策略挂载会话记忆 advisor——
- * 仅 lead 拆解节点注入（与路径 A 同口径：同一 SessionService 记忆源 +
- * ContextAssemblingAdvisor 预算裁剪），aggregator 与子任务专家不注入；无会话 ID 或
- * 未提供记忆源（单测场景）时跳过。
+ * <p>记忆注入（spec 子项 5）：经 {@link MemoryPolicy} 按策略只读注入会话历史——仅 lead 拆解
+ * 节点注入（手动 loadContext 拼进请求消息 + ContextAssemblingAdvisor 预算裁剪，不挂
+ * MessageChatMemoryAdvisor 以避免其自动写回污染会话），aggregator 与子任务专家不注入；
+ * 无会话 ID 或未提供记忆源（单测场景）时跳过。
  *
  * <p>观测：每次调用结束（成功/失败）经 {@link LlmCallRecorder} 异步记录耗时与 token
  * 消耗——call/stream 统一走流式通道后无 usage 回包，token 按输出文本近似估算
@@ -441,12 +440,18 @@ final class AgentChatCaller {
         ChatClient.ChatClientRequestSpec spec = client.prompt()
                 .system(promptAssembler.assemble(forAgent, fallbackSystem))
                 .user(user);
-        // 记忆注入（编排路径唯一注入点：lead 拆解）：策略判定 + 会话 ID + 记忆源三重把关，
-        // 装配与路径 A 完全同口径（MessageChatMemoryAdvisor + CONVERSATION_ID + ContextAssemblingAdvisor 预算裁剪）；
-        // aggregator/子任务专家不挂任何记忆 advisor（子任务上下文由 lead 在子任务描述中传递）
+        // 记忆注入（编排路径唯一注入点：lead 拆解）：策略判定 + 会话 ID + 记忆源三重把关。
+        // 只读注入：手动加载历史拼进请求消息，不挂 MessageChatMemoryAdvisor——该 advisor 会
+        // 自动写回（before 写 lead 内部 user 指令、after 写 JSON 拆解产物），编排中间产物一旦
+        // 入库会被后续轮次当历史载入，造成角色错位；会话写回统一由 ChatService 负责。
+        // 手动注入同时让 ContextAssemblingAdvisor 对「历史 + 本轮」整体做归一化与预算裁剪
+        // （advisor 方式下历史在裁剪之后才合并，既不受预算约束也不做 role 归一化）。
+        // aggregator/子任务专家不注入（子任务上下文由 lead 在子任务描述中传递）
         if (memoryStore != null && memoryPolicy.shouldInject(forAgent, sessionId)) {
-            spec.advisors(MessageChatMemoryAdvisor.builder(memoryStore).build());
-            spec.advisors(a -> a.param(ChatMemory.CONVERSATION_ID, sessionId));
+            List<Message> history = memoryStore.get(sessionId);
+            if (history != null && !history.isEmpty()) {
+                spec.messages(history);
+            }
             spec.advisors(new ContextAssemblingAdvisor(budgets.getHistoryBudget()));
         }
         // 请求级 advisor 挂载（如 lead/聚合的 PromptBudgetAdvisor）：

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -22,7 +23,7 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.tool.ToolAssignments;
-import java.util.function.Consumer;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -31,6 +32,8 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClient.ChatClientRequestSpec;
 import org.springframework.ai.chat.client.ChatClient.StreamResponseSpec;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.UserMessage;
 import reactor.core.publisher.Flux;
 
 /**
@@ -321,27 +324,29 @@ class MultiAgentGraphAgentTest {
     /* ---------------- 记忆动态注入（MemoryPolicy） ---------------- */
 
     /**
-     * 记忆动态注入：lead 拆解带会话记忆 advisor（与路径 A 同口径：MessageChatMemoryAdvisor +
-     * CONVERSATION_ID 参数 + ContextAssemblingAdvisor 预算裁剪），子任务专家（含未指派回退的
-     * general 兜底专家身份）与聚合节点不挂任何记忆 advisor。
+     * 记忆只读注入：lead 拆解把会话历史只读拼入请求消息（不挂 MessageChatMemoryAdvisor，
+     * 避免其自动写回把编排中间产物入库）+ ContextAssemblingAdvisor 预算裁剪，
+     * 子任务专家（含未指派回退的 general 兜底专家身份）与聚合节点不注入。
      */
     @Test
-    void execute_leadWithSession_carriesMemoryAdvisor_subtasksAndAggregateDoNot() {
-        // 一条指派 researcher、一条未指派（执行时回退 general 兜底专家身份）：两路子任务都不得挂记忆
+    void execute_leadWithSession_injectsHistoryReadOnly_subtasksAndAggregateDoNot() {
+        // 一条指派 researcher、一条未指派（执行时回退 general 兜底专家身份）：两路子任务都不注入
         String leadJson = "{\"subtasks\":[{\"desc\":\"调研竞品\",\"agent\":\"researcher\"},{\"desc\":\"撰写摘要\"}]}";
         stubChat(leadJson);
+        when(memoryStore.get("sess-1")).thenReturn(List.of(new UserMessage("上一轮用户提问"), new AssistantMessage("上一轮回答")));
+        when(requestSpec.messages(anyList())).thenReturn(requestSpec);
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
                 null, null, memoryStore);
 
         agent.execute(new Goal("gm1", "调研竞品并撰写摘要", "sess-1"));
 
-        // 仅 lead 1 次调用挂载：记忆 advisor + 会话 ID 参数 + 上下文裁剪
-        verify(requestSpec, org.mockito.Mockito.times(1)).advisors(any(MessageChatMemoryAdvisor.class));
-        verify(requestSpec, org.mockito.Mockito.times(1)).advisors(anyConsumer());
+        // 仅 lead 1 次调用注入历史（只读，无记忆 advisor、无 CONVERSATION_ID 参数）+ 上下文裁剪
+        verify(requestSpec, org.mockito.Mockito.times(1)).messages(anyList());
+        verify(requestSpec, never()).advisors(any(MessageChatMemoryAdvisor.class));
         verify(requestSpec, org.mockito.Mockito.times(1)).advisors(any(ContextAssemblingAdvisor.class));
     }
 
-    /** 无会话 ID（Goal 未关联会话）→ lead 也不挂记忆 advisor（策略：无会话 ID 场景一律不注入） */
+    /** 无会话 ID（Goal 未关联会话）→ lead 也不注入历史（策略：无会话 ID 场景一律不注入） */
     @Test
     void execute_withoutSessionId_skipsMemoryAdvisor() {
         stubChat(fixedContent());
@@ -350,14 +355,9 @@ class MultiAgentGraphAgentTest {
 
         agent.execute(new Goal("gm2", "调研竞品并输出报告"));
 
+        verify(requestSpec, never()).messages(anyList());
         verify(requestSpec, never()).advisors(any(MessageChatMemoryAdvisor.class));
-        verify(requestSpec, never()).advisors(anyConsumer());
         verify(requestSpec, never()).advisors(any(ContextAssemblingAdvisor.class));
-    }
-
-    /** 泛型辅助：匹配 Consumer 重载的 advisors(...)（记忆 advisor 的 CONVERSATION_ID 参数挂载），避免依赖具体嵌套类型名 */
-    private static <T> Consumer<T> anyConsumer() {
-        return any();
     }
 
     /* ---------------- 断点续跑（Checkpointer） ---------------- */
