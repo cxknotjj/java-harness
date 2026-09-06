@@ -11,9 +11,11 @@ import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.GoalService;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -34,15 +36,18 @@ public class AgentServiceImpl implements AgentService {
     private final GoalService goalService;
     private final AgentConfigProvider agentConfigProvider;
     private final AgentRegistry agentRegistry;
+    private final Executor goalExecutor;
 
     public AgentServiceImpl(GoalService goalService,
                             AgentConfigProvider agentConfigProvider,
-                            @Lazy AgentRegistry agentRegistry) {
+                            @Lazy AgentRegistry agentRegistry,
+                            @Qualifier("goalExecutor") Executor goalExecutor) {
         this.goalService = goalService;
         this.agentConfigProvider = agentConfigProvider;
         // @Lazy 代理断环：AgentRegistry bean 创建期 init() 会经 ObjectProvider 现取本 bean，
         // 双方在创建期互等，代理注入推迟解析到首次路由调用（届时 Registry 已装配完成）
         this.agentRegistry = agentRegistry;
+        this.goalExecutor = goalExecutor;
     }
 
     /** 提交目标给指定 Agent 异步执行（立即返回，后台执行） */
@@ -50,7 +55,15 @@ public class AgentServiceImpl implements AgentService {
     public Goal submit(String agentName, String objective) {
         Agent agent = requireAgent(agentName);
         Goal goal = goalService.create(objective);
-        CompletableFuture.runAsync(() -> run(goal, agent));
+        try {
+            goalExecutor.execute(() -> run(goal, agent));
+        } catch (RejectedExecutionException e) {
+            // 队列已满：立即落为 FAILED 终态供客户端轮询可见，不留无声排队的 PENDING
+            String reason = "执行队列已满，任务被拒绝，请稍后重试";
+            log.warn("[{}] goal '{}' 提交被拒绝：{}", goal.id(), goal.objective(), reason);
+            goal.fail(reason);
+            goalService.update(goal);
+        }
         return goal;
     }
 
@@ -174,9 +187,10 @@ public class AgentServiceImpl implements AgentService {
             goal.succeed(summary);
             goalService.update(goal);
             log.info("[{}] goal '{}' SUCCEEDED -> {}", goal.id(), goal.objective(), summary);
-        } catch (Exception e) {
-            // 目标失败是正常业务结果（如未配置 API key 时的 401），只记一行摘要避免刷屏
-            String reason = errorReason(e);
+    } catch (Throwable e) {
+        // 目标失败是正常业务结果（如未配置 API key 时的 401），只记一行摘要避免刷屏；
+        // 捕获 Throwable：Error 逃逸若不在此回写，goal 会永久卡 RUNNING（只能等重启清理）
+        String reason = errorReason(e);
             log.warn("[{}] goal '{}' FAILED: {}", goal.id(), goal.objective(), reason);
             goal.fail(reason);
             goalService.update(goal);

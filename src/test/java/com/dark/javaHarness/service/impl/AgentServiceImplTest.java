@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.agent.Agent;
@@ -18,6 +20,10 @@ import com.dark.javaHarness.service.GoalService;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.BeforeEach;
@@ -25,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import reactor.core.publisher.Flux;
 
 /**
@@ -35,6 +42,7 @@ import reactor.core.publisher.Flux;
  * - agentNames 委托 registry 动态路由表
  * - 表行 Agent（deepseek/nailong）经 registry 返回实例（GA 实例/惰性注册）后正常路由
  * - 流式全链路生命周期（成功/失败/断连取消）不回归
+ * - submit 异步执行容量语义：10 并发全终态、队列满拒绝兜底、Error 逃逸回写 FAILED
  */
 @ExtendWith(MockitoExtension.class)
 class AgentServiceImplTest {
@@ -50,7 +58,8 @@ class AgentServiceImplTest {
 
     @BeforeEach
     void setUp() {
-        agentService = new AgentServiceImpl(goalService, agentConfigProvider, agentRegistry);
+        // Runnable::run 同步执行器：路由/生命周期用例无需真实异步；submit 容量语义用例自建真实线程池
+        agentService = new AgentServiceImpl(goalService, agentConfigProvider, agentRegistry, Runnable::run);
     }
 
     /** 创建能记录 "被路由到哪个 agent" 的 stub Agent：executeStream/execute 时把 name 记入 AtomicReference */
@@ -256,5 +265,113 @@ class AgentServiceImplTest {
 
         assertEquals(List.of("ok-nailong"), tokens, "运行时插行经惰性注册后应可路由");
         assertEquals("nailong", routedTo.get());
+    }
+
+    /* ---------------- submit 异步执行（受管线程池容量语义） ---------------- */
+
+    /** 小容量真实线程池：验证容量语义（排队/拒绝），随用例手动 shutdown */
+    private static ThreadPoolTaskExecutor pool(int core, int queue) {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(core);
+        executor.setMaxPoolSize(core);
+        executor.setQueueCapacity(queue);
+        executor.setThreadNamePrefix("test-goal-");
+        // 收尾走优雅停机：默认 shutdownNow 会中断在途任务，把放行后的任务打成 InterruptedException FAILED
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationMillis(5_000);
+        executor.initialize();
+        return executor;
+    }
+
+    /** 验收主用例：并发提交 10 个 Goal 稳定执行——全部到达 SUCCEEDED 终态，无拒绝、无卡 RUNNING */
+    @Test
+    void submit_tenConcurrentGoals_allReachSucceeded() throws Exception {
+        ThreadPoolTaskExecutor executor = pool(4, 20);
+        try {
+            Agent agent = mock(Agent.class);
+            CountDownLatch release = new CountDownLatch(1);
+            // 执行体堵在闸门上：保证 10 个提交（4 在途 + 6 排队）全部受理后才一起放行
+            when(agent.execute(any())).thenAnswer(inv -> {
+                release.await(10, TimeUnit.SECONDS);
+                return "done";
+            });
+            when(agentRegistry.require("general")).thenReturn(agent);
+            when(goalService.create(anyString()))
+                    .thenAnswer(inv -> new Goal("goal-" + UUID.randomUUID(), inv.getArgument(0, String.class)));
+            AgentServiceImpl svc = new AgentServiceImpl(goalService, agentConfigProvider, agentRegistry, executor);
+
+            int n = 10;
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch submitted = new CountDownLatch(n);
+            List<Goal> goals = new CopyOnWriteArrayList<>();
+            for (int i = 0; i < n; i++) {
+                new Thread(() -> {
+                    try {
+                        assertTrue(start.await(5, TimeUnit.SECONDS));
+                        goals.add(svc.submit("general", "obj"));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        submitted.countDown();
+                    }
+                }).start();
+            }
+            start.countDown();
+            assertTrue(submitted.await(5, TimeUnit.SECONDS), "10 个并发提交应全部受理");
+            release.countDown();
+
+            // 每 goal 两次 update（markRunning + succeed），20 次到齐即全部到达终态
+            verify(goalService, timeout(10_000).times(2 * n)).update(any());
+            assertTrue(goals.stream().allMatch(g -> g.status() == GoalStatus.SUCCEEDED),
+                    "10 个 Goal 应全部 SUCCEEDED，无拒绝、无卡 RUNNING");
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+    /** 拒绝兜底：队列满时 submit 不外抛，goal 落为 FAILED 终态（客户端轮询可见）而非无声排队 */
+    @Test
+    void submit_queueFull_marksGoalFailedInsteadOfThrowing() throws Exception {
+        ThreadPoolTaskExecutor executor = pool(1, 0); // 同步队列：唯一线程被占后必拒绝
+        try {
+            Agent agent = mock(Agent.class);
+            CountDownLatch occupied = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            when(agent.execute(any())).thenAnswer(inv -> {
+                occupied.countDown();
+                release.await(10, TimeUnit.SECONDS);
+                return "done";
+            });
+            when(agentRegistry.require("general")).thenReturn(agent);
+            when(goalService.create(anyString()))
+                    .thenAnswer(inv -> new Goal("goal-reject", inv.getArgument(0, String.class)));
+            AgentServiceImpl svc = new AgentServiceImpl(goalService, agentConfigProvider, agentRegistry, executor);
+
+            svc.submit("general", "第一个任务占住唯一线程");
+            assertTrue(occupied.await(5, TimeUnit.SECONDS), "第一个任务应已占用唯一线程");
+
+            Goal rejected = svc.submit("general", "第二个任务应被拒绝");
+
+            assertEquals(GoalStatus.FAILED, rejected.status(), "被拒绝的 goal 应落为 FAILED 终态");
+            assertTrue(rejected.summary().contains("队列已满"), "失败原因应写明队列已满");
+            release.countDown();
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+    /** Error 逃逸兜底：execute 抛 Error（非 Exception）也回写 FAILED，不再卡 RUNNING */
+    @Test
+    void submit_agentThrowsError_marksGoalFailed() {
+        Agent agent = mock(Agent.class);
+        when(agent.execute(any())).thenThrow(new LinkageError("类加载失败"));
+        when(agentRegistry.require("general")).thenReturn(agent);
+        when(goalService.create(anyString()))
+                .thenAnswer(inv -> new Goal("goal-error", inv.getArgument(0, String.class)));
+
+        Goal goal = agentService.submit("general", "obj"); // setUp 注入 Runnable::run，同步执行
+
+        assertEquals(GoalStatus.FAILED, goal.status());
+        assertEquals("类加载失败", goal.summary());
     }
 }
