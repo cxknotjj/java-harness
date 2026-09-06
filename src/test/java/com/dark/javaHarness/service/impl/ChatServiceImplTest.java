@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -182,6 +183,22 @@ class ChatServiceImplTest {
 
         assertTrue(lines.contains("event: token\ndata: writer-token"), "应按 agentId 路由到对应 Agent 的流");
         verify(agentService, never()).executeStreamReactive(anyString(), anyString(), anyString());
+        // 请求携带 agentId 即视为会话内切换：session 表 agent_id 需同步
+        verify(sessionService).switchAgent("50", 2L);
+    }
+
+    @Test
+    void streamReactive_withAgentId_switchSyncFails_shouldNotBreakStream() {
+        // 会话 Agent 同步失败（如 agentId 不存在）只告警不中断：路由侧自行回退默认 Agent
+        ChatRequest req = new ChatRequest("hi", "50", 99L);
+        doThrow(new IllegalArgumentException("agent 不存在: 99"))
+                .when(sessionService).switchAgent("50", 99L);
+        when(agentService.executeStreamReactiveByAgentId(99L, "hi", "50"))
+                .thenReturn(Flux.just("fallback-token"));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        assertTrue(lines.contains("event: token\ndata: fallback-token"), "同步失败不得影响本次聊天流");
     }
 
     @Test

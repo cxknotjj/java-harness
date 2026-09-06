@@ -7,6 +7,7 @@ import com.dark.javaHarness.domain.entity.SessionEntity;
 import com.dark.javaHarness.domain.entity.SessionMessageEntity;
 import com.dark.javaHarness.mapper.SessionMapper;
 import com.dark.javaHarness.mapper.SessionMessageMapper;
+import com.dark.javaHarness.service.AgentConfigProvider;
 import com.dark.javaHarness.service.SessionService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -54,13 +55,17 @@ public class SessionServiceImpl implements SessionService {
     private final SessionMapper sessionMapper;
     private final SessionMessageMapper messageMapper;
     private final ObjectMapper objectMapper;
+    /** agent 表读取器：switchAgent 校验目标 agentId 存在性 */
+    private final AgentConfigProvider agentConfigProvider;
 
     public SessionServiceImpl(SessionMapper sessionMapper,
                               SessionMessageMapper messageMapper,
-                              ObjectMapper objectMapper) {
+                              ObjectMapper objectMapper,
+                              AgentConfigProvider agentConfigProvider) {
         this.sessionMapper = sessionMapper;
         this.messageMapper = messageMapper;
         this.objectMapper = objectMapper;
+        this.agentConfigProvider = agentConfigProvider;
     }
 
     /** 创建新会话（会话名取首条提问截断），返回自增主键的字符串形式 */
@@ -180,6 +185,33 @@ public class SessionServiceImpl implements SessionService {
         QueryWrapper<SessionEntity> qw = new QueryWrapper<>();
         qw.eq("session_id", sid);
         return sessionMapper.selectOne(qw);
+    }
+
+    /** 会话内切换 Agent：agentId 存在性校验 + 会话存在性校验后更新 agent_id（与当前值相同跳过写库） */
+    @Override
+    public void switchAgent(String sessionId, Long agentId) {
+        Long sid = parseSessionId(sessionId);
+        if (sid == null) {
+            throw new IllegalArgumentException("非法 sessionId: " + sessionId);
+        }
+        if (agentId == null) {
+            throw new IllegalArgumentException("agentId 不能为空");
+        }
+        SessionEntity session = getSession(sessionId);
+        if (session == null) {
+            throw new IllegalArgumentException("会话不存在: " + sessionId);
+        }
+        String agentName = agentConfigProvider.findAgentNameById(agentId)
+                .orElseThrow(() -> new IllegalArgumentException("agent 不存在: " + agentId));
+        if (session.getAgentId() != null && session.getAgentId().longValue() == agentId) {
+            log.debug("会话已绑定该 Agent，跳过更新 sessionId={} agentId={}", sessionId, agentId);
+            return;
+        }
+        UpdateWrapper<SessionEntity> uw = new UpdateWrapper<>();
+        uw.eq("session_id", sid)
+                .set("agent_id", agentId);
+        sessionMapper.update(null, uw);
+        log.info("会话切换 Agent sessionId={} -> agentId={}('{}')", sessionId, agentId, agentName);
     }
 
     /** 分页查询会话（软删除的不会返回），按会话ID降序（最新在前） */

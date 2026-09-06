@@ -110,6 +110,17 @@ public class ChatServiceImpl implements ChatService {
                 : Mono.just(new SessionCtx(existing, false));
 
         return sessionMono.flatMapMany(ctx -> {
+            // 请求携带 agentId 即视为「会话内切换 Agent」：同步更新 session 表 agent_id，
+            // 会话档案与实际路由保持一致（新建会话则从默认 1 修正为请求指定的 Agent）。
+            // 失败只告警不中断：路由侧 executeStreamReactiveByAgentId 对非法 agentId 已回退默认 Agent
+            if (request.agentId() != null) {
+                try {
+                    sessionService.switchAgent(ctx.sid(), request.agentId());
+                } catch (Exception e) {
+                    log.warn("[chat] 会话 Agent 同步失败（不影响本次路由）sid={} agentId={}: {}",
+                            ctx.sid(), request.agentId(), safeMessage(e));
+                }
+            }
             // agentId 非空时按该 Agent 路由，否则走默认 Agent
             Flux<String> agentTokens = (request.agentId() != null)
                     ? agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())

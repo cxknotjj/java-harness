@@ -5,6 +5,7 @@ import com.dark.javaHarness.domain.dto.AgentsView;
 import java.util.List;
 import com.dark.javaHarness.domain.dto.GoalView;
 import com.dark.javaHarness.domain.dto.GoalsView;
+import com.dark.javaHarness.domain.dto.SessionAgentView;
 import com.dark.javaHarness.domain.dto.SessionCreatedView;
 import com.dark.javaHarness.domain.dto.SessionPageView;
 import com.dark.javaHarness.domain.dto.SubmitView;
@@ -56,6 +57,17 @@ public class HarnessController {
     public SessionCreatedView createSession(@RequestParam(defaultValue = "新会话") String name) {
         String sessionId = sessionService.createSession("cli", name);
         return new SessionCreatedView(sessionId, name);
+    }
+
+    /**
+     * 会话内切换 Agent：更新 session 表 agent_id（当前会话此后固定路由到该 Agent）。
+     * agentId 不存在/会话不存在抛 IllegalArgumentException（全局处理器映射 400）。
+     */
+    @PostMapping("/sessions/{sessionId}/agent")
+    public SessionAgentView switchAgent(@PathVariable String sessionId, @RequestParam Long agentId) {
+        sessionService.switchAgent(sessionId, agentId);
+        String agentName = agentService.findAgentNameById(agentId).orElse(null);
+        return new SessionAgentView(sessionId, agentId, agentName);
     }
 
     /** 提交一个目标给指定 Agent 异步执行 */

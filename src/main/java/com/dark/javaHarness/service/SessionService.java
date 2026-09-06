@@ -38,6 +38,14 @@ public interface SessionService extends ChatMemory {
     SessionEntity getSession(String sessionId);
 
     /**
+     * 会话内切换 Agent：校验 agentId 在 agent 表存在后，更新 session 表 agent_id。
+     * 与当前值相同则跳过写库（幂等，聊天路径每条消息都带 agentId 时避免无谓更新）。
+     *
+     * @throws IllegalArgumentException sessionId 非法、会话不存在或 agentId 在 agent 表无记录
+     */
+    void switchAgent(String sessionId, Long agentId);
+
+    /**
      * 分页查询会话（软删除的不会返回），按会话ID降序（最新在前）。
      * @param current 页码，从 1 开始
      * @param size    每页条数

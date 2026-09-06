@@ -208,6 +208,24 @@ public class ChatApiClient {
     }
 
     /**
+     * 调用 POST /api/harness/sessions/{sessionId}/agent?agentId=... 会话内切换 Agent。
+     * 服务端更新 session 表 agent_id（会话档案与路由一致）。
+     *
+     * @throws IOException 网络错误，或非 2xx 响应（agentId 不存在/会话不存在为 400，消息含服务端原因）
+     */
+    public void switchSessionAgent(String sessionId, long agentId) throws IOException {
+        Request request = new Request.Builder()
+                .url(baseUrl + "/api/harness/sessions/" + sessionId + "/agent?agentId=" + agentId)
+                .post(RequestBody.create(new byte[0], null))
+                .build();
+        try (Response resp = http.newCall(request).execute()) {
+            if (!resp.isSuccessful()) {
+                throw new ApiException(resp.code(), resp.body().string());
+            }
+        }
+    }
+
+    /**
      * 调用 GET /api/chat/goal-status?goalId=... 查询 goal 生命周期状态。
      *
      * @return 状态名（PENDING/RUNNING/SUCCEEDED/FAILED）；goal 不存在返回 null（404）
