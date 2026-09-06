@@ -44,6 +44,7 @@
 **短板（按风险排序）**：
 
 1. **可靠性弱**：LLM 调用失败即整体失败（无重试/降级/熔断）；无并发上限，多请求可打爆线程池与模型配额——demo 可跑，多人不可用
+   （2026-09 部分收口：LLM 调用已有 `LlmRetry` 三次指数退避；后台 Goal 已有受管线程池容量上限与拒绝兜底，见存档「异步治理与发布工程」——限流/熔断/降级仍缺）
 2. **能力面窄**：无 web search（查资料仅 fetchUrl+浏览器硬抓）；无 RAG（不能知识库问答）；无 MCP（工具生态扩展受限）——「调研/报告」核心卖点被卡在信息获取第一步
 3. **编排智能化初级**：lead 一次性拆解、子任务纯并行无依赖、失败无重规划/反思——复杂任务成功率受限
 4. **可观测空白**：LLM 调用耗时 / token 成本 / 链路不可见，调优靠日志肉翻
@@ -56,12 +57,21 @@
 - **中期 = 编排智能化**（失败重规划 / 子任务依赖）：能力面铺完后收益最大，agent 从「能跑」到「聪明」
 - **远期 = 工程化可观测 + 产品化**（监控/追踪/容器化/前端）：按需启动
 
+**发展方向增补（2026-09-06 评估）**：
+
+- **Goal 失败重投任务化**（新增至 P2）：线程池治理完成后可靠性补全的下一块；设计要点已评估（路由列迁移 + 瞬态失败限定 + 防双跑），详见 P2 条目
+- **多实例水平扩展**（新增至 P3）：解除单实例假设——`failAllRunning` 启动清理、本地线程池、GRAPH_CHECKPOINT 单写者；与「消息队列」条目合并推进
+- **长期记忆滚动摘要**（新增至 P2）：当前历史为全量快照 + 预算裁剪（最旧轮次直接丢弃），超长会话会丢单
+- **Agent 行为回归评测集**（新增至 P3）：prompt / 模型参数改动后防回归的固定评测集，与 `llm_call_log` 成本账本互补
+- **多模态输入**（远期备选）：视觉模型（qwen-vl 类）经 agent 表接入，待真实需求再启动
+
 ## P0 · 可靠性与安全收口（眼前优先，先做稳）
 
 - [ ] **模型调用重试/限流**：Spring Retry / Resilience4j，模型失败自动重试（指数退避，可重试错误与限流错误区分），接口限流防刷
   - 验收：bad key 场景按策略重试后失败；限流返回 429
-- [ ] **并发 / 资源控制**：流式连接数限制、异步线程池隔离与参数化、模型调用超时兜底与熔断降级（COMPLEX 编排失败可降级为 SIMPLE 单模型重答）
-  - 验收：并发提交多个流式请求稳定，无连接/线程池耗尽
+- [ ] **并发 / 资源控制**：流式连接数限制、模型调用超时兜底与熔断降级（COMPLEX 编排失败可降级为 SIMPLE 单模型重答）
+  - 2026-09 部分完成：异步线程池隔离与参数化已落地（`goalExecutor` 有界池 + 拒绝兜底 + MVC 异步槽位，见存档「异步治理与发布工程」）；连接数限制与熔断降级待做
+  - 验收：并发提交多个流式请求稳定，无连接/线程池耗尽（线程池部分已由 10 并发 submit 用例覆盖）
 - [ ] **工具分配最小权限化**：现状按「能力类别」粒度分配（`ToolAssignments` 给整组工具），存在权限漏洞：
   - **`general`** **全量过宽且是所有回退路径的落点**：路由兜底、未识别专家、lead 漏指派全部落 general——最宽权限（执行/容器写/网页）给了最不可控的场景，违背最小权限原则
   - 改造项（沙箱语境下已简化：沙箱原生分执行/只读文件/写入三类，无需再拆类）：
@@ -69,8 +79,9 @@
     - 重排 `ToolAssignments` 分配表并同步测试（专家派遣用例、`ToolAssignments` 相关断言）
   - 机制说明：权限边界是**服务端硬边界**——只注入已分配工具的 schema，模型看不见未分配的工具，伪造调用在服务端无执行注册（比提示词约束可靠）
   - 验收：general/未指派子任务全链路无写与执行权限；coder 仍可完成「读文件→改文件→跑命令」闭环
-- [ ] **异步任务治理**：`CompletableFuture.runAsync` 改为 `@Async` + 自定义线程池，或加任务表支持失败重投
-  - 验收：并发提交 10 个 Goal 稳定执行，无线程池耗尽
+- [x] **异步任务治理**：`CompletableFuture.runAsync` 改为受管线程池（`@Async` 注解因自调用陷阱弃用，直接注入 Executor）
+  - 落地：`GoalExecutorConfig` 双池（`goal-exec-` 后台 Goal 池 core=max=8 / 队列 50 / 优雅停机；`applicationTaskExecutor` MVC 异步槽位）；队列满拒绝 → Goal 落 FAILED 终态；`run()` catch Throwable 堵 Error 逃逸卡 RUNNING
+  - 验收 ✅：并发提交 10 个 Goal 稳定执行全 SUCCEEDED、无拒绝无卡 RUNNING（单测覆盖）；失败重投部分经评估另立任务（见 P2「Goal 失败重投」），详见存档「异步治理与发布工程」
 
 * [ ] **prompt的动态加载：**
   - [ ] 1.skill的动态装配
@@ -107,6 +118,13 @@
 - [ ] **子任务依赖编排**：lead 拆解支持声明依赖（如 `depends_on`），有依赖的子任务串行、无依赖的并行，替代当前纯并行
   - 验收：「先调研 X 再基于结论写代码」类任务按依赖顺序执行
 - [ ] **复杂路径 Checkpointer（可选，落库断点）**：长编排可断点续跑——如需再评估
+- [ ] **Goal 失败重投（任务化，2026-09 评估后另立）**：失败 Goal 自动重投——设计要点：
+  - goal 表未存 agent 路由信息，重投需 V10 迁移加 `agent_name` 路由列（重走路由会再烧一次 LLM judge，不可取）
+  - 加 `retry_count` / `next_retry_at`，仅对瞬态失败（网络/超时/5xx）重投且限次数；调用层 `LlmRetry` 已有 3 次退避，Goal 级重投的增量收益在「编排中后段失败」场景
+  - 防双跑复用 resume 409 机制（RUNNING 拒绝重投）；多 agent 路径优先走检查点 /resume 而非盲目重跑
+  - 验收：注入瞬态失败的 Goal 在窗口期后自动重投一次成功，非瞬态失败不重投
+- [ ] **长期记忆滚动摘要**：会话历史超预算被裁剪的最旧轮次，滚动压缩为一段摘要注入 system（`MemoryPolicy` 扩展），长会话不丢单
+  - 验收：超长会话中早期关键信息（如用户自述偏好）仍能被引用
 
 ## P3 · 工程化与产品化（按需启动）
 
@@ -137,6 +155,12 @@
 - [ ] **安全**：Spring Security + JWT 接口鉴权；API Key 走 KMS/Vault 管理
   - 验收：未带 token 的请求被拒绝
 - [ ] **WebSocket**：如需全双工交互（如任务进度推送）可扩展
+- [ ] **多实例水平扩展**：解除单实例假设——`failAllRunning` 启动清理、本地 `goalExecutor`、GRAPH_CHECKPOINT 单写者；分布式锁（如 ShedLock）或消息队列派发二选一，与「消息队列」条目同批评估
+  - 验收：双实例同时运行，同一 Goal 不被双重执行，重启清理只影响本实例
+- [ ] **Agent 行为回归评测集**：固定输入集 + 断言（路由 SIMPLE/COMPLEX 判定、专家派遣、输出约定），prompt / 模型参数改动后一条命令跑完防回归
+  - 验收：评测脚本输出每项通过与耗时，可选纳入 CI
+- [ ] **多模态输入（远期）**：视觉模型（qwen-vl 类）经 agent 表接入，支持图片理解类请求
+  - 验收：提交图片 URL 得到基于图片内容的回答
 
 ***
 
@@ -170,6 +194,13 @@
 - [x] **Prompt 组装管线（prompt的动态加载·子项 4）**：新增 `prompt` 包 `PromptAssembler`——每请求按 agent 名段落化组装 system prompt（角色段→工具索引段→工具纪律段→输出约定段→skill 段），两路径（`GeneralAssistantAgent`/`AgentChatCaller.buildSpec`）统一接入；`predictSubtask` 的硬编码 persona/工具纪律拼接删除、收敛为组装段。角色段优先级保持：agent 表 prompt > 角色兜底 > 默认。skill 段为扩展点接口 `SkillSectionProvider`（当前空实现）——后续子项 1「skill Markdown 目录装配」只需实现该接口注入即可，不改组装管线；子项 2/3（tool/mcp 装配数据化）可复用 `ToolAssignments.purposeOf` 元数据与工具索引段机制。测试 `PromptAssemblerTest`
 - [x] **记忆上下文动态注入（prompt的动态加载·子项 5）**：`MemoryPolicy` 按角色策略注入——编排 `lead` 注入会话记忆（与路径 A general 完全同口径：`SessionService` 同源 memoryStore + `MessageChatMemoryAdvisor` + `ContextAssemblingAdvisor` 预算裁剪，无会话 ID 跳过）；聚合节点与子任务专家不注入（聚合忠实于各子任务结果，子任务上下文由 lead 在子任务描述中传递）；编排内 general 兜底专家（未指派落点）不注入。测试 `MemoryPolicyTest` + `MultiAgentGraphAgentTest` 编排注入断言
 - [x] **工具 Schema 延迟加载（prompt的动态加载·子项 6）**：`ToolLazyManager` 会话级两段式暴露——首轮未展开工具仅注入轻量态（名称+用途，inputSchema 置空，直接调用返回中文引导文本不执行真实逻辑），system 经工具索引段给全量工具清单；模型调 `expand_tool(toolName)` 后工具加入会话级展开集合并返回完整参数说明，其后请求按完整 schema 注入并可执行（同请求内 expand 后自动放行，避免自愈循环）；expand\_tool 元工具不经 tracer/预算（零工具行噪声、不占执行额度）；越权展开未分配工具被拒绝。开关 `app.prompt.lazy-tools.enabled`（默认 true）关闭即回退全量注入现状。测试 `ToolLazyManagerTest`（13 用例）
+
+## 异步治理与发布工程（2026-09-06 完成）
+
+- [x] **后台 Goal 执行线程池治理**：`submit` 的 `CompletableFuture.runAsync`（commonPool）改为受管 `goalExecutor` 池（core=max=8、队列 50、优雅停机 30s），替代在 commonPool 上跑分钟级阻塞 LLM 调用（CPU-1 线程且 JVM 全局共用）；队列满 `RejectedExecutionException` 兜底把 Goal 落 FAILED（轮询可见，不再无声排队）；`run()` catch 从 Exception 放宽到 Throwable，Error 逃逸不再卡 RUNNING。测试：`AgentServiceImplTest` 新增 10 并发全 SUCCEEDED / 队列满兜底 / LinkageError 逃逸三用例（bdd2ac4）
+- [x] **MVC 异步执行器槽位补位**：定义 goalExecutor 后 Boot 自动配置的 applicationTaskExecutor 让位，MVC 流式 SSE 派发回退每请求一线程的 `MvcSimpleAsyncTaskExecutor` 并打生产告警（反汇编定位：Boot 按 bean 名 `containsBean("applicationTaskExecutor")` 接线）；显式补 `applicationTaskExecutor` 槽位 bean（`mvc-async-` 前缀），与 goal 长任务池分离（d4a4d96）
+- [x] **API Key 装载链路修复与系统级分发**：非交互 bash 不执行 .bashrc export（开头守卫 early-return），run.sh 开窗（wt.exe 新 wsl 会话）与 run-wsl.bat 显式注入路径都拿不到 key → 服务 401。key 迁仓库根 `.env.local`（gitignored，run.sh / run-wsl.bat / .bashrc 三处 source 兜底）+ 主机制升级 Windows 用户环境变量 + `WSLENV` 透传（所有 wsl 会话自动带 key）；顺带修 cmd interop 传参引号污染（1e63a8a + 系统级 setx）
+- [x] **CLI 流式渲染增量直出**：渲染器每 token 整行擦除重绘（`\r\033[2K`+全缓冲）依赖终端转义支持，失效终端表现为同段文字带渐长尾巴重复（DB 取证：goal.summary 与 llm_call_log 干净、单次调用，排除模型/服务端）；改为只补打未上屏部分，纯文本行零重绘，着色行完成时才整行重绘升级。测试：`TerminalRendererTest` 重影回归用例（1ba27d6）
 
 ## 工具与沙箱（2026-08 完成）
 

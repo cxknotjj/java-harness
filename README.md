@@ -15,7 +15,7 @@
 [![Spring AI](https://img.shields.io/badge/Spring%20AI-1.1.x-6DB33F?logo=spring&logoColor=white)](https://spring.io/projects/spring-ai)
 [![Graph](https://img.shields.io/badge/graph--core-1.1.2.2-orange)](https://github.com/alibaba/spring-ai-alibaba)
 [![MySQL](https://img.shields.io/badge/MySQL-Flyway%20Managed-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
-[![Tests](https://img.shields.io/badge/tests-258%20passing-brightgreen?logo=junit5&logoColor=white)](#-运行测试)
+[![Tests](https://img.shields.io/badge/tests-262%20passing-brightgreen?logo=junit5&logoColor=white)](#-运行测试)
 [![Docker](https://img.shields.io/badge/sandbox-Docker%20Isolated-2496ED?logo=docker&logoColor=white)](#-环境要求)
 
 *简单问题直接答 · 复杂任务多 Agent 编排 · 全程流式可视化*
@@ -47,6 +47,7 @@
 | 🕸️ | **多 Agent 编排** | StateGraph「Lead 拆解 → 专家并行 → 聚合汇总」，按难度拆解（至多 4 条、禁凑数） |
 | 👨‍👩‍👧‍👦 | **专家体系** | researcher / coder / analyst / writer 四类专家，数据库驱动配置，lead 按子任务智能指派 |
 | 📺 | **真·流式输出** | 逐 token SSE 推送 + 打字机效果，编排各阶段实时进度事件（编排/拆解/子任务/聚合） |
+| 🧵 | **线程池治理** | 后台 Goal 走受管有界线程池（容量上限 + 队列满快速失败落 FAILED），流式派发独立池互不挤占 |
 | 🛡️ | **沙箱隔离** | 模型生成的代码/命令在 Docker 容器内执行，宿主机零暴露；工具按专家最小权限分配 |
 | 💾 | **会话记忆** | 多轮上下文自动组装：过滤 / token 预算截断 / 角色归一化 |
 | 🔁 | **断点续跑** | graph-core 检查点落库（MySQL），长编排中断后 `/resume` 从断点继续，已完成节点不重跑 |
@@ -101,10 +102,13 @@ flowchart TD
 | 🐳 Docker Desktop | ⚠️ 沙箱必需 | Python/Shell/浏览器工具的容器隔离；无 Docker 时仅沙箱类工具不可用，其余功能正常（需预拉取镜像，见 `TECH_STACK.md`） |
 | 🔑 API Key | 🔄 可选 | DashScope（通义千问）/ DeepSeek；不配置可启动，调用模型会返回 `invalid_api_key` |
 
-### ⚡ 一键启动（Windows 推荐）
+### ⚡ 一键启动
 
 > [!TIP]
-> 双击项目根目录的 **`run.bat`**，脚本自动：编译 → 打开主服务窗口（8080）→ 就绪后自动打开 CLI 聊天窗口。
+> 三套启动脚本任选其一（**勿同时运行**，8080 端口会冲突）：
+> - **`run-wsl.bat`**（Windows 推荐）：双击自动进 WSL——编译 → 后台起服务（日志在 `/tmp/javaHarness-server.log`）→ 就绪后本窗口变 CLI
+> - **`run.sh`**（WSL 终端）：`./run.sh` 全流程——编译 → 新窗口起服务 → 本终端轮询就绪 → 进入 CLI；子命令 `server / stop / cli / build / test`
+> - **`run-win.bat`**（Windows 本机）：Windows 侧检出 + Windows JDK/Maven 环境时使用
 
 ### 🔧 手动启动
 
@@ -130,13 +134,21 @@ curl -s -X POST http://localhost:8080/api/chat \
 
 **4️⃣ （可选）配置真实 API Key**
 
-```powershell
-# Windows PowerShell
-$env:QWEN_API_KEY = "sk-你的key"     # DashScope（通义千问）
-$env:DEEPSEEK_API_KEY = "sk-你的key" # DeepSeek
-```
+按优先级任选其一，重启服务后即可真实对话（不配置也能启动，调用模型返回 401 占位 key 错误）：
 
-重启服务后即可真实对话。
+```powershell
+# 方式一：系统级环境变量（推荐，新开窗口全局生效；WSL 会话需 WSLENV 透传）
+setx QWEN_API_KEY "sk-你的key"      # DashScope（通义千问）
+setx DEEPSEEK_API_KEY "sk-你的key"  # DeepSeek
+setx WSLENV "QWEN_API_KEY/u:DEEPSEEK_API_KEY/u"   # 透传进 WSL（Linux 侧运行时需要）
+
+# 方式二：仓库根 .env.local（run.sh / run-wsl.bat 启动时自动加载，已被 gitignore 不入库）
+#   QWEN_API_KEY=sk-你的key
+#   DEEPSEEK_API_KEY=sk-你的key
+
+# 方式三：仅当前终端会话临时生效
+$env:QWEN_API_KEY = "sk-你的key"    # Windows PowerShell；WSL 用 export QWEN_API_KEY=...
+```
 
 ## 🎮 CLI 使用
 
@@ -251,6 +263,8 @@ flowchart LR
 > API Key 出于安全不落库，解析规则（约定优于配置）：
 > 1. `app.providers.<provider>.api-key`（yaml 显式映射，优先）
 > 2. `<PROVIDER大写>_API_KEY` 环境变量（约定式回退，如 `QWEN_API_KEY`、`DEEPSEEK_API_KEY`）
+>
+> Key 的**装载通道**：系统级环境变量（Windows 侧 + `WSLENV` 透传进 WSL）> 仓库根 `.env.local`（启动脚本自动 source，gitignored）> 当前会话 `export`；解析优先级不受通道影响。
 
 ## 📁 项目结构
 
@@ -275,11 +289,22 @@ src/main/java/com/dark/javaHarness/
 │   ├── AgentConfigProvider.java  # 从 agent 表读取运行配置（路由映射）
 │   └── impl/                     # 业务实现（AgentServiceImpl / ChatServiceImpl / LlmRouteJudge / LlmCallRecorder 等）
 ├── advisor/                      # Spring AI Advisor 拦截器（Agent 流程横切管理）
-│   └── ContextAssemblingAdvisor.java  # 上下文组装：过滤/截断/role 归一化（token 预算）
-├── config/agent/                 # Agent 配置与装配
-│   ├── ChatAgentConfig.java      # 注册各 Agent bean + graph-core 检查点存储器（MysqlSaver）
-│   ├── ChatClientFactory.java    # 按服务商构建 OpenAI 兼容 ChatClient（Registry 模式）
-│   └── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（从 model_provider 表加载）
+│   ├── ContextAssemblingAdvisor.java  # 上下文组装：过滤/截断/role 归一化（token 预算）
+│   └── PromptBudgetAdvisor.java  # Prompt 分段预算（历史/user/工具结果三段裁剪）
+├── config/                       # 应用配置
+│   ├── GoalExecutorConfig.java   # 执行线程池：goal-exec- 后台 Goal 池 + mvc-async- MVC 异步槽位
+│   ├── ContextBudgetProperties.java  # token 预算配置（app.context.*）
+│   ├── MybatisPlusConfig.java    # MyBatis-Plus 分页等配置
+│   └── agent/                    # Agent 配置与装配
+│       ├── ChatAgentConfig.java  # 注册各 Agent bean + graph-core 检查点存储器（MysqlSaver）
+│       ├── ChatClientFactory.java    # 按服务商构建 OpenAI 兼容 ChatClient（Registry 模式）
+│       ├── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（从 model_provider 表加载）
+│       └── ThinkingSwitchChatModel.java  # 按 model_provider.disable_thinking 注入思考开关
+├── prompt/                       # Prompt 组装管线（两路径统一）
+│   ├── PromptAssembler.java      # 五段式 system prompt 组装（角色/工具索引/纪律/输出约定/skill）
+│   ├── MemoryPolicy.java         # 会话记忆按角色注入矩阵
+│   ├── ToolLazyManager.java      # 工具 Schema 两段式延迟加载（轻量态 → expand_tool 展开）
+│   └── PromptSection.java / SkillSectionProvider.java  # 段模型与 skill 扩展点
 ├── mapper/                       # 数据访问层：MyBatis-Plus Mapper
 │   └── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper / ModelProviderMapper / LlmCallLogMapper
 ├── domain/                       # 领域模型（父包）
@@ -300,7 +325,8 @@ src/main/java/com/dark/javaHarness/
 │   └── ProgressLine.java           # 进度行线协议（MARK+stage+SEP+detail）编解码
 ├── cli/
 │   ├── ChatCli.java              # 命令行聊天客户端（独立进程，纯 HTTP 连 8080）
-│   └── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE) / /api/chat/resume
+│   ├── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE) / /api/chat/resume
+│   └── render/TerminalRenderer.java  # Claude Code 风格渲染：流式增量直出 + spinner 原位刷新 + 工具行
 └── tool/
     ├── WebTools.java             # 网页抓取工具（fetchUrl：HTML→纯文本，仅 http/https，限长）
     ├── DemoTools.java            # 示例工具集（时间 / 计算 / 天气）
@@ -315,7 +341,7 @@ src/main/java/com/dark/javaHarness/
 
 ## 🧪 运行测试
 
-单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**（当前 258 个用例全绿）：
+单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**（当前 262 个用例全绿）：
 
 ```bash
 mvn -s .mvn/settings.xml test
@@ -339,6 +365,7 @@ mvn -s .mvn/settings.xml test
 | `ToolAssignmentsTest` | 🛡️ 工具分配：双通道注入、最小权限、重名工具去重 |
 | `McpToolProviderTest` | 🔗 MCP 工具接入：STDIO 传输、超时配置 |
 | `WebToolsTest` | 🌍 网页抓取：HTML→纯文本、协议白名单 |
+| `TerminalRendererTest` | 🖥️ CLI 渲染：Markdown 行级着色、流式增量直出（防整段重影回归） |
 
 </details>
 

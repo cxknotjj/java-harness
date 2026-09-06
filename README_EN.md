@@ -15,7 +15,7 @@
 [![Spring AI](https://img.shields.io/badge/Spring%20AI-1.1.x-6DB33F?logo=spring&logoColor=white)](https://spring.io/projects/spring-ai)
 [![Graph](https://img.shields.io/badge/graph--core-1.1.2.2-orange)](https://github.com/alibaba/spring-ai-alibaba)
 [![MySQL](https://img.shields.io/badge/MySQL-Flyway%20Managed-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
-[![Tests](https://img.shields.io/badge/tests-258%20passing-brightgreen?logo=junit5&logoColor=white)](#-running-tests)
+[![Tests](https://img.shields.io/badge/tests-262%20passing-brightgreen?logo=junit5&logoColor=white)](#-running-tests)
 [![Docker](https://img.shields.io/badge/sandbox-Docker%20Isolated-2496ED?logo=docker&logoColor=white)](#-prerequisites)
 
 *Simple questions answered directly · Complex tasks orchestrated across agents · Fully streaming, end to end*
@@ -47,6 +47,7 @@
 | 🕸️ | **Multi-Agent Orchestration** | StateGraph "Lead decomposition → experts in parallel → aggregation"; subtasks are decomposed by difficulty (at most 4, no padding) |
 | 👨‍👩‍👧‍👦 | **Expert System** | Four expert roles — researcher / coder / analyst / writer — configured from the database; lead assigns each subtask to the right expert |
 | 📺 | **True Streaming** | Token-by-token SSE push with typewriter effect, plus real-time progress events for every orchestration stage (orchestration / decomposition / subtasks / aggregation) |
+| 🧵 | **Thread-Pool Governance** | Background goals run in a managed bounded pool (capacity cap + fast-fail to FAILED when full); streaming dispatch uses a separate pool so the two never starve each other |
 | 🛡️ | **Sandbox Isolation** | Model-generated code/commands run inside Docker containers with zero host exposure; tools are assigned per expert under least privilege |
 | 💾 | **Session Memory** | Multi-turn context assembled automatically: filtering / token-budget truncation / role normalization |
 | 🔁 | **Resume from Checkpoint** | graph-core checkpoints persisted to MySQL; after an interruption, `/resume` continues from the breakpoint without re-running completed nodes |
@@ -101,10 +102,13 @@ flowchart TD
 | 🐳 Docker Desktop | ⚠️ For sandbox | Container isolation for Python/Shell/browser tools; without Docker only sandbox-class tools are unavailable, everything else works (pre-pull images, see `TECH_STACK.md`) |
 | 🔑 API Key | 🔄 Optional | DashScope (Qwen) / DeepSeek; the app starts without keys — model calls return `invalid_api_key` |
 
-### ⚡ One-Click Start (recommended on Windows)
+### ⚡ One-Click Start
 
 > [!TIP]
-> Double-click **`run.bat`** in the project root. The script automatically: compiles → opens the main-service window (8080) → opens the CLI chat window once ready.
+> Three launcher scripts — pick one (**never run two at once**, port 8080 would clash):
+> - **`run-wsl.bat`** (recommended on Windows): double-click to enter WSL automatically — compile → start the service in the background (log at `/tmp/javaHarness-server.log`) → this window becomes the CLI once ready
+> - **`run.sh`** (WSL terminal): `./run.sh` runs the full flow — compile → open a new window for the service → poll until ready in this terminal → enter the CLI; subcommands `server / stop / cli / build / test`
+> - **`run-win.bat`** (native Windows): for a Windows-side checkout with Windows JDK/Maven
 
 ### 🔧 Manual Start
 
@@ -130,13 +134,21 @@ curl -s -X POST http://localhost:8080/api/chat \
 
 **4️⃣ (Optional) Configure real API keys**
 
-```powershell
-# Windows PowerShell
-$env:QWEN_API_KEY = "sk-your-key"     # DashScope (Qwen)
-$env:DEEPSEEK_API_KEY = "sk-your-key" # DeepSeek
-```
+Any one of the following, then restart the service (the app also starts with no keys — model calls fail with a 401 placeholder-key error):
 
-Restart the service and real conversations will work.
+```powershell
+# Option 1: system-level environment variables (recommended; global for new windows; WSL sessions need WSLENV passthrough)
+setx QWEN_API_KEY "sk-your-key"      # DashScope (Qwen)
+setx DEEPSEEK_API_KEY "sk-your-key"  # DeepSeek
+setx WSLENV "QWEN_API_KEY/u:DEEPSEEK_API_KEY/u"   # pass into WSL (needed when running Linux-side)
+
+# Option 2: repo-root .env.local (auto-sourced by run.sh / run-wsl.bat; gitignored)
+#   QWEN_API_KEY=sk-your-key
+#   DEEPSEEK_API_KEY=sk-your-key
+
+# Option 3: current terminal session only
+$env:QWEN_API_KEY = "sk-your-key"    # Windows PowerShell; use export QWEN_API_KEY=... in WSL
+```
 
 ## 🎮 CLI Usage
 
@@ -251,6 +263,8 @@ flowchart LR
 > For security, API keys are never stored in the database. Resolution rules (convention over configuration):
 > 1. `app.providers.<provider>.api-key` (explicit yaml mapping, highest priority)
 > 2. `<PROVIDER in upper case>_API_KEY` environment variable (fallback by convention, e.g. `QWEN_API_KEY`, `DEEPSEEK_API_KEY`)
+>
+> Key **loading channels**: system-level environment variables (Windows side + `WSLENV` passthrough into WSL) > repo-root `.env.local` (auto-sourced by the launch scripts, gitignored) > current-session `export`; resolution priority is unaffected by the channel.
 
 ## 📁 Project Structure
 
@@ -275,11 +289,22 @@ src/main/java/com/dark/javaHarness/
 │   ├── AgentConfigProvider.java  # Runtime config from the agent table (routing map)
 │   └── impl/                     # Implementations (AgentServiceImpl / ChatServiceImpl / LlmRouteJudge / LlmCallRecorder etc.)
 ├── advisor/                      # Spring AI Advisor interceptors (cross-cutting agent-flow management)
-│   └── ContextAssemblingAdvisor.java  # Context assembly: filter / truncate / role normalization (token budget)
-├── config/agent/                 # Agent configuration & assembly
-│   ├── ChatAgentConfig.java      # Registers agent beans + graph-core checkpoint store (MysqlSaver)
-│   ├── ChatClientFactory.java    # Builds OpenAI-compatible ChatClients per provider (Registry pattern)
-│   └── ChatClientRegistry.java   # Model-name → ChatClient registry (loaded from the model_provider table)
+│   ├── ContextAssemblingAdvisor.java  # Context assembly: filter / truncate / role normalization (token budget)
+│   └── PromptBudgetAdvisor.java  # Prompt section budgets (history / user / tool-result truncation)
+├── config/                       # Application configuration
+│   ├── GoalExecutorConfig.java   # Execution pools: goal-exec- background goal pool + mvc-async- MVC async slot
+│   ├── ContextBudgetProperties.java  # Token budget config (app.context.*)
+│   ├── MybatisPlusConfig.java    # MyBatis-Plus configuration (pagination etc.)
+│   └── agent/                    # Agent configuration & assembly
+│       ├── ChatAgentConfig.java      # Registers agent beans + graph-core checkpoint store (MysqlSaver)
+│       ├── ChatClientFactory.java    # Builds OpenAI-compatible ChatClients per provider (Registry pattern)
+│       ├── ChatClientRegistry.java   # Model-name → ChatClient registry (loaded from the model_provider table)
+│       └── ThinkingSwitchChatModel.java  # Injects thinking switch per model_provider.disable_thinking
+├── prompt/                       # Prompt assembly pipeline (shared by both paths)
+│   ├── PromptAssembler.java      # Five-section system prompt (role / tool index / discipline / output / skill)
+│   ├── MemoryPolicy.java         # Per-role session-memory injection matrix
+│   ├── ToolLazyManager.java      # Two-phase lazy tool-schema loading (lightweight → expand_tool)
+│   └── PromptSection.java / SkillSectionProvider.java  # Section model and skill extension point
 ├── mapper/                       # Data access: MyBatis-Plus mappers
 │   └── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper / ModelProviderMapper / LlmCallLogMapper
 ├── domain/                       # Domain model (parent package)
@@ -300,7 +325,8 @@ src/main/java/com/dark/javaHarness/
 │   └── ProgressLine.java           # Progress line wire protocol (MARK+stage+SEP+detail) codec
 ├── cli/
 │   ├── ChatCli.java              # CLI chat client (standalone process, pure HTTP to 8080)
-│   └── api/ChatApiClient.java    # OkHttp wrapper for /api/chat, /api/chat/stream (SSE) and /api/chat/resume
+│   ├── api/ChatApiClient.java    # OkHttp wrapper for /api/chat, /api/chat/stream (SSE) and /api/chat/resume
+│   └── render/TerminalRenderer.java  # Claude Code-style rendering: incremental streaming + in-place spinner + tool lines
 └── tool/
     ├── WebTools.java             # Web fetch tool (fetchUrl: HTML → plain text, http/https only, size-capped)
     ├── DemoTools.java            # Demo toolset (time / calculator / weather)
@@ -315,7 +341,7 @@ src/main/java/com/dark/javaHarness/
 
 ## 🧪 Running Tests
 
-Unit tests run on JUnit 5 + Mockito and need **no real database / network / API keys** (currently 258 test cases, all green):
+Unit tests run on JUnit 5 + Mockito and need **no real database / network / API keys** (currently 262 test cases, all green):
 
 ```bash
 mvn -s .mvn/settings.xml test
@@ -339,6 +365,7 @@ mvn -s .mvn/settings.xml test
 | `ToolAssignmentsTest` | 🛡️ Tool assignment: dual-channel injection, least privilege, duplicate-tool dedup |
 | `McpToolProviderTest` | 🔗 MCP tool access: STDIO transport, timeout configuration |
 | `WebToolsTest` | 🌍 Web fetch: HTML → plain text, protocol whitelist |
+| `TerminalRendererTest` | 🖥️ CLI rendering: Markdown line coloring, incremental streaming output (anti ghost-repeat regression) |
 
 </details>
 

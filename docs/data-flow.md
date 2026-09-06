@@ -231,7 +231,7 @@ MultiAgentGraphAgent.executeStreamReactive(goal)
 | 进度行 | `event: progress` + `data: {"stage":..,"detail":..}`（Jackson 序列化 `StageRow` record） | 排除，不写回 |
 | 内容行 | `data: <row>` | `doOnNext` 收集，`[DONE]` 后统一写回多轮记忆 |
 
-CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spinner（原位刷新，完成折叠归档灰色 `✓ 阶段 · 耗时`）、`拆解/子任务` 直接归档摘要行、`tool` 转 `⏺ 工具名(参数)` spinner、`tool-done` 归档着色结果行（✓ 绿 / ✗ 红，`+N/-M 行` diff 着色）；最终回答仍按内容流逐 token 呈现打字机效果。
+CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spinner（原位刷新，完成折叠归档灰色 `✓ 阶段 · 耗时`）、`拆解/子任务` 直接归档摘要行、`tool` 转 `⏺ 工具名(参数)` spinner、`tool-done` 归档着色结果行（✓ 绿 / ✗ 红，`+N/-M 行` diff 着色）；最终回答仍按内容流逐 token 呈现打字机效果——**增量直出**（只补打未上屏部分，不依赖终端擦行重绘；2026-09-06 修复：原每 token 整行擦除重绘在 `\r\033[2K` 失效终端表现为同段文字带渐长尾巴重复），仅有着色收益的行（标题/列表/粗体/行内代码/代码块）完成时才整行重绘升级。
 
 **测试**：`MultiAgentGraphAgentTest`（mock Registry/ChatClient 固定返回，断言进度阶段时序与子任务事件数量）+ `ChatServiceImplTest.streamReactive_shouldMapProgressRowToProgressEvent` + `ToolCallTracerTest`（事件组装/装饰行为/schema 透传）+ `TerminalRendererTest`（工具行渲染）。
 
@@ -453,6 +453,50 @@ AgentChatCaller.buildSpec()（统一出口）
 
 ***
 
+## 5h. Goal 执行通道与线程池治理（2026-09-06）
+
+> Goal 有三条执行通道，线程归属各不相同；后台执行走受管线程池，不再占用
+> `ForkJoinPool.commonPool()`（CPU-1 线程且被并行流等 JVM 全局共用，分钟级阻塞
+> LLM 调用占满会拖累无关代码）。
+
+```
+① 同步通道 executeSync
+   Tomcat 请求线程内直接阻塞执行 run()（调用方要的就是同步语义）
+
+② 异步通道 submit（POST /api/harness/submit）
+   goalService.create（PENDING 落库）→ goalExecutor.execute(() -> run(goal, agent))
+   → 池内线程：markRunning → agent.execute（阻塞 LLM 调用）→ SUCCEEDED/FAILED 落库
+   客户端轮询 GET /api/harness/goals/{id} 取终态
+   ⚠️ 拒绝兜底：池满（8 在途 + 50 队列满）时 execute 抛 RejectedExecutionException
+      → submit 捕获 → goal.fail("执行队列已满…") 落库（终态可见，不留无声排队 PENDING）
+   ⚠️ run() catch Throwable：Error 逃逸也回写 FAILED，goal 不再永久卡 RUNNING
+
+③ 流式通道 executeStreamReactive / resume
+   MVC 异步请求处理（Flux→SSE 桥接的完成/超时派发）走 applicationTaskExecutor 槽位
+   （mvc-async- 前缀池，Boot 按 bean 名接线）
+   业务侧阻塞 DB / Agent 执行 → Schedulers.boundedElastic()（Reactor 自带池）
+```
+
+**线程池配置**（`GoalExecutorConfig`，两池分离互不挤占）：
+
+| 池 | bean 名 | 参数 | 承载 |
+| --- | --- | --- | --- |
+| goal 执行池 | `goalExecutor` | core=max=8 / 队列 50 / 前缀 `goal-exec-` / 优雅停机 30s | 后台 Goal（分钟级阻塞 LLM 调用，线程数=最大并发编排数） |
+| MVC 异步槽位 | `applicationTaskExecutor` | core=8 / 前缀 `mvc-async-` / 默认无界队列 | 流式 SSE 的结果/超时派发（任务短小） |
+
+⚠️ **Boot 槽位坑**：项目定义任意 `Executor` bean 会让 Boot 自动配置的 applicationTaskExecutor
+让位（`@ConditionalOnMissingBean(Executor.class)`），而 MVC 异步按 bean 名
+`containsBean("applicationTaskExecutor")` 接线——槽位缺席时流式请求回退为
+**每请求开新线程**的 `MvcSimpleAsyncTaskExecutor`（无界）并打生产告警（static 闸每 JVM
+只打一次，易漏）。故两个池必须成对显式定义。
+
+**单实例假设**：启动清理 `failAllRunning`（RUNNING → FAILED）与本地线程池都基于单实例
+部署；水平扩展需先解除该假设（见 TODO「多实例水平扩展」）。
+
+**测试**：`AgentServiceImplTest`（10 并发 submit 全 SUCCEEDED / 队列满拒绝兜底落 FAILED / LinkageError 逃逸回写 FAILED）。
+
+***
+
 ## 6. 错误处理
 
 | 环节             | 处理                                        |
@@ -461,6 +505,8 @@ AgentChatCaller.buildSpec()（统一出口）
 | Agent 执行失败（同步） | `ChatResponse.failure`（status=FAILED），不写回 |
 | Agent 执行失败（流式） | SSE `event:error`，末尾 `meta.status=FAILED` |
 | 未知 agentId     | 兜底 `general`                              |
+| 后台 submit 队列已满 | `RejectedExecutionException` 捕获 → goal 落 `FAILED`（原因=执行队列已满），客户端轮询可见终态，不无声排队 |
+| 后台执行 Error 逃逸 | `run()` catch `Throwable` → goal 落 `FAILED`（原因=异常摘要），不残留 RUNNING |
 | lead 拆解失败      | 退化单任务；子任务失败留空，聚合跳过                        |
 | 流式请求挂死（厂商端静默） | 流上 Reactor `timeout` 空闲超时 120s（`STREAM_IDLE_TIMEOUT`，覆盖工具执行期最长正常静默 ~8s 的 10 倍余量）→ 快速失败转重试判定（超时不可重试，直接上抛） |
 | 聚合流式失败       | 带护栏的流式重试一次（聚合只有流式一条语义路径）：未推出任何 token（挂死超时等首 token 前失败）或 0 内容 token → 重试；已推 token 后失败 → 不重试（内容重复风险），以已收内容为准；重试仍失败 → 上抛按失败收尾 |
@@ -520,6 +566,8 @@ AgentChatCaller.buildSpec()（统一出口）
 | 沙箱工具面      | `SandboxToolProvider`（agentscope-runtime 容器）        |
 | MCP 工具        | `McpServerTools`（Server，3 工具→/mcp）+ `McpToolProvider`（Client，懒连接发现）+ `ToolAssignments` |
 | LLM 调用观测   | `LlmCallRecorder`（异步落库）+ `LlmCallController`（`/api/llm-calls` 查询）   |
+| 执行通道线程池 | `GoalExecutorConfig`（`goalExecutor` 后台 Goal 池 + `applicationTaskExecutor` MVC 异步槽位） |
+| CLI 渲染     | `TerminalRenderer`（流式增量直出 + 着色行整行重绘升级 + spinner 原位刷新 + 工具行）   |
 
-> 更新日期：2026-08-28 / 5e MCP 接入、分配表与组件映射更新：2026-08-29 / 5f Prompt 动态装配、5g Agent 表驱动注册、6a 流式背书取消与 5c/5d/6 口径更新：2026-09-04。
+> 更新日期：2026-08-28 / 5e MCP 接入、分配表与组件映射更新：2026-08-29 / 5f Prompt 动态装配、5g Agent 表驱动注册、6a 流式背书取消与 5c/5d/6 口径更新：2026-09-04 / 5h Goal 执行通道线程池治理、6 队列满与 Error 逃逸兜底、CLI 增量直出口径与组件映射更新：2026-09-06。
 
