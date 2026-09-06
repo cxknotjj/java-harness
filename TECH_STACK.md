@@ -33,7 +33,7 @@
 | HTTP 客户端 | OkHttp                     | 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`）                                   |
 | 序列化      | Jackson                    | 随 Boot | DTO 序列化 / SSE meta 解析                                                          |
 | 代码生成     | Lombok                     | -      | 实体类简化                                                                          |
-| 测试       | JUnit 5 / Mockito          | 随 Boot | 19 个测试类 / 104 用例（不依赖真实 DB/网络，见 docs/functional-testing.md）                    |
+| 测试       | JUnit 5 / Mockito          | 随 Boot | 36 个测试类 / 258 用例（不依赖真实 DB/网络，见 docs/functional-testing.md，2026-09-06 核对）           |
 | 日志       | SLF4J + Logback            | 随 Boot | Agent 执行状态日志                                                                   |
 | 初始化 SQL  | ~~schema.sql~~ 已移除         | -      | 由 Flyway 迁移脚本接管（见上）                                                            |
 

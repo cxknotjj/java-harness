@@ -1,7 +1,7 @@
 # 上下文管理优化方案
 
-> 状态：设计定稿，待实现
-> 关联代码：`advisor/ContextAssemblingAdvisor`、`tool/ToolCallBudget`、`tool/TokenEstimator`、`agent/MultiAgentGraphAgent`
+> 状态：**已实现**（2026-09-06 核对）——`app.context.*` 预算配置（`config/ContextBudgetProperties`）、静态 prompt 预算拦截器（`advisor/PromptBudgetAdvisor`，lead/聚合节点接入）、`tool/ToolCallBudget` 均已落地，由 `MultiAgentGraphAgent` / `GeneralAssistantAgent` 消费；本文保留为设计依据与参数口径说明。
+> 关联代码：`advisor/ContextAssemblingAdvisor`、`advisor/PromptBudgetAdvisor`、`tool/ToolCallBudget`、`tool/TokenEstimator`、`agent/MultiAgentGraphAgent`
 > 背景：262 万 prompt token 事故复盘后，输入侧防线已补齐（工具预算/内容过滤/白名单），本方案补齐最后一个缺口——**静态 prompt 无预算**。
 
 ---
