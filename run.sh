@@ -24,6 +24,11 @@ cd "$(dirname "$0")"
 export JAVA_HOME="$HOME/jdk-17.0.20.1+1"
 export PATH="$JAVA_HOME/bin:$HOME/apache-maven-3.9.9/bin:$PATH"
 
+# 本地密钥（QWEN_API_KEY/DEEPSEEK_API_KEY）：Ubuntu 非交互 bash 不执行 .bashrc 的
+# export（开头守卫 early-return），server 子命令与 nohup 兜底路径在此显式加载；
+# 开窗路径环境不跨 wt.exe/wsl.exe 边界，由下方生成的窗口脚本再加载一次
+if [ -f .env.local ]; then . ./.env.local; fi
+
 PROJ="$(pwd)"
 MVN="mvn -s .mvn/settings.xml"
 
@@ -37,6 +42,8 @@ open_server_window() {
     cat > "$script" <<EOF
 #!/usr/bin/env bash
 cd '$PROJ'
+# 新 wsl 会话不继承本 shell 环境，密钥在此独立加载（缺失则跳过，应用回退占位 key）
+if [ -f .env.local ]; then . ./.env.local; fi
 export JAVA_HOME="$JAVA_HOME"
 export PATH="$PATH"
 $MVN spring-boot:run

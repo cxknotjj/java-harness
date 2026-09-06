@@ -30,13 +30,15 @@ REM  Environment (WSL side):
 REM    project: /home/wsl/development/java-harness
 REM    JDK17:   /home/wsl/jdk-17.0.20.1+1   Maven: /home/wsl/apache-maven-3.9.9
 REM  Non-interactive bash does not source ~/.bashrc, so JAVA_HOME/PATH
-REM  are injected explicitly on every command below.
+REM  are injected explicitly on every command below. API keys live in
+REM  the repo-root .env.local (untracked; ~/.bashrc sources it too for
+REM  interactive shells) and are sourced here the same way.
 REM
 REM  NOTE: keep this file ASCII-only. cmd parses .bat lines with the
 REM  console codepage; multi-byte chars in a UTF-8 .bat break parsing.
 REM ================================================================
 set "PROJ=/home/wsl/development/java-harness"
-set "ENV=export JAVA_HOME=/home/wsl/jdk-17.0.20.1+1 && export PATH=$JAVA_HOME/bin:/home/wsl/apache-maven-3.9.9/bin:$PATH"
+set "ENV=export JAVA_HOME=/home/wsl/jdk-17.0.20.1+1 && export PATH=$JAVA_HOME/bin:/home/wsl/apache-maven-3.9.9/bin:$PATH && { [ -f ./.env.local ] && . ./.env.local || true; }"
 set "SRVLOG=/tmp/javaHarness-server.log"
 
 if /i "%~1"=="server" goto server
