@@ -326,7 +326,9 @@ final class AgentChatCaller {
     }
 
     private static String safeMsg(Exception e) {
-        return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        // 原因链展开：供应商 4xx/5xx 的响应体（报错 JSON）在 HttpStatusCodeException 里，
+        // 外层 wrapper 的 getMessage() 常为空或泛化，直接取会丢真实报错
+        return LlmCallRecorder.describeError(e);
     }
 
     /**

@@ -53,6 +53,12 @@ public final class LlmRetry {
         T run();
     }
 
+    /** 逐次尝试监听：每次真实调用结束（成功/失败）回调一次，供观测层按尝试粒度落 llm_call_log */
+    @FunctionalInterface
+    public interface AttemptListener {
+        void onAttempt(int attempt, long durationMs, Throwable error);
+    }
+
     /**
      * 判定异常是否可重试；沿着 cause 链剥壳（Spring AI 常把原始网络异常再包一层）。
      */
@@ -90,11 +96,33 @@ public final class LlmRetry {
      */
     public <T> T executeWithRetry(RetryOp<T> op)
             throws RuntimeException {
+        return executeWithRetry(op, null);
+    }
+
+    /**
+     * 带重试地执行 {@code op}。可重试错误按指数退避重试，直到成功或尝试耗尽；
+     * 不可重试错误立即抛出。重试耗尽时向上抛<b>最后一次</b>异常（供上层观测/兜底）。
+     *
+     * @param listener 每次真实尝试结束（成功/失败）回调一次，可为 null；观测层据此
+     *                 把每次尝试（含重试）逐条落 llm_call_log，而非只记最终结果
+     * @return 成功时的调用结果
+     * @throws RuntimeException 不可重试错误立即抛出，或可重试错误重试耗尽后抛出
+     */
+    public <T> T executeWithRetry(RetryOp<T> op, AttemptListener listener)
+            throws RuntimeException {
         RuntimeException last = null;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            long start = System.currentTimeMillis();
             try {
-                return op.run();
+                T result = op.run();
+                if (listener != null) {
+                    listener.onAttempt(attempt, System.currentTimeMillis() - start, null);
+                }
+                return result;
             } catch (RuntimeException e) {
+                if (listener != null) {
+                    listener.onAttempt(attempt, System.currentTimeMillis() - start, e);
+                }
                 last = e;
                 boolean retryable = isRetryable(e);
                 if (!retryable) {

@@ -183,17 +183,32 @@ public class GeneralAssistantAgent implements Agent {
         Sinks.Many<String> toolEvents = Sinks.many().unicast().onBackpressureBuffer();
         long start = System.currentTimeMillis();
         StringBuilder collected = new StringBuilder();
+        // 流式异常的真实原因（供应商 4xx/5xx 报错、读超时等）在 Flux 错误通道里，
+        // doFinally 只有信号没有异常体——用 doOnError 抓住真实 Throwable 供观测落库
+        java.util.concurrent.atomic.AtomicReference<Throwable> streamError =
+                new java.util.concurrent.atomic.AtomicReference<>();
         // 关闸挂 merge 之前的主干段（多 Agent 侧同款死锁教训：关闸在 merge 后会循环等待）
         Flux<String> content = buildChatRequestSpec(goal.sessionId(), goal.objective(),
                         row -> BranchProgressListener.tryEmitSerialized(toolEvents, row))
                 .stream()
                 .content()
                 .doOnNext(collected::append)
+                .doOnError(streamError::set)
                 .doFinally(sig -> {
-                    // 终结（含 cancel/error）时记录本次调用观测：流式无 usage，按已收文本估算
-                    recordCall(goal.sessionId(), true, sig != SignalType.CANCEL && sig != SignalType.ON_ERROR,
-                            null, collected, start,
-                            sig == SignalType.ON_ERROR ? new IllegalStateException("流式异常终止") : null);
+                    // 终结（含 cancel/error）时记录本次调用观测：流式无 usage，按已收文本估算。
+                    // error 带真实异常（原因链展开后有供应商响应体），CANCEL 单独标注不再记 null
+                    Throwable err;
+                    if (sig == SignalType.ON_ERROR) {
+                        err = streamError.get() != null
+                                ? streamError.get()
+                                : new IllegalStateException("流式异常终止");
+                    } else if (sig == SignalType.CANCEL) {
+                        err = new IllegalStateException("客户端断开（stream cancel）");
+                    } else {
+                        err = null;
+                    }
+                    recordCall(goal.sessionId(), true, err == null,
+                            null, collected, start, err);
                     BranchProgressListener.tryCompleteSerialized(toolEvents);
                 });
         return content.mergeWith(toolEvents.asFlux());
@@ -202,10 +217,11 @@ public class GeneralAssistantAgent implements Agent {
     /**
      * 观测记录：调用结束（成功/失败/cancel）异步落 llm_call_log。
      * 阻塞调用 usage 非 null 时记真实 token；流式（usage=null）按已收输出文本近似估算。
+     * 错误描述经 {@link LlmCallRecorder#describeError} 展开原因链（含供应商响应体）。
      */
     private void recordCall(String sessionId, boolean stream, boolean ok,
                             org.springframework.ai.chat.metadata.Usage usage,
-                            StringBuilder collected, long start, Exception error) {
+                            StringBuilder collected, long start, Throwable error) {
         if (recorder == null) {
             return;
         }
@@ -220,12 +236,10 @@ public class GeneralAssistantAgent implements Agent {
             totalVal = completionVal;
             estimated = true;
         }
-        String msg = error == null ? null
-                : (error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
         recorder.record(new LlmCallLog(sessionId, agentName,
                 agentService.getAgentConfig(agentName).map(AgentConfig::model).orElse(null),
                 stream, ok, prompt, completionVal, totalVal, estimated,
-                System.currentTimeMillis() - start, msg));
+                System.currentTimeMillis() - start, LlmCallRecorder.describeError(error)));
     }
 
     /** 组装一次聊天请求规格：按 agent 表模型取 ChatClient；历史只读注入，上下文由组装拦截器裁剪；system 经 PromptAssembler 按段组装 */

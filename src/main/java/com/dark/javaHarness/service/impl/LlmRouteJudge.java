@@ -59,18 +59,15 @@ private final ChatClientRegistry clientRegistry;
             log.info("[route] message 为空 -> SIMPLE");
             return RouteDecision.SIMPLE;
         }
-        long start = System.currentTimeMillis();
         try {
-            // 重试只针对「单次 LLM 调用」：可重试错误自动重试，重试耗尽或不可重试抛出。
-            // 解析在 LLM 调用成功之后进行（解析失败属业务逻辑错误，不可重试）。
-            String content = retry.executeWithRetry(() -> doCall(message));
-            RouteDecision decision = parse(content);
-            record(start, true, null, message);
-            return decision;
+            // 逐次尝试记录：每次真实 LLM 调用（含重试）单独落一行 llm_call_log，
+            // 失败尝试带真实错误描述，不再只记重试链的聚合结果（重试曾完全不可见）
+            String content = retry.executeWithRetry(() -> doCall(message),
+                    (attempt, durationMs, err) -> record(durationMs, err == null, err, message));
+            return parse(content);
         } catch (Exception e) {
             // 判断失败（含重试耗尽或解析失败）不阻塞请求，兜底走简单路径
             log.warn("[route] 判断失败，兜底 SIMPLE：{}", safeMessage(e));
-            record(start, false, e, message);
             return RouteDecision.SIMPLE;
         }
     }
@@ -93,18 +90,16 @@ private final ChatClientRegistry clientRegistry;
                 .getText();
     }
 
-    /** judge 调用观测落库（无会话上下文，sessionId 为空；token 近似估算） */
-    private void record(long start, boolean ok, Exception e, String message) {
+    /** judge 单次尝试观测落库（无会话上下文，sessionId 为空；token 近似估算；错误经原因链展开） */
+    private void record(long durationMs, boolean ok, Throwable e, String message) {
         if (recorder == null) {
             return;
         }
         int promptTokens = LlmCallRecorder.estimateTokens(SYSTEM_PROMPT)
                 + LlmCallRecorder.estimateTokens(message);
-        String msg = e == null ? null
-                : (e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
         recorder.record(new LlmCallLog(null, "route-judge", ROUTE_MODEL, false, ok,
                 promptTokens, null, null, true,
-                System.currentTimeMillis() - start, msg));
+                durationMs, LlmCallRecorder.describeError(e)));
     }
 
     /** 解析 LLM 返回内容中的 route 字段；非法/缺失一律兜底 SIMPLE。 */
@@ -126,6 +121,6 @@ private final ChatClientRegistry clientRegistry;
     }
 
     private static String safeMessage(Exception e) {
-        return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        return LlmCallRecorder.describeError(e);
     }
 }

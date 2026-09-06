@@ -103,6 +103,11 @@ public class ChatClientFactory {
             OpenAiChatModel model = OpenAiChatModel.builder()
                     .openAiApi(api)
                     .defaultOptions(OpenAiChatOptions.builder().build())
+                    // 关闭 Spring AI 内部隐式重试：重试统一收敛到 LlmRetry（每次尝试都有
+                    // 观测记录）。内部重试层对 llm_call_log 完全不可见，且其退避（最长 3s 递增）
+                    // 曾把单次 300s 读超时放大成 832s 的请求阻塞（llm_call_log #198）
+                    .retryTemplate(org.springframework.retry.support.RetryTemplate.builder()
+                            .maxAttempts(1).build())
                     .build();
             // 思考端点：模型层包装器按请求注入 enable_thinking:false（defaultOptions.extraBody
             // 在带运行时选项的调用模式下不生效，见 ThinkingSwitchChatModel 类注释）

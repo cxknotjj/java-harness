@@ -65,4 +65,31 @@ public class LlmCallRecorder {
     public static int estimateTokens(String text) {
         return com.dark.javaHarness.tool.TokenEstimator.estimateTokens(text);
     }
+
+    /**
+     * 展开异常原因链取「最有信息量」的错误描述，供 error_msg 落库。
+     *
+     * 优先取带响应体的 HTTP 异常（{@link HttpStatusCodeException}，模型供应商的
+     * 报错 JSON 就在响应体里，如 401 invalid_api_key）；其余取链上第一条非空
+     * message；全空兜底最外层类名。流式路径的异常常被框架层层包裹，直接取
+     * 外层 getMessage() 往往为空或过于泛化（曾把供应商 4xx 报错记成 null）。
+     * 超长截断由 doInsert 统一处理。
+     */
+    public static String describeError(Throwable error) {
+        if (error == null) {
+            return null;
+        }
+        String firstMsg = null;
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            if (t instanceof org.springframework.web.client.HttpStatusCodeException hse) {
+                String body = hse.getResponseBodyAsString();
+                return "HTTP " + hse.getStatusCode().value()
+                        + (body == null || body.isBlank() ? "" : " - " + body.trim());
+            }
+            if (firstMsg == null && t.getMessage() != null && !t.getMessage().isBlank()) {
+                firstMsg = t.getMessage();
+            }
+        }
+        return firstMsg != null ? firstMsg : error.getClass().getSimpleName();
+    }
 }
