@@ -185,6 +185,8 @@ class ChatServiceImplTest {
         verify(agentService, never()).executeStreamReactive(anyString(), anyString(), anyString());
         // 请求携带 agentId 即视为会话内切换：session 表 agent_id 需同步
         verify(sessionService).switchAgent("50", 2L);
+        // 显式指定 agentId 时不得再走路由判断：分流结果用不上，白付一次同步 LLM 调用的延时与风险
+        verify(routeJudge, never()).judge(anyString());
     }
 
     @Test

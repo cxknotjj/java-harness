@@ -98,9 +98,6 @@ public class ChatServiceImpl implements ChatService {
      */
     @Override
     public Flux<String> streamReactive(ChatRequest request) {
-        // 主 Agent 前置判断：分流「场景A简单(general) / 场景B复杂(multi-agent)」
-        String resolvedAgent = resolveAgent(request.message());
-
         String existing = request.sessionId();
         boolean needNew = existing == null || existing.isBlank();
         Mono<SessionCtx> sessionMono = needNew
@@ -120,12 +117,18 @@ public class ChatServiceImpl implements ChatService {
                     log.warn("[chat] 会话 Agent 同步失败（不影响本次路由）sid={} agentId={}: {}",
                             ctx.sid(), request.agentId(), safeMessage(e));
                 }
+                // 显式指定 agentId 时跳过路由判断：分流结果在该分支用不上，而判断本身是一次
+                // 同步 LLM 调用（思考型模型失控时曾阻塞请求 14 分钟，见 llm_call_log #198），
+                // 指定 Agent 的请求不必陪跑这段延时与风险
+                return toSseBody(
+                        agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid()),
+                        ctx.sid(), ctx.newSession(), request.message(), null);
             }
-            // agentId 非空时按该 Agent 路由，否则走默认 Agent
-            Flux<String> agentTokens = (request.agentId() != null)
-                    ? agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())
-                    : agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid());
-            return toSseBody(agentTokens, ctx.sid(), ctx.newSession(), request.message(), null);
+            // 主 Agent 前置判断：分流「场景A简单(general) / 场景B复杂(multi-agent)」
+            String resolvedAgent = resolveAgent(request.message());
+            return toSseBody(
+                    agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid()),
+                    ctx.sid(), ctx.newSession(), request.message(), null);
         });
     }
 
