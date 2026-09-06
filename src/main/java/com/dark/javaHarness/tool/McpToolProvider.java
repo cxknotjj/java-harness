@@ -17,11 +17,15 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 /**
@@ -36,10 +40,14 @@ import org.springframework.stereotype.Component;
  *       Windows 下 npx/npm 自动补 .cmd（ProcessBuilder 不做 PATHEXT 解析）。
  * </ul>
  *
- * <p><b>连接策略（架构决策）</b>：MCP client 走「懒连接 + 失败降级」，与 {@link SandboxToolProvider}
- * 一脉相承——应用启动完全不依赖 MCP，首次被 agent 取工具时才发起连接；
- * 连接/发现失败则返回空工具面并记录 warn，绝不让单点故障拖垮整个应用。
- * 注意 http 模式连本进程时须待 Spring 启动完成后 /mcp 才可达，懒连接天然规避了启动死锁。
+ * <p><b>连接策略（架构决策）</b>：MCP client 走「后台预热 + 懒连接兜底 + 失败降级」，与
+ * {@link SandboxToolProvider} 一脉相承——应用启动完全不依赖 MCP；应用就绪后（ApplicationReadyEvent）
+ * 后台线程先行连接/发现，把握手超时的代价挪出请求路径；若请求早于预热完成到来，仍走
+ * toolCallbacks() 的懒连接（双重检查锁并发安全）。连接/发现失败（含空目标）同样写入缓存，
+ * 绝不让单点故障拖垮应用、也绝不让首条用户消息为坏掉的 MCP server 买单（曾经：坏的 stdio
+ * server 握手超时 30s 全额落在用户首条消息上）。
+ * 注意 http 模式连本进程时须待 Spring 启动完成后 /mcp 才可达，预热挂在 ApplicationReadyEvent
+ * 天然规避了启动死锁。
  *
  * <p><b>按 agent 硬边界</b>：这里只负责「收集」MCP 工具；谁可见、谁能调由
  * {@link ToolAssignments} 决定（当前 researcher 与 general）。未分配 agent 的请求不注入这些 schema。
@@ -63,6 +71,12 @@ public class McpToolProvider {
     private final Object lock = new Object();
     private volatile List<ToolCallback> cached;
     private volatile McpSyncClient client;
+    /** 后台预热线程：应用就绪后先行连接/发现，避免请求线程为 MCP 握手超时买单 */
+    private final ExecutorService warmupExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "mcp-warmup");
+        t.setDaemon(true);
+        return t;
+    });
 
     public McpToolProvider(
             @Value("${spring.ai.mcp.client.transport:http}") String transport,
@@ -77,6 +91,21 @@ public class McpToolProvider {
                 : null;
     }
 
+    /** 应用就绪后后台预热 MCP 连接/发现：把握手超时的代价挪出请求路径。挂在 ApplicationReadyEvent
+     *  上，http 模式连自建 /mcp 时端点必然已就绪（规避启动死锁）；失败与成功同样落缓存。 */
+    @EventListener(ApplicationReadyEvent.class)
+    public void warmupAsync() {
+        warmupExecutor.execute(() -> {
+            try {
+                List<ToolCallback> result = toolCallbacks();
+                log.info("[mcp] 后台预热完成，工具面 {} 个工具", result.size());
+            } catch (Throwable t) {
+                // toolCallbacks 内部已兜底降级，此处仅防预热线程意外挂掉
+                log.warn("[mcp] 后台预热异常（不影响请求，首次取用仍会懒连接）: {}", t.toString());
+            }
+        });
+    }
+
     /** MCP 暴露的工具回调；未配置连接目标或连接失败时返回空列表（不影响主链路） */
     public List<ToolCallback> toolCallbacks() {
         List<ToolCallback> c = cached;
@@ -85,8 +114,10 @@ public class McpToolProvider {
         }
         String target = target();
         if (target.isEmpty()) {
+            // 空目标是永久态（构造时已定）：缓存空结果，避免每个请求重复 warn
             log.warn("[mcp] transport={} 但未配置连接目标（server-url / stdio-command），MCP 工具面为空", transport);
-            return List.of();
+            cached = List.of();
+            return cached;
         }
         synchronized (lock) {
             if (cached != null) {
@@ -104,13 +135,16 @@ public class McpToolProvider {
 
     /** 建立连接并返回工具回调；初始化/发现失败抛异常（由上层降级为空） */
     private List<ToolCallback> connectAndDiscover() {
-        // 超时预算按「慢速外部 MCP server」放宽松：requestTimeout 约束单次 tools/call
-        // 从发起到服务端返回的整段墙钟时间（含服务端真正干活，如浏览器自动化首次拉起 Chrome），
-        // 而非通信本身（stdio/HTTP 传输都是毫秒级）；过小会把「服务端在执行」误判为超时。
-        // initializationTimeout 约束 initialize 握手——外部 server（如 npx 拉起 + 框架初始化）冷启动可能 >10s。
+        // 超时预算：requestTimeout 约束单次 tools/call 从发起到服务端返回的整段墙钟时间
+        // （含服务端真正干活，如浏览器自动化首次拉起 Chrome），而非通信本身（stdio/HTTP 传输都是
+        // 毫秒级）；过小会把「服务端在执行」误判为超时。
+        // initializationTimeout 约束 initialize 握手：8s 足够覆盖正常冷启动（npx 拉包+框架初始化），
+        // 同时把「server 秒退但握手傻等」的代价从 30s 压到 8s（坏的 npx server 通常 1-2s 内就写
+        // stderr 退出——实测 browsermcp 1.3s 即报 ERR_INVALID_URL，握手却干等满 30s）。预热在
+        // 后台线程执行，此超时正常不落在请求路径上。
         McpSyncClient client = McpClient.sync(clientTransport())
                 .requestTimeout(Duration.ofSeconds(120))
-                .initializationTimeout(Duration.ofSeconds(30))
+                .initializationTimeout(Duration.ofSeconds(8))
                 .clientInfo(new McpSchema.Implementation("javaHarness", "1.0"))
                 .build();
         this.client = client;
