@@ -5,17 +5,20 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 /**
- * Goal 异步执行线程池：承接 AgentServiceImpl#submit 的后台目标执行，
+ * 异步执行线程池配置（两池分离）：
+ *
+ * <p>{@code goalExecutor}：承接 AgentServiceImpl#submit 的后台目标执行，
  * 替代原先占用的 ForkJoinPool.commonPool()——goal 执行体是分钟级阻塞 LLM 调用，
  * 占满 commonPool（CPU-1 线程，JVM 全局共享）会拖累并行流等无关共用方。
+ * 每个在途 goal 独占一个线程阻塞等待 LLM I/O，线程数即最大并发编排数，过大撞下游
+ * 模型限流，过小拉长排队；超出队列容量的提交按默认 Abort 策略拒绝，由 submit 捕获后
+ * 把 Goal 落为 FAILED 终态（客户端轮询可见），不无声排队。
  *
- * <p>每个在途 goal 独占一个线程阻塞等待 LLM I/O，线程数即最大并发编排数，
- * 过大撞下游模型限流，过小拉长排队；队列缓存超出并发的提交，超出队列容量的
- * 提交按默认 Abort 策略拒绝，由 submit 捕获后把 Goal 落为 FAILED 终态
- * （客户端轮询可见），不无声排队。
- *
- * <p>本 bean 定义后 Boot 自动配置的 applicationTaskExecutor 按
- * {@code @ConditionalOnMissingBean(Executor.class)} 让位——项目无 @Async 消费方，无影响。
+ * <p>{@code applicationTaskExecutor}：MVC 异步请求处理（流式 SSE 的结果/超时派发）的
+ * 执行器槽位，Boot 的 WebMvcAutoConfigurationAdapter 按 bean 名 containsBean 取用。
+ * 项目存在任意 Executor bean 时 Boot 自动配置让位——槽位缺席会让流式请求回退到
+ * 每请求开新线程的 MvcSimpleAsyncTaskExecutor（无界）并打生产告警，故显式补位。
+ * 派发任务短小，固定线程 + 默认无界队列即够用；与 goal 池分离，长任务不阻塞派发。
  */
 @Configuration
 public class GoalExecutorConfig {
@@ -36,6 +39,17 @@ public class GoalExecutorConfig {
         // 优雅停机：在途 goal 等待完成再关；等待超时被中断的部分由启动清理（failAllRunning）兜底标记
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationMillis(30_000);
+        return executor;
+    }
+
+    /** MVC 异步派发池：任务短小（结果/超时/完成派发），固定线程 + 默认无界队列，永不拒绝 */
+    @Bean("applicationTaskExecutor")
+    public ThreadPoolTaskExecutor applicationTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(POOL_SIZE);
+        executor.setThreadNamePrefix("mvc-async-");
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationMillis(10_000);
         return executor;
     }
 }
