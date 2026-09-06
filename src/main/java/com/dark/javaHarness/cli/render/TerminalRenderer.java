@@ -15,8 +15,9 @@ import java.util.concurrent.TimeUnit;
  *       灰色单行摘要（{@code ✓ 编排 · 3s}），不随内容滚动刷屏</li>
  *   <li><b>工具调用行</b>：{@code ⏺ 工具名(参数)} 执行中转 spinner，完成后归档
  *       {@code ✓ 耗时 · +N/-M 行}（diff 变更着色，+绿 / -红）</li>
- *   <li><b>内容逐 token 流式输出</b>：行缓冲 + 不完整行重绘——token 直出保证打字机效果，
- *       行完成后整行重绘升级为 Markdown 着色（标题/列表/粗体/行内代码/代码块）</li>
+ *   <li><b>内容逐 token 流式输出</b>：行缓冲 + 增量直出——只补打未上屏部分保证打字机效果
+ *       （不依赖终端擦行重绘，规避 \r\033[2K 失效终端的整段重影）；
+ *       着色行（标题/列表/粗体/行内代码/代码块）完成时才做一次整行重绘升级</li>
  *   <li><b>回合小结</b>：结束后输出耗时 / 子任务数 / 输出字数近似</li>
  * </ol>
  *
@@ -62,6 +63,8 @@ public final class TerminalRenderer {
 
     // ---- 内容行缓冲状态 ----
     private final StringBuilder lineBuffer = new StringBuilder();
+    /** 当前行已上屏的字符数：增量直出只补打未上屏部分，不依赖终端擦行重绘 */
+    private int linePrinted;
     private boolean inCodeBlock;
 
     // ---- 回合统计 ----
@@ -95,6 +98,7 @@ public final class TerminalRenderer {
             subtaskDone = 0;
             contentChars = 0;
             lineBuffer.setLength(0);
+            linePrinted = 0;
             inCodeBlock = false;
         }
     }
@@ -148,13 +152,21 @@ public final class TerminalRenderer {
             contentChars += token.length();
             int idx;
             while ((idx = indexOfLineBreak(lineBuffer)) >= 0) {
+                // 先补打该行未上屏的后缀，再交 emitRenderedLine 收行（着色行会重绘整行）
+                if (idx > linePrinted) {
+                    out.print(lineBuffer.substring(linePrinted, idx));
+                }
                 String line = lineBuffer.substring(0, idx);
                 lineBuffer.delete(0, idx + 1);
                 emitRenderedLine(line);
+                linePrinted = 0;
             }
-            // 不完整行原样直出（打字机效果），整行完成后重绘升级着色
-            if (lineBuffer.length() > 0) {
-                out.print(CLEAR_LINE + lineBuffer);
+            // 不完整行增量直出（打字机效果）：只补打未上屏部分。原先每 token 擦行重绘整行，
+            // 依赖终端正确处理 \r\033[2K——部分终端不生效时每次重绘都留在屏上，
+            // 表现为「同一段文字带渐长尾巴重复」的整段重影
+            if (lineBuffer.length() > linePrinted) {
+                out.print(lineBuffer.substring(linePrinted));
+                linePrinted = lineBuffer.length();
             }
         }
     }
@@ -165,8 +177,18 @@ public final class TerminalRenderer {
     public void endTurn(boolean success, String error) {
         synchronized (lock) {
             if (lineBuffer.length() > 0) {
-                out.print(CLEAR_LINE + renderLogicalLine(lineBuffer.toString()) + "\n");
+                String rendered = renderLogicalLine(lineBuffer.toString());
+                if (rendered.equals(lineBuffer.toString())) {
+                    // 纯文本残留：补打未上屏部分后换行，免擦行重绘
+                    if (lineBuffer.length() > linePrinted) {
+                        out.print(lineBuffer.substring(linePrinted));
+                    }
+                    out.print("\n");
+                } else {
+                    out.print(CLEAR_LINE + rendered + "\n");
+                }
                 lineBuffer.setLength(0);
+                linePrinted = 0;
             }
             finishSpinnerAsDone();
             long sec = (System.currentTimeMillis() - turnStartMs) / 1000;
@@ -275,14 +297,21 @@ public final class TerminalRenderer {
     // Markdown 行渲染
     // ================================================================
 
-    /** 输出一条完整逻辑行：代码块围栏切换状态，其余行着色渲染；随后重写 partial */
+    /** 输出一条完整逻辑行：代码块围栏切换状态；着色行整行重绘升级，纯文本行免重绘直接换行 */
     private void emitRenderedLine(String line) {
         if (line.trim().startsWith("```")) {
             inCodeBlock = !inCodeBlock;
             out.print(CLEAR_LINE + GRAY + line.trim() + RESET + "\n");
             return;
         }
-        out.print(CLEAR_LINE + (inCodeBlock ? CYAN + "│ " + line + RESET : renderInline(line)) + "\n");
+        String rendered = inCodeBlock ? CYAN + "│ " + line + RESET : renderInline(line);
+        if (rendered.equals(line)) {
+            // 纯文本行（含已在屏上的前缀）无着色收益，补打部分已先行输出，直接换行——
+            // 免一次擦行重绘，普通聊天（大量纯文本）在擦行失效的终端上零重影
+            out.print("\n");
+            return;
+        }
+        out.print(CLEAR_LINE + rendered + "\n");
     }
 
     /** 逻辑行渲染（含代码块状态，供 endTurn 冲刷残留行） */

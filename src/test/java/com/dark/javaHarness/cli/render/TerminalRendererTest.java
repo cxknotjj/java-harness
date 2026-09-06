@@ -189,4 +189,36 @@ class TerminalRendererTest {
         // 真实内容不受影响
         assertTrue(out.contains("最终答案"), "内容 token 应正常输出: " + out);
     }
+
+    // ---- 重影回归：纯文本流式不做擦行重绘，内容只上屏一次 ----
+
+    @Test
+    void streaming_plainText_noRedraw_noGhosting() {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        TerminalRenderer renderer = new TerminalRenderer(
+                new PrintStream(buf, true, StandardCharsets.UTF_8));
+
+        renderer.beginTurn();
+        // 逐 token 到达的无换行单行答案——正是一次重影事故（奶龙自我介绍复读）的形态
+        String answer = "（挺起圆滚滚的小肚子）我是奶龙呀！是不是想我啦？";
+        for (int i = 0; i < answer.length(); i += 3) {
+            renderer.onToken(answer.substring(i, Math.min(i + 3, answer.length())));
+        }
+        renderer.endTurn(true, null);
+
+        String out = buf.toString(StandardCharsets.UTF_8);
+        // 老实现每 token 输出一次 CLEAR_LINE(\r\033[2K)+整行缓冲，擦行失效的终端会整段重影
+        assertFalse(out.contains("\r\033[2K"), "纯文本流式不应产生擦行重绘: " + out.replace("\033", "ESC"));
+        assertEquals(1, countOccurrences(out, "我是奶龙呀"), "答案文本在输出流中应只出现一次: " + out);
+        assertTrue(out.contains("回合结束"), "收尾小结应照常输出: " + out);
+    }
+
+    private static int countOccurrences(String s, String sub) {
+        int c = 0, i = 0;
+        while ((i = s.indexOf(sub, i)) >= 0) {
+            c++;
+            i += sub.length();
+        }
+        return c;
+    }
 }
