@@ -3,10 +3,13 @@ setlocal
 cd /d "%~dp0"
 
 REM ================================================================
-REM  javaHarness 一键启动器（Windows 本机版）
-REM  需要 Windows 侧自备 JDK17 + Maven，且本仓库有一份 Windows 侧
-REM  检出（本脚本按 %~dp0 相对路径找 .mvn\settings.xml）。
-REM  项目/JDK/Maven 已迁 WSL 的话请用 run.bat（WSL 版）。
+REM  javaHarness one-click launcher (Windows-native edition).
+REM  Requires a Windows-side checkout of this repo plus Windows
+REM  JDK17 + Maven on PATH (script resolves .mvn\settings.xml via %~dp0).
+REM  For the WSL-based environment use run-wsl.bat instead.
+REM  Run only ONE launcher at a time (port 8080 conflict).
+REM  NOTE: keep this file ASCII-only (cmd parses .bat with the console
+REM  codepage; multi-byte chars in a UTF-8 .bat break line parsing).
 REM ================================================================
 
 echo ============================================
