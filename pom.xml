@@ -31,6 +31,10 @@
         <spring-ai.version>1.1.4</spring-ai.version>
         <spring-ai-alibaba.version>1.1.2.2</spring-ai-alibaba.version>
         <mybatis-plus.version>3.5.7</mybatis-plus.version>
+        <!-- 显式固定编译编码：源码含大量中文字符串，不声明则跟随平台默认
+             （Windows=GBK / WSL=UTF-8），两套工具链编出的 class 字符串常量会不一致 -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     </properties>
     <dependencyManagement>
         <dependencies>
