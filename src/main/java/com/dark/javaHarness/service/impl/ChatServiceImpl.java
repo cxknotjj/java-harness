@@ -9,6 +9,7 @@ import com.dark.javaHarness.domain.dto.SseMeta;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.enums.SseProtocol;
+import com.dark.javaHarness.domain.entity.SessionEntity;
 import com.dark.javaHarness.exception.ResumeConflictException;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.ChatService;
@@ -65,8 +66,8 @@ public class ChatServiceImpl implements ChatService {
             newSession = true;
         }
 
-        // 主 Agent 前置判断：分流「场景A简单(general) / 场景B复杂(multi-agent)」
-        String resolvedAgent = resolveAgent(request.message());
+        // 主 Agent 前置判断：分流「场景A简单(会话绑定 Agent) / 场景B复杂(multi-agent)」
+        String resolvedAgent = resolveAgent(request.message(), sessionId);
 
         Goal goal = agentService.executeSync(resolvedAgent, request.message(), sessionId);
         writeBackContext(sessionId, request.message(), goal);
@@ -125,8 +126,8 @@ public class ChatServiceImpl implements ChatService {
                         agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())),
                         ctx.sid(), ctx.newSession(), request.message(), null);
             }
-            // 主 Agent 前置判断：分流「场景A简单(general) / 场景B复杂(multi-agent)」
-            String resolvedAgent = resolveAgent(request.message());
+            // 主 Agent 前置判断：分流「场景A简单(会话绑定 Agent) / 场景B复杂(multi-agent)」
+            String resolvedAgent = resolveAgent(request.message(), ctx.sid());
             return toSseBody(withAgentProgress(resolvedAgent,
                     agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid())),
                     ctx.sid(), ctx.newSession(), request.message(), null);
@@ -243,22 +244,46 @@ public class ChatServiceImpl implements ChatService {
 
     /**
      * 主 Agent 前置判断：调用 {@link RouteJudge} 决定走哪条路径。
-     * 复杂(COMPLEX) → multi-agent 多 Agent 编排；否则(简单/未知) → 默认 general。
-     * 判断异常/失败时兜底默认 Agent（宁可简单，不阻塞请求）。
+     * 复杂(COMPLEX) → multi-agent 多 Agent 编排；简单/未知 → 会话绑定的 Agent
+     * （session.agent_id，如曾用 /agent 切换；未绑定或失效回退默认 general），
+     * 不再一律压回 general——会话切过 Agent 后简单问题也应由该 Agent 回答。
+     * 判断异常/失败时兜底简单路径（宁可简单，不阻塞请求）。
      *
-     * @return 选中的 agent 名（"general" 或 "multi-agent"）
+     * @return 选中的 agent 名（会话 Agent/general 或 "multi-agent"）
      */
-    private String resolveAgent(String message) {
+    private String resolveAgent(String message, String sessionId) {
         try {
             RouteDecision route = routeJudge.judge(message);
-            log.info("[route] message '{}' -> {} -> agent={}", trimForLog(message), route,
-                    route == RouteDecision.COMPLEX ? AgentConstants.MULTI_AGENT : AgentConstants.DEFAULT_AGENT);
-            return route == RouteDecision.COMPLEX
+            String resolved = route == RouteDecision.COMPLEX
                     ? AgentConstants.MULTI_AGENT
-                    : AgentConstants.DEFAULT_AGENT;
+                    : sessionAgentName(sessionId);
+            log.info("[route] message '{}' -> {} -> agent={}", trimForLog(message), route, resolved);
+            return resolved;
         } catch (Exception e) {
             // 判断异常不得影响请求主流程：兜底默认（简单）路径
-            log.warn("[route] 主 Agent 判断异常，回退默认 agent：{}", safeMessage(e));
+            log.warn("[route] 主 Agent 判断异常，回退会话 Agent：{}", safeMessage(e));
+            return sessionAgentName(sessionId);
+        }
+    }
+
+    /**
+     * 解析会话绑定的 Agent 名（session.agent_id → agent 表 agent_name）。
+     * 会话不存在/未绑定/查询失败/agent 行已删时回退默认 general——与
+     * {@code executeStreamReactiveByAgentId} 未命中回退的语义一致。
+     */
+    private String sessionAgentName(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return AgentConstants.DEFAULT_AGENT;
+        }
+        try {
+            SessionEntity session = sessionService.getSession(sessionId);
+            if (session == null || session.getAgentId() == null) {
+                return AgentConstants.DEFAULT_AGENT;
+            }
+            return agentService.findAgentNameById(session.getAgentId().longValue())
+                    .orElse(AgentConstants.DEFAULT_AGENT);
+        } catch (Exception e) {
+            log.warn("[route] 会话 Agent 解析失败，回退默认 sid={}: {}", sessionId, safeMessage(e));
             return AgentConstants.DEFAULT_AGENT;
         }
     }

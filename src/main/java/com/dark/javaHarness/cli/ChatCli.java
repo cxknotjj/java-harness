@@ -395,7 +395,7 @@ public class ChatCli {
     private void handleAgentCommand(String line) {
         String arg = line.substring("/agent".length()).trim();
         if (arg.isEmpty()) {
-            ui.println("当前 Agent: " + (agentId == null ? "自动分流（服务端按复杂度选择）" : agentId));
+            ui.println("当前 Agent: " + (agentId == null ? "自动分流（简单→会话绑定 Agent，复杂→multi-agent）" : agentId));
             return;
         }
         if ("off".equalsIgnoreCase(arg)) {

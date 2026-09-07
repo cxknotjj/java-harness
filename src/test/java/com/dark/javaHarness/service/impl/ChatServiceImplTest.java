@@ -19,6 +19,7 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.dark.javaHarness.domain.entity.SessionEntity;
 import com.dark.javaHarness.enums.GoalStatus;
 import com.dark.javaHarness.exception.ResumeConflictException;
 import com.dark.javaHarness.service.AgentService;
@@ -228,6 +229,44 @@ class ChatServiceImplTest {
 
         verify(routeJudge).judge("调研竞品");
         verify(agentService).executeStreamReactive(eq("multi-agent"), eq("调研竞品"), eq("50"));
+    }
+
+    /** 简单路径不再一律压回 general：按 session.agent_id 路由到会话绑定的 Agent */
+    @Test
+    void streamReactive_simple_shouldRouteToSessionBoundAgent() {
+        ChatRequest req = new ChatRequest("你好啊", "50", null);
+        SessionEntity session = new SessionEntity();
+        session.setAgentId(10);
+        when(sessionService.getSession("50")).thenReturn(session);
+        when(agentService.findAgentNameById(10L)).thenReturn(Optional.of("coder"));
+        when(routeJudge.judge("你好啊")).thenReturn(RouteDecision.SIMPLE);
+        when(agentService.executeStreamReactive("coder", "你好啊", "50"))
+                .thenReturn(Flux.just("coder 的回答"));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        verify(agentService).executeStreamReactive("coder", "你好啊", "50");
+        verify(agentService, never()).executeStreamReactive(eq("general"), anyString(), anyString());
+        assertTrue(lines.stream().anyMatch(l -> l.contains("\"stage\":\"agent\"") && l.contains("\"detail\":\"coder\"")),
+                "流首 agent 进度行应为会话绑定 Agent，而非 general: " + lines);
+    }
+
+    /** 会话绑定失效（agent 行已删）时回退 general，不得让请求失败 */
+    @Test
+    void streamReactive_sessionAgentMissing_shouldFallbackToGeneral() {
+        ChatRequest req = new ChatRequest("hi", "50", null);
+        SessionEntity session = new SessionEntity();
+        session.setAgentId(10);
+        when(sessionService.getSession("50")).thenReturn(session);
+        when(agentService.findAgentNameById(10L)).thenReturn(Optional.empty());
+        when(routeJudge.judge("hi")).thenReturn(RouteDecision.SIMPLE);
+        when(agentService.executeStreamReactive("general", "hi", "50"))
+                .thenReturn(Flux.just("fallback"));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        verify(agentService).executeStreamReactive("general", "hi", "50");
+        assertTrue(lines.contains("event: token\ndata: fallback"), "回退 general 后流应正常输出: " + lines);
     }
 
     @Test
