@@ -88,6 +88,27 @@ public class AgentConfigProvider {
         return Optional.empty();
     }
 
+    /**
+     * 从 agent 表读取指定 Agent 的 tools 列（工具分配数据化，prompt 动态加载·子项 2）：
+     * 逗号分隔的组名/工具名声明。行不存在/列空白/查询异常均返回 empty
+     * （ToolAssignments 据此回退代码内置分配，行为与现状一致）。
+     */
+    public Optional<String> findAgentTools(String agentName) {
+        if (agentName == null || agentName.isBlank()) {
+            return Optional.empty();
+        }
+        try {
+            AgentEntity row = agentMapper.selectOne(new LambdaQueryWrapper<AgentEntity>()
+                    .eq(AgentEntity::getAgentName, agentName)
+                    .select(AgentEntity::getTools)
+                    .last("LIMIT 1"));
+            return row == null ? Optional.empty() : Optional.ofNullable(row.getTools());
+        } catch (Exception e) {
+            log.warn("读取 agent 表 tools 列失败 agent={}", agentName, e);
+            return Optional.empty();
+        }
+    }
+
     /** 按 model_provider.id 解析模型名（请求级 model 参数用）；id 空或查不到返回 null（走默认） */
     private String resolveModelName(Long modelProviderId) {
         if (modelProviderId == null) {

@@ -30,8 +30,11 @@ spring:
         transport: stdio
         # 懒连接时的 server 地址（http 模式），由 McpToolProvider 读取
         server-url: http://localhost:${server.port:8080}/mcp
-        # stdio 模式启动命令。优先级：项目根 mcp-config.json（mcpServers JSON 结构，同 Claude/Cursor）
-        # → 此内联命令（回退）。示例：stdio-command: "npx -y @browsermcp/mcp@latest"
+        # 多 server 配置（McpToolProvider）：优先读项目根 mcp-config.json（mcpServers JSON 结构，
+        # 同 Claude/Cursor）的全量条目——command(±args)=stdio、url=http、enabled:false 跳过，
+        # 每 server 独立懒连接、失败按 server 隔离；文件缺失/无有效条目回退本节 legacy 单 server：
+        # stdio 走 mcp-config.json 第一条目 → 此内联命令（回退），http 走上方 server-url。
+        # 示例：stdio-command: "npx -y @browsermcp/mcp@latest"
         stdio-command: ""
   datasource:
     url: jdbc:mysql://localhost:3306/harness?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false
@@ -68,6 +71,13 @@ app:
   prompt:
     lazy-tools:
       enabled: true
+    # skill 动态装配（Markdown 技能库）：扫描 dir 目录的 .md 技能文件（front-matter 声明
+    # name/description/agents），system 注入「名称+描述」索引段，模型经 load_skill 元工具
+    # 按需取完整正文；文件按 mtime 热重载（放入/修改下一请求生效，免重启）；
+    # 关闭后 skill 段为空、load_skill 不注册
+    skills:
+      enabled: true
+      dir: skills
   providers:
     dashscope:
       api-key: ${QWEN_API_KEY:dummy-key-for-startup}

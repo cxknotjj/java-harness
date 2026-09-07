@@ -30,6 +30,9 @@ public class AgentEntity {
     /** 系统提示词（System Prompt） */
     private String prompt;
 
+    /** 分配的工具（逗号分隔：组名 web/demo/sandbox.* 或精确工具名；NULL/空白回退代码内置分配） */
+    private String tools;
+
     /** 状态：1-启用 0-禁用 */
     private Integer status;
 

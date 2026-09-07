@@ -3,6 +3,7 @@ package com.dark.javaHarness.agent;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -34,6 +35,8 @@ import org.springframework.ai.chat.client.ChatClient.StreamResponseSpec;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
 import reactor.core.publisher.Flux;
 
 /**
@@ -46,6 +49,13 @@ import reactor.core.publisher.Flux;
  */
 @ExtendWith(MockitoExtension.class)
 class MultiAgentGraphAgentTest {
+
+    /** 文本 token → ChatResponse 流（生产流式链已切 chatResponse 通道以捕获 streamUsage 末帧） */
+    private static Flux<ChatResponse> fluxOf(String... tokens) {
+        return Flux.fromArray(java.util.Arrays.stream(tokens)
+                .map(t -> new ChatResponse(List.of(new Generation(new AssistantMessage(t)))))
+                .toArray(ChatResponse[]::new));
+    }
 
     @Mock
     private ChatClientRegistry clientRegistry;
@@ -76,9 +86,9 @@ class MultiAgentGraphAgentTest {
         when(chatClient.prompt()).thenReturn(requestSpec);
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
-        // call() 已统一流式背书：lead/子任务/聚合全部走 stream().content() 通道
+        // call() 已统一流式背书：lead/子任务/聚合全部走 stream().chatResponse() 通道
         when(requestSpec.stream()).thenReturn(streamSpec);
-        when(streamSpec.content()).thenReturn(Flux.just(content));
+        when(streamSpec.chatResponse()).thenReturn(fluxOf(content));
     }
 
     /** 独立 stub 的客户端：专家子任务使用，内容固定（避免与共享 mock 的 stub 冲突） */
@@ -90,7 +100,7 @@ class MultiAgentGraphAgentTest {
         when(rs.system(anyString())).thenReturn(rs);
         when(rs.user(anyString())).thenReturn(rs);
         when(rs.stream()).thenReturn(ss);
-        when(ss.content()).thenReturn(Flux.just(content));
+        when(ss.chatResponse()).thenReturn(fluxOf(content));
         return c;
     }
 
@@ -201,8 +211,8 @@ class MultiAgentGraphAgentTest {
     void executeStreamReactive_streamsFinalAnswerTokenByToken() {
         stubChat(fixedContent());
         // 覆盖聚合节点的 stream 内容：三段 token（含一个空片段，模拟真实流的空 token）
-        when(streamSpec.content())
-                .thenReturn(Flux.just("最终回答", "", "第二段", "。"));
+        when(streamSpec.chatResponse())
+                .thenReturn(fluxOf("最终回答", "", "第二段", "。"));
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
         java.util.List<String> rows = agent
@@ -288,7 +298,7 @@ class MultiAgentGraphAgentTest {
         verify(clientRegistry, never()).get(any(Long.class));
     }
 
-    /** agent 表无任何配置（含 null model）→ 走默认客户端，model 参数不应被设置 */
+    /** agent 表无任何配置（含 null model）→ 走默认客户端，streamUsage 照常开启但 model 不设置 */
     @Test
     void execute_withoutConfig_usesDefaultClientWithoutModelOption() {
         stubChat(fixedContent());
@@ -299,7 +309,14 @@ class MultiAgentGraphAgentTest {
         assertEquals(fixedContent(), reply);
         // lead + 2 个并行子任务 + 聚合共 4 次调用，全部走默认客户端（model=null）
         verify(clientRegistry, org.mockito.Mockito.times(4)).get(isNull());
-        verify(requestSpec, never()).options(any());
+        // streamUsage 统计开启后 options 必挂（仅设开关不覆盖客户端默认），但 model 不得被设置
+        org.mockito.ArgumentCaptor<org.springframework.ai.openai.OpenAiChatOptions> optionsCaptor =
+                org.mockito.ArgumentCaptor.forClass(org.springframework.ai.openai.OpenAiChatOptions.class);
+        verify(requestSpec, org.mockito.Mockito.times(4)).options(optionsCaptor.capture());
+        optionsCaptor.getAllValues().forEach(o -> {
+            assertTrue(o.getStreamUsage(), "streamUsage 统计应随每次调用开启");
+            assertNull(o.getModel(), "无配置时不得设置模型名（走客户端默认）");
+        });
     }
 
     /* ---------------- 静态 prompt 预算（PromptBudgetAdvisor 挂载） ---------------- */
@@ -434,12 +451,12 @@ class MultiAgentGraphAgentTest {
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         // lead（第 1 次）立即返回拆解 JSON；子任务（第 2、3 次）在途阻塞到放行
         when(requestSpec.stream()).thenReturn(streamSpec);
-        when(streamSpec.content()).thenAnswer(inv -> {
+        when(streamSpec.chatResponse()).thenAnswer(inv -> {
             if (contentCalls.incrementAndGet() == 1) {
-                return Flux.just(fixedContent());
+                return fluxOf(fixedContent());
             }
             releaseSubtasks.await(10, java.util.concurrent.TimeUnit.SECONDS);
-            return Flux.just(fixedContent());
+            return fluxOf(fixedContent());
         });
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null,
                 new com.alibaba.cloud.ai.graph.checkpoint.savers.MemorySaver());
@@ -482,9 +499,9 @@ class MultiAgentGraphAgentTest {
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         // lenient：短路生效时 lead 可能一次都不调用（UnnecessaryStubbing 免检）
         lenient().when(requestSpec.stream()).thenReturn(streamSpec);
-        lenient().when(streamSpec.content()).thenAnswer(inv -> {
+        lenient().when(streamSpec.chatResponse()).thenAnswer(inv -> {
             releaseLead.await(10, java.util.concurrent.TimeUnit.SECONDS);
-            return Flux.just(fixedContent());
+            return fluxOf(fixedContent());
         });
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
@@ -522,21 +539,21 @@ class MultiAgentGraphAgentTest {
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.stream()).thenReturn(streamSpec);
-        when(streamSpec.content()).thenAnswer(inv -> {
+        when(streamSpec.chatResponse()).thenAnswer(inv -> {
             if (contentCalls.incrementAndGet() <= 3) {
-                return Flux.just(fixedContent()); // lead + 2 子任务正常完成
+                return fluxOf(fixedContent()); // lead + 2 子任务正常完成
             }
             // 聚合：首 token 已产出（在途），尾 token 等放行
             aggStarted.countDown();
             return Flux.concat(
-                    Flux.just("首token"),
+                    fluxOf("首token"),
                     Flux.defer(() -> {
                         try {
                             releaseTail.await(10, java.util.concurrent.TimeUnit.SECONDS);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         }
-                        return Flux.just("尾token");
+                        return fluxOf("尾token");
                     }));
         });
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
@@ -575,15 +592,15 @@ class MultiAgentGraphAgentTest {
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.stream()).thenReturn(streamSpec);
-        when(streamSpec.content()).thenAnswer(inv -> {
+        when(streamSpec.chatResponse()).thenAnswer(inv -> {
             int call = contentCalls.incrementAndGet();
             if (call <= 3) {
-                return Flux.just(fixedContent()); // lead + 2 子任务正常完成
+                return fluxOf(fixedContent()); // lead + 2 子任务正常完成
             }
             if (call == 4) {
                 return Flux.error(new RuntimeException("模拟厂商端挂死超时")); // 聚合首试失败（0 token）
             }
-            return Flux.just(fixedContent()); // 聚合重试成功
+            return fluxOf(fixedContent()); // 聚合重试成功
         });
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 
@@ -611,13 +628,13 @@ class MultiAgentGraphAgentTest {
         when(requestSpec.system(anyString())).thenReturn(requestSpec);
         when(requestSpec.user(anyString())).thenReturn(requestSpec);
         when(requestSpec.stream()).thenReturn(streamSpec);
-        when(streamSpec.content()).thenAnswer(inv -> {
+        when(streamSpec.chatResponse()).thenAnswer(inv -> {
             int call = contentCalls.incrementAndGet();
             if (call <= 3) {
-                return Flux.just(fixedContent()); // lead + 2 子任务正常完成
+                return fluxOf(fixedContent()); // lead + 2 子任务正常完成
             }
             // 聚合：先推一个 token 再失败（部分输出）
-            return Flux.concat(Flux.just("部分"), Flux.error(new RuntimeException("中途失败")));
+            return Flux.concat(fluxOf("部分"), Flux.error(new RuntimeException("中途失败")));
         });
         agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments, null);
 

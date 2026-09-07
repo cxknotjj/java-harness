@@ -3,6 +3,8 @@ package com.dark.javaHarness.agent;
 import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.enums.AgentConstants;
+import com.dark.javaHarness.prompt.PromptAssembler;
+import com.dark.javaHarness.prompt.SkillManager;
 import com.dark.javaHarness.service.AgentConfigProvider;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
@@ -44,10 +46,15 @@ public class AgentRegistry {
     private final LlmCallRecorder recorder;
     private final ContextBudgetProperties budgets;
     private final ToolLazyManager lazyTools;
+    /** 共享 Prompt 组装器（含 skill 段提供者），注册实例与编排实例共用；null 时 GA 裸构建（测试场景） */
+    private final PromptAssembler promptAssembler;
+    /** skill 装配管理器（load_skill 元工具来源）；null 时不注册元工具（测试场景） */
+    private final SkillManager skillManager;
 
     /** 已注册路由表（agentName → 实例）；computeIfAbsent 保证并发惰性注册单次构造 */
     private final ConcurrentHashMap<String, Agent> agents = new ConcurrentHashMap<>();
 
+    /** 兼容构造（旧测试/调用链）：promptAssembler/skillManager 为 null，GA 内部裸构建、不注册 load_skill */
     public AgentRegistry(AgentConfigProvider provider,
                          ObjectProvider<AgentService> agentServiceProvider,
                          ChatClientRegistry clientRegistry,
@@ -56,6 +63,21 @@ public class AgentRegistry {
                          LlmCallRecorder recorder,
                          ContextBudgetProperties budgets,
                          ToolLazyManager lazyTools) {
+        this(provider, agentServiceProvider, clientRegistry, memoryStore, toolAssignments,
+                recorder, budgets, lazyTools, null, null);
+    }
+
+    /** 全参构造：promptAssembler 为共享 bean（含 skill 段提供者），skillManager 供 GA 注册 load_skill 元工具 */
+    public AgentRegistry(AgentConfigProvider provider,
+                         ObjectProvider<AgentService> agentServiceProvider,
+                         ChatClientRegistry clientRegistry,
+                         SessionService memoryStore,
+                         ToolAssignments toolAssignments,
+                         LlmCallRecorder recorder,
+                         ContextBudgetProperties budgets,
+                         ToolLazyManager lazyTools,
+                         PromptAssembler promptAssembler,
+                         SkillManager skillManager) {
         this.provider = provider;
         this.agentServiceProvider = agentServiceProvider;
         this.clientRegistry = clientRegistry;
@@ -64,6 +86,8 @@ public class AgentRegistry {
         this.recorder = recorder;
         this.budgets = budgets;
         this.lazyTools = lazyTools;
+        this.promptAssembler = promptAssembler;
+        this.skillManager = skillManager;
     }
 
     /** 启动注册：注册 agent 表全部对话 Agent 行（is_internal=0），逐行容错；general 行缺失时代码兜底注册。 */
@@ -128,10 +152,11 @@ public class AgentRegistry {
         }
     }
 
-    /** 构造对话 Agent 实例：依赖全部来自本类构造注入字段，AgentService 经 ObjectProvider 现取透传。 */
+    /** 构造对话 Agent 实例：依赖全部来自本类构造注入字段，AgentService 经 ObjectProvider 现取透传 */
     private Agent createGeneralAssistant(String agentName) {
         return new GeneralAssistantAgent(agentName, clientRegistry, memoryStore,
-                agentServiceProvider.getObject(), toolAssignments, recorder, budgets, lazyTools);
+                agentServiceProvider.getObject(), toolAssignments, recorder, budgets, lazyTools,
+                promptAssembler, skillManager);
     }
 
     /** 统一「未知 Agent」文案：含可用列表，不泄漏底层异常。 */

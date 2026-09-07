@@ -7,8 +7,11 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.dark.javaHarness.service.AgentConfigProvider;
 import java.util.List;
+import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -33,9 +36,15 @@ class ToolAssignmentsTest {
     @Mock
     private McpToolProvider mcp;
 
+    @Mock
+    private AgentConfigProvider agentConfigProvider;
+
     private final WebTools webTools = new WebTools();
 
     private ToolAssignments assignments;
+
+    /** 数据驱动实例：带 AgentConfigProvider，forAgent 优先读 tools 列声明 */
+    private ToolAssignments dataDriven;
 
     @BeforeEach
     void setUp() {
@@ -55,6 +64,7 @@ class ToolAssignmentsTest {
         lenient().when(sandbox.browserTools()).thenReturn(List.of(b1, b2, b3));
         lenient().when(mcp.toolCallbacks()).thenReturn(List.of(mcpInteractive));
         assignments = new ToolAssignments(webTools, sandbox, mcp);
+        dataDriven = new ToolAssignments(webTools, sandbox, mcp, agentConfigProvider);
     }
 
     /** 带 toolDefinition 名字的 mock 回调（真实工具名才可验证同名去重语义） */
@@ -165,5 +175,64 @@ class ToolAssignmentsTest {
         verify(sandbox, never()).readOnlyFileTools();
         verify(sandbox, never()).writeTools();
         verify(sandbox, never()).browserTools();
+    }
+
+    // ================================================================
+    // 数据驱动分配（prompt 动态加载·子项 2）：agent 表 tools 列声明优先
+    // ================================================================
+
+    @Test
+    void declaredTools_groupTokens_resolvedFromColumns() {
+        // agent 表 tools 列声明组名 → 展开为对应工具源，与 legacy 分配解耦
+        when(agentConfigProvider.findAgentTools("custom")).thenReturn(Optional.of("web, sandbox.base"));
+        ToolAssignments.ToolSet set = dataDriven.forAgent("custom");
+        assertEquals(List.of(webTools), set.annotated(), "web 组 → 注解工具对象");
+        assertEquals(1, set.callbacks().size(), "sandbox.base 组 → 执行类(1)");
+        assertEquals("base", set.callbacks().get(0).getToolDefinition().name());
+    }
+
+    @Test
+    void declaredTools_exactNames_crossCatalogLookup() {
+        // 精确工具名跨目录查找：注解工具名 → 整个 @Tool 对象；callback 名 → 单个 callback
+        when(agentConfigProvider.findAgentTools("custom"))
+                .thenReturn(Optional.of("fetchUrl, ro2"));
+        ToolAssignments.ToolSet set = dataDriven.forAgent("custom");
+        assertEquals(List.of(webTools), set.annotated(), "fetchUrl 命中 WebTools → 注入整个对象");
+        assertEquals(1, set.callbacks().size());
+        assertEquals("ro2", set.callbacks().get(0).getToolDefinition().name(), "ro2 精确命中单个回调");
+    }
+
+    @Test
+    void declaredTools_mcpToolByName_grantedBeyondLegacyWhitelist() {
+        // 数据路径按名授予 MCP 动态发现工具（白名单收窄仅 legacy 路径专用）：
+        // browser_hover 不在 legacy 白名单内，但 tools 列显式声明即放行
+        ToolCallback mcpHover = named("browser_hover");
+        lenient().when(mcp.toolCallbacks()).thenReturn(List.of(mcpHover));
+        when(agentConfigProvider.findAgentTools("custom")).thenReturn(Optional.of("browser_hover"));
+        ToolAssignments.ToolSet set = dataDriven.forAgent("custom");
+        assertTrue(set.callbacks().contains(mcpHover), "tools 列显式声明的 MCP 工具按名授予");
+    }
+
+    @Test
+    void declaredTools_unknownTokens_skipped_othersStillResolved() {
+        when(agentConfigProvider.findAgentTools("custom"))
+                .thenReturn(Optional.of("no-such-tool, demo,,  web"));
+        ToolAssignments.ToolSet set = dataDriven.forAgent("custom");
+        assertTrue(set.annotated().contains(webTools), "未知 token 跳过不影响其余声明");
+        assertEquals(2, set.annotated().size(), "demo 组 → DemoTools 一并注入");
+        assertTrue(set.callbacks().isEmpty());
+    }
+
+    @Test
+    void declaredTools_blankOrMissing_fallsBackToLegacy() {
+        // tools 列 NULL/空白 → 回退代码内置分配（legacy switch 语义不变）：
+        // 与无 AgentConfigProvider 的纯 legacy 实例结果逐字段一致（ToolSet 为 record，值相等）
+        when(agentConfigProvider.findAgentTools("researcher")).thenReturn(Optional.empty());
+        when(agentConfigProvider.findAgentTools("general")).thenReturn(Optional.of("   "));
+        assertEquals(assignments.forAgent("researcher"), dataDriven.forAgent("researcher"),
+                "tools 列缺失 → legacy 分配");
+        assertEquals(assignments.forAgent("general"), dataDriven.forAgent("general"),
+                "tools 列空白 → legacy 分配");
+        assertEquals(9, dataDriven.forAgent("general").callbacks().size(), "回退结果为 legacy 全量");
     }
 }

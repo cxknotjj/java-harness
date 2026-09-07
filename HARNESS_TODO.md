@@ -83,10 +83,14 @@
   - 落地：`GoalExecutorConfig` 双池（`goal-exec-` 后台 Goal 池 core=max=8 / 队列 50 / 优雅停机；`applicationTaskExecutor` MVC 异步槽位）；队列满拒绝 → Goal 落 FAILED 终态；`run()` catch Throwable 堵 Error 逃逸卡 RUNNING
   - 验收 ✅：并发提交 10 个 Goal 稳定执行全 SUCCEEDED、无拒绝无卡 RUNNING（单测覆盖）；失败重投部分经评估另立任务（见 P2「Goal 失败重投」），详见存档「异步治理与发布工程」
 
-* [ ] **prompt的动态加载：**
-  - [ ] 1.skill的动态装配
-  - [ ] 2.tool的动态装配
-  - [ ] 3.mcp的动态装配
+* [x] **prompt的动态加载：**
+  - [x] 1.skill的动态装配
+    - 实现：`SkillRepository` 扫描 `skills/` 目录 .md（front-matter 声明 name/description/agents，mtime 热重载免重启）+ `SkillManager` 两段式暴露——system prompt 只注入「名称：描述」索引段，模型按需调 `load_skill` 元工具取完整正文；越权防护按 agent 可见技能集服务端硬校验，返回全文按 tool-result-budget 截断
+  - [x] 2.tool的动态装配
+    - 实现：agent 表新增 `tools` 列（V10 迁移），`ToolAssignments` 优先按列声明分配（组名 `web`/`sandbox.base`… 或精确工具名，跨目录查找含 MCP 动态工具），改库即生效免重启；列 NULL/空白回退代码内置分配（legacy 语义不变）
+  - [x] 3.mcp的动态装配
+    - 实现：`McpToolProvider` 重构为多 server——解析 `mcp-config.json`（Claude/Cursor 同款 mcpServers 结构）全量条目（stdio/http 混合、`enabled:false` 跳过），每 server 独立懒连接 + 失败隔离，工具并集按名去重；文件缺失回退 legacy yaml 单 server
+    - 附带：流式真实 usage 统计——`OpenAiChatOptions.streamUsage(true)` 让末帧回传真实 usage（prompt/completion token），llm_call_log 优先记真实值、无 usage 回退估算；`load_skill` 与 `expand_tool` 同为元工具不占工具次数额度
   - [x] 4.agent角色prompt的组装
   - [x] **5.记忆上下文的动态注入**
   - [x] 6.**工具 Schema 的延迟加载:开始只注入对于工具的描述，只有agent明确需要调用时，才会按需提升暴漏完整tool参数**

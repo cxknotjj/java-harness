@@ -8,6 +8,7 @@ import com.dark.javaHarness.domain.LlmCallLog;
 import com.dark.javaHarness.exception.ModelQuotaException;
 import com.dark.javaHarness.prompt.MemoryPolicy;
 import com.dark.javaHarness.prompt.PromptAssembler;
+import com.dark.javaHarness.prompt.SkillManager;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
@@ -85,6 +86,8 @@ final class AgentChatCaller {
     private final SessionService memoryStore;
     /** 工具 Schema 延迟加载管理器（开关关闭时 process 全量透传，行为与现状一致）；编排三节点共享同一会话展开集 */
     private final ToolLazyManager lazyTools;
+    /** skill 装配管理器（load_skill 元工具来源）；null 时不注册元工具（单测/旧构造链场景） */
+    private final SkillManager skillManager;
     /** LLM 调用观测记录器（可 null：无观测场景下直通） */
     private final LlmCallRecorder recorder;
     /** 模型调用重试策略（指数退避，最多 3 次） */
@@ -165,12 +168,31 @@ final class AgentChatCaller {
                     PromptAssembler promptAssembler,
                     SessionService memoryStore,
                     ToolLazyManager lazyTools) {
+        this(clientRegistry, agentService, toolAssignments, recorder, retry, budgets,
+                promptAssembler, memoryStore, lazyTools, null);
+    }
+
+    /**
+     * 全参构造（含 skill 装配）：skillManager 为 null 时不注册 load_skill 元工具
+     * （单测/旧构造链场景）；正式装配由 MultiAgentGraphAgent 透传共享实例。
+     */
+    AgentChatCaller(ChatClientRegistry clientRegistry,
+                    AgentService agentService,
+                    ToolAssignments toolAssignments,
+                    LlmCallRecorder recorder,
+                    LlmRetry retry,
+                    ContextBudgetProperties budgets,
+                    PromptAssembler promptAssembler,
+                    SessionService memoryStore,
+                    ToolLazyManager lazyTools,
+                    SkillManager skillManager) {
         this.clientRegistry = clientRegistry;
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
         this.promptAssembler = promptAssembler;
         this.memoryStore = memoryStore;
         this.lazyTools = lazyTools != null ? lazyTools : new ToolLazyManager(toolAssignments, false);
+        this.skillManager = skillManager;
         this.recorder = recorder;
         this.retry = retry;
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
@@ -208,9 +230,11 @@ final class AgentChatCaller {
         return retry.executeWithRetry(() -> {
             long start = System.currentTimeMillis();
             try {
+                java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
+                        new java.util.concurrent.atomic.AtomicReference<>();
                 String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                        toolEmitter, false, extraAdvisors, null, cancelled);
-                recordOkEstimated(sessionId, forAgent, model, start, content);
+                        toolEmitter, false, extraAdvisors, null, cancelled, usageRef);
+                recordOkStream(sessionId, forAgent, model, start, content, usageRef.get());
                 return content;
             } catch (RuntimeException e) {
                 // 客户端断连中止：记录后立即上抛（CancellationException 不可重试，直接放行）
@@ -230,9 +254,11 @@ final class AgentChatCaller {
                     log.warn("[caller] {} 发起未知名工具调用，去工具重试一次：{}", forAgent, safeMsg(e));
                     long start2 = System.currentTimeMillis();
                     try {
+                        java.util.concurrent.atomic.AtomicReference<Usage> usageRef2 =
+                                new java.util.concurrent.atomic.AtomicReference<>();
                         String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                                null, true, extraAdvisors, null, cancelled);
-                        recordOkEstimated(sessionId, forAgent, model, start2, content);
+                                null, true, extraAdvisors, null, cancelled, usageRef2);
+                        recordOkStream(sessionId, forAgent, model, start2, content, usageRef2.get());
                         return content;
                     } catch (RuntimeException e2) {
                         recordError(sessionId, forAgent, model, true, start2, e2);
@@ -249,9 +275,11 @@ final class AgentChatCaller {
     String invokeAndRecord(AgentConfig config, String sessionId, String forAgent,
                            String fallbackSystem, String user, Consumer<String> toolEmitter,
                            boolean disableTools, String model, long start, Advisor... extraAdvisors) {
+        java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
         String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                toolEmitter, disableTools, extraAdvisors, null, null);
-        recordOkEstimated(sessionId, forAgent, model, start, content);
+                toolEmitter, disableTools, extraAdvisors, null, null, usageRef);
+        recordOkStream(sessionId, forAgent, model, start, content, usageRef.get());
         return content;
     }
 
@@ -274,10 +302,13 @@ final class AgentChatCaller {
      * <p>取消语义：cancelled 已置位时直接抛取消异常（零 HTTP 请求）；执行中置位时
      * takeUntil 在下一个 token 边界中止订阅——取消向上传播关闭 HTTP 连接（厂商端
      * 停止生成），部分输出不返回。
+     *
+     * <p>usageRef 非 null 时捕获 streamUsage 末帧真实 usage，供记录真实 token（null 则纯收集）。
      */
     private String streamAttempt(AgentConfig config, String sessionId, String forAgent, String fallbackSystem,
                                  String user, Consumer<String> toolEmitter, boolean disableTools,
-                                 Advisor[] extraAdvisors, Consumer<String> onToken, BooleanSupplier cancelled) {
+                                 Advisor[] extraAdvisors, Consumer<String> onToken, BooleanSupplier cancelled,
+                                 java.util.concurrent.atomic.AtomicReference<Usage> usageRef) {
         if (cancelled != null && cancelled.getAsBoolean()) {
             throw cancelException();
         }
@@ -285,7 +316,18 @@ final class AgentChatCaller {
         try {
             buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
                     .stream()
-                    .content()
+                    .chatResponse()
+                    .doOnNext(resp -> captureUsage(resp, usageRef))
+                    // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
+                    // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
+                    // filter 根本不会执行——必须用 handle 跳过空帧
+                    .handle((org.springframework.ai.chat.model.ChatResponse resp,
+                             reactor.core.publisher.SynchronousSink<String> sink) -> {
+                        String token = AgentChatCaller.contentOf(resp);
+                        if (token != null) {
+                            sink.next(token);
+                        }
+                    })
                     // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
                     .timeout(STREAM_IDLE_TIMEOUT)
                     .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
@@ -375,10 +417,24 @@ final class AgentChatCaller {
         for (int attempt = 1; attempt <= retry.maxAttempts(); attempt++) {
             long start = System.currentTimeMillis();
             StringBuilder collected = new StringBuilder();
+            // streamUsage 末帧真实 usage（无则估算兜底）
+            java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
+                    new java.util.concurrent.atomic.AtomicReference<>();
             try {
                 buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, false, extraAdvisors)
                         .stream()
-                        .content()
+                        .chatResponse()
+                        .doOnNext(resp -> captureUsage(resp, usageRef))
+                        // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
+                        // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
+                        // filter 根本不会执行——必须用 handle 跳过空帧
+                        .handle((org.springframework.ai.chat.model.ChatResponse resp,
+                                 reactor.core.publisher.SynchronousSink<String> sink) -> {
+                            String token = AgentChatCaller.contentOf(resp);
+                            if (token != null) {
+                                sink.next(token);
+                            }
+                        })
                         // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
                         .timeout(STREAM_IDLE_TIMEOUT)
                         .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
@@ -418,10 +474,9 @@ final class AgentChatCaller {
                         cancelException());
                 throw cancelException();
             }
-            // 流式无 usage 回包：按已收输出文本近似估算（与 ContextAssemblingAdvisor 同口径）
+            // streamUsage 回传真实 usage 时记真实值，无则按已收输出文本近似估算（原口径兜底）
             String out = collected.toString();
-            int tokens = LlmCallRecorder.estimateTokens(out);
-            record(sessionId, forAgent, model, true, true, null, tokens, tokens, start, null);
+            recordOkStream(sessionId, forAgent, model, start, out, usageRef.get());
             return out;
         }
         // 理论不可达（maxAttempts>=1）
@@ -465,10 +520,16 @@ final class AgentChatCaller {
             // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
             // frequencyPenalty：长报告聚合场景下模型易陷入重复循环（同一段落循环生成多次），
             // 用频率惩罚抑制；对 lead 的 JSON 输出无副作用
+            // streamUsage(true)：流式末帧回传真实 usage（OpenAI stream_options.include_usage，
+            // DashScope 兼容模式与 DeepSeek 均支持）——llm_call_log 据此记真实 prompt/completion token
             spec.options(OpenAiChatOptions.builder()
                     .model(model)
                     .frequencyPenalty(0.5)
+                    .streamUsage(true)
                     .build());
+        } else {
+            // model 空时仅设开关不覆盖客户端默认（usage 记录与模型无关）
+            spec.options(OpenAiChatOptions.builder().streamUsage(true).build());
         }
         // 专家工具分配：按 agent 名注入请求级工具（与客户端 defaultTools 合并）；
         // disableTools=true 跳过（幻觉工具调用的降级重试路径）。
@@ -499,6 +560,15 @@ final class AgentChatCaller {
         // 已展开→透传完整 schema，末尾追加 expand_tool 元工具（不经 tracer/预算——
         // 元工具不产生工具行噪声、不占真实执行额度）；开关关闭/无会话 ID 时全量透传现状
         tools = lazyTools.process(sessionId, tools);
+        // load_skill 元工具（skill 索引段配套）：该 agent 有可见技能时注册——同 expand_tool 口径
+        // 不经 tracer/次数额度；skill 全文自身在 SkillManager 内按 tool-result-budget 截断
+        List<ToolCallback> loadSkill = skillManager == null ? List.of()
+                : skillManager.loadSkillTool(forAgent).map(List::of).orElse(List.of());
+        if (!loadSkill.isEmpty()) {
+            List<ToolCallback> merged = new ArrayList<>(tools);
+            merged.addAll(loadSkill);
+            tools = merged;
+        }
         if (!tools.isEmpty()) {
             spec.toolCallbacks(tools.toArray(new ToolCallback[0]));
         }
@@ -511,20 +581,30 @@ final class AgentChatCaller {
                 : agentService.getAgentConfig(forAgent).orElse(null);
     }
 
-    /** 成功记录（流式估算口径）：call 统一走流式通道无 usage 回包，按输出文本近似估算 token */
-    private void recordOkEstimated(String sessionId, String agentName, String model, long start, String content) {
-        int tokens = LlmCallRecorder.estimateTokens(content);
-        record(sessionId, agentName, model, true, true, null, tokens, tokens, start, null);
-    }
-
-    /** 成功记录：usage 可解析则记真实 token，否则留空 */
-    private void recordOk(String sessionId, String agentName, String model, boolean stream,
-                          Usage usage, long start, String content) {
+    /** 成功记录（流式）：streamUsage 末帧回传真实 usage 时记真实 token，无则按输出文本估算兜底 */
+    private void recordOkStream(String sessionId, String agentName, String model, long start,
+                                String content, Usage usage) {
         Integer prompt = usage == null ? null : usage.getPromptTokens();
         Integer completion = usage == null ? null : usage.getCompletionTokens();
         Integer total = usage == null ? null : usage.getTotalTokens();
-        record(sessionId, agentName, model, stream, true,
-                prompt, completion, total, start, null);
+        if (completion == null) {
+            int tokens = LlmCallRecorder.estimateTokens(content);
+            completion = tokens;
+            total = tokens;
+        }
+        record(sessionId, agentName, model, true, true, prompt, completion, total, start, null);
+    }
+
+    /** 模型空响应防御：从流式 chatResponse 捕获 usage（streamUsage 末帧回传真实值；取最后一个非空有效帧） */
+    private static void captureUsage(org.springframework.ai.chat.model.ChatResponse resp,
+                                     java.util.concurrent.atomic.AtomicReference<Usage> ref) {
+        if (ref == null) {
+            return;
+        }
+        Usage usage = usageOf(resp);
+        if (usage != null && usage.getTotalTokens() != null && usage.getTotalTokens() > 0) {
+            ref.set(usage);
+        }
     }
 
     private void recordError(String sessionId, String agentName, String model, boolean stream,

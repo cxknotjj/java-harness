@@ -16,6 +16,7 @@ import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.prompt.PromptAssembler;
+import com.dark.javaHarness.prompt.SkillManager;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
@@ -170,12 +171,33 @@ public class MultiAgentGraphAgent implements Agent {
                                 ContextBudgetProperties budgets,
                                 SessionService memoryStore,
                                 ToolLazyManager lazyTools) {
+        this(agentName, clientRegistry, agentService, toolAssignments, recorder,
+                checkpointSaver, budgets, memoryStore, lazyTools, null, null);
+    }
+
+    /**
+     * 全参构造（含 skill 装配）：promptAssembler/skillManager 为 null 时内部裸构建
+     * （旧构造链/单测场景，无 skill 段、不注册 load_skill）；正式装配由 ChatAgentConfig
+     * 注入共享实例——编排三节点与路径 A 共用同一组装器与 skill 技能面。
+     */
+    public MultiAgentGraphAgent(String agentName,
+                                ChatClientRegistry clientRegistry,
+                                AgentService agentService,
+                                ToolAssignments toolAssignments,
+                                LlmCallRecorder recorder,
+                                BaseCheckpointSaver checkpointSaver,
+                                ContextBudgetProperties budgets,
+                                SessionService memoryStore,
+                                ToolLazyManager lazyTools,
+                                PromptAssembler promptAssembler,
+                                SkillManager skillManager) {
         ToolLazyManager lazy = lazyTools != null ? lazyTools : new ToolLazyManager(toolAssignments, false);
         this.agentName = agentName;
         // 工具索引段与延迟加载同源：开启时索引段追加 expand_tool 使用引导（与轻量态工具面对齐）
-        this.promptAssembler = new PromptAssembler(agentService, toolAssignments, List.of(), lazy.isEnabled());
+        this.promptAssembler = promptAssembler != null ? promptAssembler
+                : new PromptAssembler(agentService, toolAssignments, List.of(), lazy.isEnabled());
         this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments, recorder,
-                new LlmRetry(), null, promptAssembler, memoryStore, lazy);
+                new LlmRetry(), null, this.promptAssembler, memoryStore, lazy, skillManager);
         this.checkpointSaver = checkpointSaver;
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
         try {

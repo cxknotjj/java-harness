@@ -122,4 +122,77 @@ class McpToolProviderTest {
             return false;
         }
     }
+
+    // ================================================================
+    // 多 server 配置解析（prompt 动态加载·子项 3）：mcpServers 全量条目
+    // ================================================================
+
+    @Test
+    void multiServerConfig_stdioAndHttpAndMixed_parsed() throws Exception {
+        String json = """
+                {
+                  "mcpServers": {
+                    "stdio-server": { "command": "npx", "args": ["-y", "some-server"] },
+                    "http-server": { "url": "http://localhost:9000/mcp" },
+                    "disabled": { "command": "skip-me", "enabled": false },
+                    "invalid": { "description": "既无 command 也无 url" }
+                  }
+                }
+                """;
+        Path f = Files.createTempFile("mcp-multi", ".json");
+        Files.writeString(f, json);
+        List<McpToolProvider.ServerSpec> specs = McpToolProvider.loadServerSpecs(f);
+        assertEquals(2, specs.size(), "disabled 跳过 + 无 command/url 条目跳过 = 2 个有效 server");
+        McpToolProvider.ServerSpec stdio = specs.get(0);
+        assertEquals("stdio-server", stdio.name());
+        assertEquals("stdio", stdio.transport());
+        assertEquals("npx", stdio.command());
+        assertEquals(List.of("-y", "some-server"), stdio.args());
+        McpToolProvider.ServerSpec http = specs.get(1);
+        assertEquals("http-server", http.name());
+        assertEquals("http", http.transport());
+        assertEquals("http://localhost:9000/mcp", http.url());
+    }
+
+    @Test
+    void multiServerConfig_enabledTrueDefault_missingEnabledFieldStillLoaded() throws Exception {
+        String json = """
+                { "mcpServers": { "a": { "url": "http://x/mcp" } } }
+                """;
+        Path f = Files.createTempFile("mcp-enabled", ".json");
+        Files.writeString(f, json);
+        assertEquals(1, McpToolProvider.loadServerSpecs(f).size(),
+                "缺省 enabled 字段视为启用");
+    }
+
+    @Test
+    void multiServerConfig_missingFileOrBadStructure_returnsEmpty() throws Exception {
+        assertTrue(McpToolProvider.loadServerSpecs(Path.of("target/no-such-mcp.json")).isEmpty(),
+                "文件缺失返回空表（调用方回退 legacy）");
+        Path noServers = Files.createTempFile("mcp-noservers", ".json");
+        Files.writeString(noServers, "{ \"other\": {} }");
+        assertTrue(McpToolProvider.loadServerSpecs(noServers).isEmpty(), "无 mcpServers 对象返回空表");
+        Path bad = Files.createTempFile("mcp-bad", ".json");
+        Files.writeString(bad, "{ not valid json ");
+        assertTrue(McpToolProvider.loadServerSpecs(bad).isEmpty(), "坏 JSON 返回空表不抛");
+    }
+
+    @Test
+    void constructor_multiServerConfig_loadsAllSpecs() throws Exception {
+        // 构造器优先走 mcp-config.json 全量条目（而非 legacy 单 server 分支）
+        String json = """
+                {
+                  "mcpServers": {
+                    "one": { "url": "http://localhost:1/mcp" },
+                    "two": { "url": "http://localhost:2/mcp" }
+                  }
+                }
+                """;
+        Path f = Files.createTempFile("mcp-ctor", ".json");
+        Files.writeString(f, json);
+        // 两个不可达 server：toolCallbacks 降级为空（失败隔离，不抛），但配置面已加载
+        McpToolProvider provider = new McpToolProvider("http", "", "", f.toString());
+        assertTrue(provider.toolCallbacks().isEmpty(),
+                "server 不可达时按 server 隔离降级为空工具面，不影响主链路");
+    }
 }

@@ -10,6 +10,7 @@ import static org.mockito.Mockito.when;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.tool.ToolAssignments;
+import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -19,15 +20,25 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.ChatClient.ChatClientRequestSpec;
 import org.springframework.ai.chat.client.ChatClient.StreamResponseSpec;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.client.HttpServerErrorException;
 import reactor.core.publisher.Flux;
 
 /**
  * AgentChatCaller 重试行为单测：编排环节调用器在模型调用失败时按策略自动重试。
- * call() 底层统一走流式通道（可中止），stub 亦为流式（stream().content() 返回 Flux）。
+ * call() 底层统一走流式通道（可中止），stub 亦为流式（stream().chatResponse() 返回 Flux）。
  */
 class AgentChatCallerRetryTest {
+
+    /** 文本 token → ChatResponse 流（生产流式链已切 chatResponse 通道以捕获 streamUsage 末帧） */
+    private static Flux<ChatResponse> fluxOf(String... tokens) {
+        return Flux.fromArray(List.of(tokens).stream()
+                .map(t -> new ChatResponse(List.of(new Generation(new AssistantMessage(t)))))
+                .toArray(ChatResponse[]::new));
+    }
 
     private ChatClientRegistry clientRegistry;
     private AgentService agentService;
@@ -49,8 +60,8 @@ class AgentChatCallerRetryTest {
                 new LlmRetry(3, 1));
     }
 
-    /** 组装一个流式 stub 客户端：content() 的 Flux 由调用方逐次给出，calls 计数每次尝试 +1 */
-    private StreamStub streamStub(AtomicInteger calls, Flux<String>... contents) {
+    /** 组装一个流式 stub 客户端：chatResponse() 的 Flux 由调用方逐次给出，calls 计数每次尝试 +1 */
+    private StreamStub streamStub(AtomicInteger calls, Flux<ChatResponse>... contents) {
         ChatClient c = mock(ChatClient.class);
         ChatClientRequestSpec rs = mock(ChatClientRequestSpec.class);
         StreamResponseSpec ss = mock(StreamResponseSpec.class);
@@ -58,7 +69,7 @@ class AgentChatCallerRetryTest {
         when(rs.system(anyString())).thenReturn(rs);
         when(rs.user(anyString())).thenReturn(rs);
         when(rs.stream()).thenReturn(ss);
-        when(ss.content()).thenAnswer(inv -> {
+        when(ss.chatResponse()).thenAnswer(inv -> {
             calls.incrementAndGet();
             return contents[calls.get() - 1];
         });
@@ -75,7 +86,7 @@ class AgentChatCallerRetryTest {
         // 第 1 次抛 500，第 2 次返回内容
         StreamStub stub = streamStub(calls,
                 Flux.error(new HttpServerErrorException(HttpStatus.INTERNAL_SERVER_ERROR)),
-                Flux.just("retried-ok"));
+                fluxOf("retried-ok"));
 
         String result = callerWithClient(stub.client()).call("s1", "coder", "sys", "任务");
 
@@ -119,11 +130,11 @@ class AgentChatCallerRetryTest {
         when(rs.system(anyString())).thenReturn(rs);
         when(rs.user(anyString())).thenReturn(rs);
         when(rs.stream()).thenReturn(ss);
-        when(ss.content()).thenAnswer(inv -> {
+        when(ss.chatResponse()).thenAnswer(inv -> {
             calls.incrementAndGet();
             // 第 2 个 token 到达时模拟客户端断连置位
-            return Flux.just("a", "b", "c").doOnNext(t -> {
-                if ("b".equals(t)) {
+            return fluxOf("a", "b", "c").doOnNext(resp -> {
+                if ("b".equals(AgentChatCaller.contentOf(resp))) {
                     cancelled.set(true);
                 }
             });

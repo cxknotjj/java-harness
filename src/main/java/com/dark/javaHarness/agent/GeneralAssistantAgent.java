@@ -6,6 +6,7 @@ import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.domain.LlmCallLog;
 import com.dark.javaHarness.prompt.PromptAssembler;
+import com.dark.javaHarness.prompt.SkillManager;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
@@ -56,6 +57,8 @@ public class GeneralAssistantAgent implements Agent {
     private final PromptAssembler promptAssembler;
     /** 工具 Schema 延迟加载管理器（开关关闭时 process 全量透传，行为与现状一致） */
     private final ToolLazyManager lazyTools;
+    /** skill 装配管理器（load_skill 元工具来源；null=不注册，单测/旧构造链场景） */
+    private final SkillManager skillManager;
     /** LLM 调用观测记录器（可 null：无观测场景下直通） */
     private final LlmCallRecorder recorder;
     /** 模型调用重试策略（最多 3 次、指数退避） */
@@ -95,6 +98,25 @@ public class GeneralAssistantAgent implements Agent {
                                  LlmCallRecorder recorder,
                                  com.dark.javaHarness.config.ContextBudgetProperties budgets,
                                  ToolLazyManager lazyTools) {
+        this(agentName, clientRegistry, memoryStore, agentService, toolAssignments,
+                recorder, budgets, lazyTools, null, null);
+    }
+
+    /**
+     * 全参构造（含 skill 装配）：promptAssembler/skillManager 为 null 时内部裸构建
+     * （旧构造链/单测场景，无 skill 段、不注册 load_skill）；正式装配由 ChatAgentConfig/
+     * AgentRegistry 注入共享实例（skill 段提供者与 toolLazyManager 开关对齐）。
+     */
+    public GeneralAssistantAgent(String agentName,
+                                 ChatClientRegistry clientRegistry,
+                                 SessionService memoryStore,
+                                 AgentService agentService,
+                                 ToolAssignments toolAssignments,
+                                 LlmCallRecorder recorder,
+                                 com.dark.javaHarness.config.ContextBudgetProperties budgets,
+                                 ToolLazyManager lazyTools,
+                                 PromptAssembler promptAssembler,
+                                 SkillManager skillManager) {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.memoryStore = memoryStore;
@@ -102,8 +124,9 @@ public class GeneralAssistantAgent implements Agent {
         this.toolAssignments = toolAssignments;
         this.lazyTools = lazyTools != null ? lazyTools : new ToolLazyManager(toolAssignments, false);
         // 工具索引段与延迟加载同源：开启时索引段追加 expand_tool 使用引导（与轻量态工具面对齐）
-        this.promptAssembler = new PromptAssembler(agentService, toolAssignments, List.of(),
-                this.lazyTools.isEnabled());
+        this.promptAssembler = promptAssembler != null ? promptAssembler
+                : new PromptAssembler(agentService, toolAssignments, List.of(), this.lazyTools.isEnabled());
+        this.skillManager = skillManager;
         this.recorder = recorder;
         this.historyBudget = budgets != null ? budgets.getHistoryBudget() : 4000;
         this.retry = new LlmRetry();
@@ -149,10 +172,24 @@ public class GeneralAssistantAgent implements Agent {
         log.info("AI agent '{}' 开始流式处理目标: {}", name(), goal.objective());
         long start = System.currentTimeMillis();
         StringBuilder collected = new StringBuilder();
+        // streamUsage 开启后末帧回传真实 usage（无则维持估算兜底）
+        java.util.concurrent.atomic.AtomicReference<org.springframework.ai.chat.metadata.Usage> usageRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
 
         Flux<String> flux = buildChatRequestSpec(goal.sessionId(), goal.objective())
                 .stream()
-                .content();
+                .chatResponse()
+                .doOnNext(resp -> captureUsage(resp, usageRef))
+                // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
+                // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
+                // filter 根本不会执行——必须用 handle 跳过空帧
+                .handle((org.springframework.ai.chat.model.ChatResponse resp,
+                         reactor.core.publisher.SynchronousSink<String> sink) -> {
+                    String token = AgentChatCaller.contentOf(resp);
+                    if (token != null) {
+                        sink.next(token);
+                    }
+                });
         // 真正逐 token 推送：订阅流，每来一个 token 立即回调，阻塞等待流结束
         try {
             flux.doOnNext(token -> {
@@ -164,10 +201,10 @@ public class GeneralAssistantAgent implements Agent {
                     .then()
                     .block();
         } catch (RuntimeException e) {
-            recordCall(goal.sessionId(), true, false, null, collected, start, e);
+            recordCall(goal.sessionId(), true, false, usageRef.get(), collected, start, e);
             throw e;
         }
-        recordCall(goal.sessionId(), true, true, null, collected, start, null);
+        recordCall(goal.sessionId(), true, true, usageRef.get(), collected, start, null);
         log.info("AI agent '{}' 流式输出完成", name());
     }
 
@@ -187,16 +224,31 @@ public class GeneralAssistantAgent implements Agent {
         // doFinally 只有信号没有异常体——用 doOnError 抓住真实 Throwable 供观测落库
         java.util.concurrent.atomic.AtomicReference<Throwable> streamError =
                 new java.util.concurrent.atomic.AtomicReference<>();
+        // streamUsage 开启后末帧回传真实 usage（无则维持估算兜底）
+        java.util.concurrent.atomic.AtomicReference<org.springframework.ai.chat.metadata.Usage> usageRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
         // 关闸挂 merge 之前的主干段（多 Agent 侧同款死锁教训：关闸在 merge 后会循环等待）
         Flux<String> content = buildChatRequestSpec(goal.sessionId(), goal.objective(),
                         row -> BranchProgressListener.tryEmitSerialized(toolEvents, row))
                 .stream()
-                .content()
+                .chatResponse()
+                .doOnNext(resp -> captureUsage(resp, usageRef))
+                // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
+                // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
+                // filter 根本不会执行——必须用 handle 跳过空帧
+                .handle((org.springframework.ai.chat.model.ChatResponse resp,
+                         reactor.core.publisher.SynchronousSink<String> sink) -> {
+                    String token = AgentChatCaller.contentOf(resp);
+                    if (token != null) {
+                        sink.next(token);
+                    }
+                })
                 .doOnNext(collected::append)
                 .doOnError(streamError::set)
                 .doFinally(sig -> {
-                    // 终结（含 cancel/error）时记录本次调用观测：流式无 usage，按已收文本估算。
-                    // error 带真实异常（原因链展开后有供应商响应体），CANCEL 单独标注不再记 null
+                    // 终结（含 cancel/error）时记录本次调用观测：streamUsage 末帧 usage 优先，
+                    // 无则按已收文本估算。error 带真实异常（原因链展开后有供应商响应体），
+                    // CANCEL 单独标注不再记 null
                     Throwable err;
                     if (sig == SignalType.ON_ERROR) {
                         err = streamError.get() != null
@@ -208,10 +260,19 @@ public class GeneralAssistantAgent implements Agent {
                         err = null;
                     }
                     recordCall(goal.sessionId(), true, err == null,
-                            null, collected, start, err);
+                            usageRef.get(), collected, start, err);
                     BranchProgressListener.tryCompleteSerialized(toolEvents);
                 });
         return content.mergeWith(toolEvents.asFlux());
+    }
+
+    /** 从流式 chatResponse 捕获 usage（streamUsage 末帧回传真实值；取最后一个非空有效帧） */
+    private static void captureUsage(org.springframework.ai.chat.model.ChatResponse resp,
+                                     java.util.concurrent.atomic.AtomicReference<org.springframework.ai.chat.metadata.Usage> ref) {
+        org.springframework.ai.chat.metadata.Usage usage = AgentChatCaller.usageOf(resp);
+        if (usage != null && usage.getTotalTokens() != null && usage.getTotalTokens() > 0) {
+            ref.set(usage);
+        }
     }
 
     /**
@@ -290,12 +351,26 @@ public class GeneralAssistantAgent implements Agent {
         // 末尾追加 expand_tool 元工具（不经 tracer——元工具不产生工具行噪声，真实工具行正常）；
         // 开关关闭/无会话 ID 时全量透传现状
         tools = lazyTools.process(sessionId, tools);
+        // load_skill 元工具（skill 索引段配套）：该 agent 有可见技能时注册——同 expand_tool 口径
+        // 不经 tracer/次数额度；skill 全文自身在 SkillManager 内按 tool-result-budget 截断
+        List<ToolCallback> loadSkill = skillManager == null ? List.of()
+                : skillManager.loadSkillTool(agentName).map(List::of).orElse(List.of());
+        if (!loadSkill.isEmpty()) {
+            List<ToolCallback> merged = new ArrayList<>(tools);
+            merged.addAll(loadSkill);
+            tools = merged;
+        }
         if (!tools.isEmpty()) {
             spec.toolCallbacks(tools.toArray(new ToolCallback[0]));
         }
+        // streamUsage(true)：流式末帧回传真实 usage（OpenAI stream_options.include_usage，
+        // DashScope 兼容模式与 DeepSeek 均支持）——llm_call_log 据此记真实 prompt/completion
+        // token，工具 schema/skill 索引等请求侧开销可见；model 空时仅设开关不覆盖客户端默认
+        OpenAiChatOptions.Builder options = OpenAiChatOptions.builder().streamUsage(true);
         if (model != null && !model.isBlank()) {
-            spec.options(OpenAiChatOptions.builder().model(model).build());
+            options.model(model);
         }
+        spec.options(options.build());
         return spec;
     }
 }

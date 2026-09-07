@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -13,6 +12,7 @@ import static org.mockito.Mockito.when;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.service.AgentService;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,6 +23,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import reactor.core.publisher.Flux;
 
@@ -36,6 +39,14 @@ import reactor.core.publisher.Flux;
  */
 @ExtendWith(MockitoExtension.class)
 class AgentChatCallerTest {
+
+    /** 文本 token → ChatResponse 流（生产流式链已切 chatResponse 通道以捕获 streamUsage 末帧） */
+    private static Flux<ChatResponse> fluxOf(String... tokens) {
+        return Flux.fromArray(List.of(tokens).stream()
+                .map(t -> new ChatResponse(List.of(new Generation(new AssistantMessage(t)))))
+                .toArray(ChatResponse[]::new));
+    }
+
 
     @Mock
     private ChatClientRegistry clientRegistry;
@@ -67,9 +78,9 @@ class AgentChatCallerTest {
 
     @Test
     void call_unknownToolHallucination_retriesOnceWithoutTools() {
-        when(streamSpec.content())
+        when(streamSpec.chatResponse())
                 .thenReturn(Flux.error(new IllegalStateException("No ToolCallback found for tool name: researcher")))
-                .thenReturn(Flux.just("调研完成：4399 公司……"));
+                .thenReturn(fluxOf("调研完成：4399 公司……"));
 
         String out = caller.call("s1", "researcher", "兜底提示", "任务内容", null);
 
@@ -80,7 +91,7 @@ class AgentChatCallerTest {
 
     @Test
     void call_otherError_propagates() {
-        when(streamSpec.content()).thenReturn(Flux.error(new IllegalStateException("无关异常")));
+        when(streamSpec.chatResponse()).thenReturn(Flux.error(new IllegalStateException("无关异常")));
 
         assertThrows(IllegalStateException.class,
                 () -> caller.call("s1", "researcher", "兜底提示", "任务内容", null));
@@ -88,7 +99,7 @@ class AgentChatCallerTest {
 
     @Test
     void invokeOnce_disableTools_skipsAllToolInjection() {
-        when(streamSpec.content()).thenReturn(Flux.just("ok"));
+        when(streamSpec.chatResponse()).thenReturn(fluxOf("ok"));
 
         String out = caller.invokeAndRecord(
                 new AgentConfig(1L, "m1", "系统提示词"), "s1", "researcher",
@@ -102,20 +113,32 @@ class AgentChatCallerTest {
     @Test
     void call_collectsAllTokensFromStreamChannel() {
         // call() 改为流式背书：全部 token 收集后拼接返回
-        when(streamSpec.content()).thenReturn(Flux.just("你好", "，", "世界"));
+        when(streamSpec.chatResponse()).thenReturn(fluxOf("你好", "，", "世界"));
 
         String out = caller.call("s1", "researcher", "兜底提示", "任务内容", null);
 
         assertEquals("你好，世界", out);
     }
 
+    /** 回归（streamUsage）：末帧只含 usage（无 generations，contentOf=null）应跳过而非炸流 */
+    @Test
+    void call_usageOnlyFinalFrame_skippedWithoutError() {
+        when(streamSpec.chatResponse()).thenReturn(Flux.concat(
+                fluxOf("部分", "回答"),
+                Flux.just(new ChatResponse(List.of()))));
+
+        String out = caller.call("s1", "researcher", "兜底提示", "任务内容", null);
+
+        assertEquals("部分回答", out, "usage 空帧应被跳过，内容完整");
+    }
+
     @Test
     void call_cancelledMidStream_abortsAtTokenBoundary_noRetry() {
         AtomicBoolean cancelled = new AtomicBoolean(false);
         // 第 2 个 token 到达时模拟客户端断连置位：takeUntil 放行的终止前元素在 doOnNext 拦截中止
-        when(streamSpec.content()).thenReturn(Flux.just("a", "b", "c")
-                .doOnNext(t -> {
-                    if ("b".equals(t)) {
+        when(streamSpec.chatResponse()).thenReturn(fluxOf("a", "b", "c")
+                .doOnNext(resp -> {
+                    if ("b".equals(AgentChatCaller.contentOf(resp))) {
                         cancelled.set(true);
                     }
                 }));

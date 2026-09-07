@@ -11,7 +11,11 @@ import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
+import com.dark.javaHarness.prompt.PromptAssembler;
+import com.dark.javaHarness.prompt.SkillManager;
+import com.dark.javaHarness.prompt.SkillSectionProvider;
 import com.dark.javaHarness.prompt.ToolLazyManager;
+import java.util.List;
 import javax.sql.DataSource;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
@@ -49,6 +53,20 @@ public class ChatAgentConfig {
     }
 
     /**
+     * 共享 Prompt 组装器（prompt 的动态加载）：两路径（GeneralAssistantAgent / multi-agent 编排）
+     * 统一实例——skill 段提供者 Spring 自动收集（当前 {@link SkillManager}，子项 1），
+     * lazy 开关与 toolLazyManager 对齐。@Lazy AgentService 解创建期循环（AgentRegistry
+     * 装配期构造 Agent 实例时才用到组装器，组装器本身只在请求期调 agentService）。
+     */
+    @Bean
+    public PromptAssembler promptAssembler(@Lazy AgentService agentService,
+                                           ToolAssignments toolAssignments,
+                                           List<SkillSectionProvider> skillProviders,
+                                           ToolLazyManager toolLazyManager) {
+        return new PromptAssembler(agentService, toolAssignments, skillProviders, toolLazyManager.isEnabled());
+    }
+
+    /**
      * Agent 表驱动注册表：对话 Agent 路由表的唯一来源。
      * 装配顺序在方法体内显式编排（不用 initMethod，顺序最清晰）：
      * 先预注入 multi-agent 编排 bean（表行不构造编排实例），再启动注册
@@ -63,9 +81,12 @@ public class ChatAgentConfig {
                                        LlmCallRecorder recorder,
                                        com.dark.javaHarness.config.ContextBudgetProperties budgets,
                                        ToolLazyManager toolLazyManager,
+                                       PromptAssembler promptAssembler,
+                                       SkillManager skillManager,
                                        MultiAgentGraphAgent multiAgent) {
         AgentRegistry agentRegistry = new AgentRegistry(agentConfigProvider, agentService, registry,
-                memoryStore, toolAssignments, recorder, budgets, toolLazyManager);
+                memoryStore, toolAssignments, recorder, budgets, toolLazyManager,
+                promptAssembler, skillManager);
         agentRegistry.register(multiAgent);
         agentRegistry.init();
         return agentRegistry;
@@ -85,7 +106,7 @@ public class ChatAgentConfig {
                 .build();
     }
 
-    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合），带 MySQL 检查点与静态 prompt 预算；memoryStore 与 GeneralAssistantAgent 同源，lead 拆解据此注入会话记忆；toolLazyManager 与路径 A 共享（会话展开集跨路径通用） */
+    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合），带 MySQL 检查点与静态 prompt 预算；memoryStore 与 GeneralAssistantAgent 同源，lead 拆解据此注入会话记忆；toolLazyManager 与路径 A 共享（会话展开集跨路径通用）；promptAssembler/skillManager 共享实例（skill 索引段与 load_skill 跨路径一致） */
     @Bean
     public MultiAgentGraphAgent multiAgent(ChatClientRegistry registry,
                                            @Lazy AgentService agentService,
@@ -94,8 +115,11 @@ public class ChatAgentConfig {
                                            LlmCallRecorder recorder,
                                            BaseCheckpointSaver graphCheckpointSaver,
                                            com.dark.javaHarness.config.ContextBudgetProperties budgets,
-                                           ToolLazyManager toolLazyManager) {
+                                           ToolLazyManager toolLazyManager,
+                                           PromptAssembler promptAssembler,
+                                           SkillManager skillManager) {
         return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService,
-                toolAssignments, recorder, graphCheckpointSaver, budgets, memoryStore, toolLazyManager);
+                toolAssignments, recorder, graphCheckpointSaver, budgets, memoryStore,
+                toolLazyManager, promptAssembler, skillManager);
     }
 }
