@@ -262,10 +262,29 @@ class ChatServiceImplTest {
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress")), "应包含 event: progress");
         assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress") && l.contains("\"stage\":\"拆解\"")),
                 "进度行的 event 与 data 应在同一元素内并带 stage JSON");
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress")
+                        && l.contains("\"stage\":\"agent\"") && l.contains("\"detail\":\"multi-agent\"")),
+                "流首应带 agent 归属进度行（CLI 据此渲染回答前缀）");
         assertTrue(lines.contains("event: token\ndata: 最终回答A"),
                 "内容行应按 token 事件输出（progress 之后必须显式声明 event: token，否则 SSE 粘滞会吞掉 token）");
         assertFalse(lines.stream().anyMatch(l -> l.contains("{\"stage\"") == false && l.contains("子任务已就绪")),
                 "进度行不应以内容 token 形式泄漏");
+    }
+
+    /** 流首 agent 进度行：指定 agentId 时带上解析出的 agent 名（CLI 据此渲染回答前缀） */
+    @Test
+    void streamReactive_agentIdPath_emitsAgentProgressWithResolvedName() {
+        ChatRequest req = new ChatRequest("hi", "50", 2L);
+        when(agentService.findAgentNameById(2L)).thenReturn(java.util.Optional.of("writer"));
+        when(agentService.executeStreamReactiveByAgentId(2L, "hi", "50"))
+                .thenReturn(Flux.just("writer 的回答"));
+
+        List<String> lines = chatService.streamReactive(req).collectList().block();
+
+        assertTrue(lines.stream().anyMatch(l -> l.startsWith("event: progress")
+                        && l.contains("\"stage\":\"agent\"") && l.contains("\"detail\":\"writer\"")),
+                "应带解析出的 agent 名: " + lines);
+        assertTrue(lines.contains("event: token\ndata: writer 的回答"), "内容照常输出: " + lines);
     }
 
     /**

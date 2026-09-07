@@ -67,6 +67,14 @@ public final class TerminalRenderer {
     private int linePrinted;
     private boolean inCodeBlock;
 
+    // ---- 回答归属前缀（agent 进度行驱动，与用户侧「你> 」提示符对称） ----
+    /** 已着色的「agentName> 」前缀（首个回答 token 前打印一次） */
+    private String answerPrefix;
+    /** 前缀是否已上屏（后到的 agent 事件不再重复打印） */
+    private boolean prefixPrinted;
+    /** 前缀是否仍在当前光标行行首（该行完成重绘时须原样补回，否则被 CLEAR_LINE 擦掉） */
+    private boolean prefixOnLine;
+
     // ---- 回合统计 ----
     private long turnStartMs;
     private int subtaskDone;
@@ -100,6 +108,9 @@ public final class TerminalRenderer {
             lineBuffer.setLength(0);
             linePrinted = 0;
             inCodeBlock = false;
+            answerPrefix = null;
+            prefixPrinted = false;
+            prefixOnLine = false;
         }
     }
 
@@ -128,6 +139,12 @@ public final class TerminalRenderer {
                     cancelSpinner();
                     archiveToolDone(detail);
                 }
+                // 回答归属：记录「agentName> 」前缀（不转 spinner），首个回答 token 前打印
+                case "agent" -> {
+                    if (detail != null && !detail.isBlank() && !prefixPrinted) {
+                        answerPrefix = BOLD + CYAN + detail + "> " + RESET;
+                    }
+                }
                 // 杂散/空 stage 行（无阶段名的进度噪声，如 MCP 工具回放的残留）直接忽略，
                 // 否则 startSpinner("") 会以空标题起 spinner，折叠时渲染成「✓  · 0s」的孤立空行
                 default -> {
@@ -148,6 +165,11 @@ public final class TerminalRenderer {
         }
         synchronized (lock) {
             finishSpinnerAsDone();
+            if (answerPrefix != null && !prefixPrinted) {
+                out.print(answerPrefix);
+                prefixPrinted = true;
+                prefixOnLine = true;
+            }
             lineBuffer.append(token);
             contentChars += token.length();
             int idx;
@@ -184,8 +206,9 @@ public final class TerminalRenderer {
                         out.print(lineBuffer.substring(linePrinted));
                     }
                     out.print("\n");
+                    prefixOnLine = false;
                 } else {
-                    out.print(CLEAR_LINE + rendered + "\n");
+                    out.print(CLEAR_LINE + withAnswerPrefix() + rendered + "\n");
                 }
                 lineBuffer.setLength(0);
                 linePrinted = 0;
@@ -301,7 +324,7 @@ public final class TerminalRenderer {
     private void emitRenderedLine(String line) {
         if (line.trim().startsWith("```")) {
             inCodeBlock = !inCodeBlock;
-            out.print(CLEAR_LINE + GRAY + line.trim() + RESET + "\n");
+            out.print(CLEAR_LINE + withAnswerPrefix() + GRAY + line.trim() + RESET + "\n");
             return;
         }
         String rendered = inCodeBlock ? CYAN + "│ " + line + RESET : renderInline(line);
@@ -309,9 +332,19 @@ public final class TerminalRenderer {
             // 纯文本行（含已在屏上的前缀）无着色收益，补打部分已先行输出，直接换行——
             // 免一次擦行重绘，普通聊天（大量纯文本）在擦行失效的终端上零重影
             out.print("\n");
+            prefixOnLine = false;
             return;
         }
-        out.print(CLEAR_LINE + rendered + "\n");
+        out.print(CLEAR_LINE + withAnswerPrefix() + rendered + "\n");
+    }
+
+    /** 当前光标行行首若挂着回答前缀（首次回答行），擦行重绘时须原样补回 */
+    private String withAnswerPrefix() {
+        if (prefixOnLine) {
+            prefixOnLine = false;
+            return answerPrefix == null ? "" : answerPrefix;
+        }
+        return "";
     }
 
     /** 逻辑行渲染（含代码块状态，供 endTurn 冲刷残留行） */

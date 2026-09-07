@@ -231,7 +231,7 @@ MultiAgentGraphAgent.executeStreamReactive(goal)
 | 进度行 | `event: progress` + `data: {"stage":..,"detail":..}`（Jackson 序列化 `StageRow` record） | 排除，不写回 |
 | 内容行 | `data: <row>` | `doOnNext` 收集，`[DONE]` 后统一写回多轮记忆 |
 
-CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spinner（原位刷新，完成折叠归档灰色 `✓ 阶段 · 耗时`）、`拆解/子任务` 直接归档摘要行、`tool` 转 `⏺ 工具名(参数)` spinner、`tool-done` 归档着色结果行（✓ 绿 / ✗ 红，`+N/-M 行` diff 着色）；最终回答仍按内容流逐 token 呈现打字机效果——**增量直出**（只补打未上屏部分，不依赖终端擦行重绘；2026-09-06 修复：原每 token 整行擦除重绘在 `\r\033[2K` 失效终端表现为同段文字带渐长尾巴重复），仅有着色收益的行（标题/列表/粗体/行内代码/代码块）完成时才整行重绘升级。
+CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spinner（原位刷新，完成折叠归档灰色 `✓ 阶段 · 耗时`）、`拆解/子任务` 直接归档摘要行、`tool` 转 `⏺ 工具名(参数)` spinner、`tool-done` 归档着色结果行（✓ 绿 / ✗ 红，`+N/-M 行` diff 着色）；`agent` 行（流首，detail=实际路由的 agent 名）供 CLI 在首个回答 token 前渲染「agentName> 」前缀，与用户侧「你> 」提示符对称；最终回答仍按内容流逐 token 呈现打字机效果——**增量直出**（只补打未上屏部分，不依赖终端擦行重绘；2026-09-06 修复：原每 token 整行擦除重绘在 `\r\033[2K` 失效终端表现为同段文字带渐长尾巴重复），仅有着色收益的行（标题/列表/粗体/行内代码/代码块）完成时才整行重绘升级。
 
 **测试**：`MultiAgentGraphAgentTest`（mock Registry/ChatClient 固定返回，断言进度阶段时序与子任务事件数量）+ `ChatServiceImplTest.streamReactive_shouldMapProgressRowToProgressEvent` + `ToolCallTracerTest`（事件组装/装饰行为/schema 透传）+ `TerminalRendererTest`（工具行渲染）。
 

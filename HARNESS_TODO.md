@@ -233,6 +233,7 @@
   - 输入体验：JLine 3——历史持久化、`/` 命令 Tab 补全、多行粘贴；无 TTY 自动降级。**JLine 3 不可替代性**：Windows 控制台无纯 Java 逐键 raw 输入；启动方式 `mvn -s .mvn/settings.xml -Pcli compile exec:exec`（fork 独立进程接管真实终端）
   - 乱码修复：CLI 输出统一收敛到 JLine `terminal.writer()` 宽字符通道（WriterBridge），GBK/65001 代码页均正常
   - 验收 ✅：全量 101 用例通过；文档 `docs/0828-CLI输出优化工具调用行与输入体验.md`
+- [x] **回答归属前缀（2026-09-06）**：SSE 流首新增 `stage=agent` 进度行——服务端下发实际路由到的 agent 名（智能分流与指定 agentId 两条路径都覆盖，续跑固定 multi-agent），CLI 在首个回答 token 前渲染着色「agentName> 」前缀，与用户侧「你> 」提示符对称，用户/智能体一眼可分；前缀计入渲染器行状态，首行着色重绘时原样补回（不被 CLEAR_LINE 擦掉）
 
 ## 项目基础（Roadmap P0 及能力项）
 

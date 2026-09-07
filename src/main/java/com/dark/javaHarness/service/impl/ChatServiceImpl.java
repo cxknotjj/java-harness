@@ -120,14 +120,15 @@ public class ChatServiceImpl implements ChatService {
                 // 显式指定 agentId 时跳过路由判断：分流结果在该分支用不上，而判断本身是一次
                 // 同步 LLM 调用（思考型模型失控时曾阻塞请求 14 分钟，见 llm_call_log #198），
                 // 指定 Agent 的请求不必陪跑这段延时与风险
-                return toSseBody(
-                        agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid()),
+                return toSseBody(withAgentProgress(agentService.findAgentNameById(request.agentId())
+                                .orElse(AgentConstants.DEFAULT_AGENT),
+                        agentService.executeStreamReactiveByAgentId(request.agentId(), request.message(), ctx.sid())),
                         ctx.sid(), ctx.newSession(), request.message(), null);
             }
             // 主 Agent 前置判断：分流「场景A简单(general) / 场景B复杂(multi-agent)」
             String resolvedAgent = resolveAgent(request.message());
-            return toSseBody(
-                    agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid()),
+            return toSseBody(withAgentProgress(resolvedAgent,
+                    agentService.executeStreamReactive(resolvedAgent, request.message(), ctx.sid())),
                     ctx.sid(), ctx.newSession(), request.message(), null);
         });
     }
@@ -149,8 +150,17 @@ public class ChatServiceImpl implements ChatService {
             throw new ResumeConflictException("该任务已完成，无需续跑: " + goalId);
         }
         log.info("[resume] goal '{}' 续跑请求（原状态={}）", goal.id(), goal.status());
-        return toSseBody(agentService.resumeStreamReactive(goal), goal.sessionId(), false,
-                goal.objective(), goal.id());
+        return toSseBody(withAgentProgress(AgentConstants.MULTI_AGENT, agentService.resumeStreamReactive(goal)),
+                goal.sessionId(), false, goal.objective(), goal.id());
+    }
+
+    /**
+     * 流首插入 agent 归属进度行（stage=agent, detail=agentName）：CLI 在首个回答 token 前
+     * 渲染「agentName&gt; 」前缀，与用户侧「你&gt; 」提示符对称——智能分流下实际路由的 Agent
+     * 只有服务端知道。进度行走旁路协议，不计入会话摘要与 goal.summary。
+     */
+    private static Flux<String> withAgentProgress(String agentName, Flux<String> agentTokens) {
+        return Flux.concat(Flux.just(ProgressLine.encode("agent", agentName)), agentTokens);
     }
 
     /**

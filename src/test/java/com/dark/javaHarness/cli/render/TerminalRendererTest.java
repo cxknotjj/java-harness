@@ -221,4 +221,61 @@ class TerminalRendererTest {
         }
         return c;
     }
+
+    /* ---------------- 回答归属前缀（agent 进度行驱动） ---------------- */
+
+    /** 去掉 ANSI 转义后比较可见文本（前缀着色会在前后缀间夹色码） */
+    private static String visible(String raw) {
+        return raw.replaceAll("\033\\[[0-9;]*[A-Za-z]", "");
+    }
+
+    @Test
+    void answerPrefix_printedBeforeFirstToken_sameLine() {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        TerminalRenderer renderer = new TerminalRenderer(
+                new PrintStream(buf, true, StandardCharsets.UTF_8));
+
+        renderer.beginTurn();
+        renderer.onProgress("agent", "nailong");
+        renderer.onToken("你好呀，");
+        renderer.onToken("我是奶龙。");
+        renderer.endTurn(true, null);
+
+        String visibleOut = visible(buf.toString(StandardCharsets.UTF_8));
+        assertTrue(visibleOut.contains("nailong> 你好呀，我是奶龙。"),
+                "前缀应与回答同行（与用户侧「你> 」对称）: " + visibleOut);
+        assertEquals(1, countOccurrences(visibleOut, "nailong> "), "前缀只应打印一次: " + visibleOut);
+    }
+
+    @Test
+    void answerPrefix_survivesFirstLineRedraw() {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        TerminalRenderer renderer = new TerminalRenderer(
+                new PrintStream(buf, true, StandardCharsets.UTF_8));
+
+        renderer.beginTurn();
+        renderer.onProgress("agent", "nailong");
+        renderer.onToken("## 要点\n"); // 首行着色完成 → CLEAR_LINE 整行重绘，前缀须原样补回
+        renderer.endTurn(true, null);
+
+        String raw = buf.toString(StandardCharsets.UTF_8);
+        assertTrue(raw.lastIndexOf("nailong> ") > raw.lastIndexOf("\r\033[2K"),
+                "重绘后行首仍应保留前缀（不被 CLEAR_LINE 擦掉）: " + visible(raw));
+        assertTrue(visible(raw).contains("# 要点"), "标题内容保留: " + visible(raw));
+    }
+
+    @Test
+    void answerPrefix_absentWithoutAgentProgress() {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        TerminalRenderer renderer = new TerminalRenderer(
+                new PrintStream(buf, true, StandardCharsets.UTF_8));
+
+        renderer.beginTurn();
+        renderer.onToken("无前缀回答");
+        renderer.endTurn(true, null);
+
+        String out = buf.toString(StandardCharsets.UTF_8);
+        assertFalse(out.contains("> "), "未收到 agent 进度行时不应打印前缀: " + out.replace("\033", "ESC"));
+        assertTrue(out.contains("无前缀回答"));
+    }
 }
