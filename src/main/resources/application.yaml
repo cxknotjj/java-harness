@@ -58,7 +58,7 @@ server:
 # 因此新增供应商通常零配置——设置 MOONSHOT_API_KEY 之类的环境变量即可。
 app:
   # 上下文预算（token，全项目统一口径 TokenEstimator）：集中管理四层预算，
-  # 详见 docs/CONTEXT_OPTIMIZATION.md——调整此处即可，无需改代码
+  # 详见 docs/guides/context-optimization.md——调整此处即可，无需改代码
   context:
     history-budget: 4000      # 路径 A 会话历史裁剪（ContextAssemblingAdvisor）
     lead-budget: 4000         # 编排 lead 拆解 prompt（超出对目标文本尾截）

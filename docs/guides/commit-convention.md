@@ -1,7 +1,7 @@
 # Commit 提交规范
 
 > 本项目遵循 [Conventional Commits](https://www.conventionalcommits.org/) 格式，**描述用中文**。
-> 与 [.trae/rules/git-workflow.md](../.trae/rules/git-workflow.md) 配套使用。
+> 与 [.trae/rules/git-workflow.md](../../.trae/rules/git-workflow.md) 配套使用。
 
 ## 格式
 

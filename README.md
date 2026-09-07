@@ -74,7 +74,7 @@ flowchart TD
 ```
 
 > [!TIP]
-> 数据流细节见 [`docs/data-flow.md`](./docs/data-flow.md)，落地 TODO 见 [`HARNESS_TODO.md`](./HARNESS_TODO.md)，测试全景见 [`docs/functional-testing.md`](./docs/functional-testing.md)。
+> 数据流细节见 [`docs/data-flow.md`](./docs/data-flow.md)，落地 TODO 见 [`docs/HARNESS_TODO.md`](./docs/HARNESS_TODO.md)，测试全景见 [`docs/functional-testing.md`](./docs/functional-testing.md)。
 
 ## 🧰 技术栈
 
@@ -99,7 +99,7 @@ flowchart TD
 | ☕ JDK | ✅ | 17+ |
 | 🛠️ Maven | ✅ | 3.8+（项目自带 settings，无需全局额外配置） |
 | 🗄️ MySQL | ✅ | `harness` 库，Flyway 启动自动建表 |
-| 🐳 Docker Desktop | ⚠️ 沙箱必需 | Python/Shell/浏览器工具的容器隔离；无 Docker 时仅沙箱类工具不可用，其余功能正常（需预拉取镜像，见 `TECH_STACK.md`） |
+| 🐳 Docker Desktop | ⚠️ 沙箱必需 | Python/Shell/浏览器工具的容器隔离；无 Docker 时仅沙箱类工具不可用，其余功能正常（需预拉取镜像，见 `docs/TECH_STACK.md`） |
 | 🔑 API Key | 🔄 可选 | DashScope（通义千问）/ DeepSeek；不配置可启动，调用模型会返回 `invalid_api_key` |
 
 ### ⚡ 一键启动

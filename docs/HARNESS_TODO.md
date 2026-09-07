@@ -72,6 +72,9 @@
 - [ ] **并发 / 资源控制**：流式连接数限制、模型调用超时兜底与熔断降级（COMPLEX 编排失败可降级为 SIMPLE 单模型重答）
   - 2026-09 部分完成：异步线程池隔离与参数化已落地（`goalExecutor` 有界池 + 拒绝兜底 + MVC 异步槽位，见存档「异步治理与发布工程」）；连接数限制与熔断降级待做
   - 验收：并发提交多个流式请求稳定，无连接/线程池耗尽（线程池部分已由 10 并发 submit 用例覆盖）
+- [ ] **Token 预算统一控制**：预算口径目前散落多处且只有输入侧裁剪、无消费侧封顶——上下文裁剪（`ContextAssemblingAdvisor`）、工具结果截断（tool-result-budget）、skill 正文截断各自独立配置，一次 COMPLEX 编排（lead + 4 子任务 + 聚合）可无上限消耗 token
+  - 改造要点：集中预算配置与裁决，分三档——单次调用输入预算 / 编排全程消费上限 / 会话累计配额；消费侧复用 `llm_call_log` 真实 usage（streamUsage 末帧）累计编排内各段调用，超预算熔断剩余子任务并降级聚合，与会话轮次清除的被动裁剪区分开
+  - 验收：模拟编排内 token 超限，后续子任务不再发起 LLM 调用，聚合带降级说明返回；各预算项集中配置、口径一致（估算 vs 真实值标记）
 - [ ] **工具分配最小权限化**：现状按「能力类别」粒度分配（`ToolAssignments` 给整组工具），存在权限漏洞：
   - **`general`** **全量过宽且是所有回退路径的落点**：路由兜底、未识别专家、lead 漏指派全部落 general——最宽权限（执行/容器写/网页）给了最不可控的场景，违背最小权限原则
   - 改造项（沙箱语境下已简化：沙箱原生分执行/只读文件/写入三类，无需再拆类）：
@@ -224,7 +227,7 @@
   - `SandboxToolProvider`：懒初始化（双检锁只尝试一次），失败降级空工具面（warn、不重试、不回退宿主机）；`@PreDestroy` 释放容器
   - 工具面三类：执行类（RunPythonCode/RunShellCommand）、只读文件类、写入类；浏览器组独立镜像独立初始化，失败只降级本组
   - 重合即退役：`ShellTools`/`FileTools`/`SearchTools`/`ToolSandbox` → 沙箱等价工具；`WebTools`/`DemoTools` 保留（Sandbox 未覆盖）
-  - 验证：JShell 直连验证容器拉起 + Shell 执行 + 退出自动删除；浏览器组 `quotes.toscrape.com/js/`（JS 渲染页）snapshot 取得 5381 字符内容；过程记录见 `docs/0828-沙箱接入与验证.md`
+  - 验证：JShell 直连验证容器拉起 + Shell 执行 + 退出自动删除；浏览器组 `quotes.toscrape.com/js/`（JS 渲染页）snapshot 取得 5381 字符内容；过程记录见 `docs/reports/2026-08-28-sandbox-integration.md`
 - [x] **Sandbox 真实 LLM 端到端** ✅：「Python 计算前 20 个素数和并运行验证」——lead 拆 1 个子任务指派 coder，`RunPythonCodeTool` 经容器 fastapi 执行，SSE 进度完整、`meta SUCCEEDED`、结果正确（素数和 639）；容器随首次工具调用懒创建、优雅停服随 `@PreDestroy` 销毁（注意：强杀 `mvn spring-boot:run` 不触发优雅关闭会残留容器）
 
 ## CLI 体验（2026-08 完成）
@@ -236,7 +239,7 @@
   - 回合小结：耗时 / 子任务数 / token 近似量
   - 输入体验：JLine 3——历史持久化、`/` 命令 Tab 补全、多行粘贴；无 TTY 自动降级。**JLine 3 不可替代性**：Windows 控制台无纯 Java 逐键 raw 输入；启动方式 `mvn -s .mvn/settings.xml -Pcli compile exec:exec`（fork 独立进程接管真实终端）
   - 乱码修复：CLI 输出统一收敛到 JLine `terminal.writer()` 宽字符通道（WriterBridge），GBK/65001 代码页均正常
-  - 验收 ✅：全量 101 用例通过；文档 `docs/0828-CLI输出优化工具调用行与输入体验.md`
+  - 验收 ✅：全量 101 用例通过；文档 `docs/reports/2026-08-28-cli-output-optimization.md`
 - [x] **回答归属前缀（2026-09-06）**：SSE 流首新增 `stage=agent` 进度行——服务端下发实际路由到的 agent 名（智能分流与指定 agentId 两条路径都覆盖，续跑固定 multi-agent），CLI 在首个回答 token 前渲染着色「agentName> 」前缀，与用户侧「你> 」提示符对称，用户/智能体一眼可分；前缀计入渲染器行状态，首行着色重绘时原样补回（不被 CLEAR_LINE 擦掉）
 
 ## 项目基础（Roadmap P0 及能力项）
@@ -258,6 +261,6 @@
 
 ## 备注
 
-- 测试全景见 [docs/functional-testing.md](./docs/functional-testing.md)，数据流详解见 [docs/data-flow.md](./docs/data-flow.md)，技术栈对照见 [TECH\_STACK.md](./TECH_STACK.md)。
+- 测试全景见 [docs/functional-testing.md](./functional-testing.md)，数据流详解见 [docs/data-flow.md](./data-flow.md)，技术栈对照见 [TECH\_STACK.md](./TECH_STACK.md)。
 - 每项完成后按对应"验收"标准验证后再勾选。
 

@@ -6,7 +6,7 @@ import org.springframework.stereotype.Component;
 /**
  * 上下文预算配置（app.context.*，全部有内置默认值，yaml 可选覆盖）：
  * 集中管理四层预算——路径 A 会话历史、lead 拆解 prompt、聚合 prompt、
- * 工具结果与工具次数（见 docs/CONTEXT_OPTIMIZATION.md）。
+ * 工具结果与工具次数（见 docs/guides/context-optimization.md）。
  */
 @Component
 @ConfigurationProperties(prefix = "app.context")

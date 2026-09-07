@@ -74,7 +74,7 @@ flowchart TD
 ```
 
 > [!TIP]
-> For data-flow details see [`docs/data-flow.md`](./docs/data-flow.md) (Chinese), for the roadmap see [`HARNESS_TODO.md`](./HARNESS_TODO.md) (Chinese), and for the full test landscape see [`docs/functional-testing.md`](./docs/functional-testing.md) (Chinese).
+> For data-flow details see [`docs/data-flow.md`](./docs/data-flow.md) (Chinese), for the roadmap see [`docs/HARNESS_TODO.md`](./docs/HARNESS_TODO.md) (Chinese), and for the full test landscape see [`docs/functional-testing.md`](./docs/functional-testing.md) (Chinese).
 
 ## 🧰 Tech Stack
 
@@ -99,7 +99,7 @@ flowchart TD
 | ☕ JDK | ✅ | 17+ |
 | 🛠️ Maven | ✅ | 3.8+ (in-project settings; no global configuration needed) |
 | 🗄️ MySQL | ✅ | `harness` database; Flyway creates all tables at startup |
-| 🐳 Docker Desktop | ⚠️ For sandbox | Container isolation for Python/Shell/browser tools; without Docker only sandbox-class tools are unavailable, everything else works (pre-pull images, see `TECH_STACK.md`) |
+| 🐳 Docker Desktop | ⚠️ For sandbox | Container isolation for Python/Shell/browser tools; without Docker only sandbox-class tools are unavailable, everything else works (pre-pull images, see `docs/TECH_STACK.md`) |
 | 🔑 API Key | 🔄 Optional | DashScope (Qwen) / DeepSeek; the app starts without keys — model calls return `invalid_api_key` |
 
 ### ⚡ One-Click Start

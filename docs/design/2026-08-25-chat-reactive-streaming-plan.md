@@ -8,7 +8,7 @@
 
 **技术栈：** Spring AI（`ChatClient.stream()` 本即 Reactor Flux）、Reactor（已在 classpath）、Spring MVC SSE、JUnit5 + Mockito。
 
-**设计文档：** `docs/superpowers/specs/2026-08-25-chat-reactive-streaming-design.md`
+**设计文档：** `2026-08-25-chat-reactive-streaming-design.md`（同目录）
 
 ---
 

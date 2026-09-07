@@ -17,7 +17,7 @@ alwaysApply: true
 
 1. **先询问确认**：提交前先 `git status` / `git diff` 向用户简要说明将提交哪些文件，确认内容无误后再操作。
 2. **忽略临时/生成文件**：`.mvn-repo/`（本地 Maven 仓库）、`.cli-history`、`target/`、IDE 本地配置（`.idea/`、`.vscode/`）等**绝不提交**。
-3. **commit message**：遵循 [Conventional Commits](../../docs/COMMIT_CONVENTION.md) 格式，**描述用中文**（type/scope 前缀保持英文）：
+3. **commit message**：遵循 [Conventional Commits](../../docs/guides/commit-convention.md) 格式，**描述用中文**（type/scope 前缀保持英文）：
    - `feat:` 新功能
    - `fix:` 修复缺陷
    - `refactor:` 重构
