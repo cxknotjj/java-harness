@@ -284,7 +284,7 @@ CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spin
 
 | 专家 | @Tool 对象 | Sandbox ToolCallback | MCP ToolCallback |
 | --- | --- | --- | --- |
-| researcher | WebTool（轻量抓取，沙箱未覆盖） | 只读文件类 | 是（见 5e 节，扩展工具生态） |
+| researcher | WebTool（轻量静态抓取：jsoup 解析 + 主内容提取 + Markdown 输出，沙箱未覆盖） | 只读文件类 | 是（见 5e 节，扩展工具生态） |
 | coder | — | 执行类 + 写入类（读→改→跑验证闭环） | — |
 | analyst | — | 执行类 + 只读类 | — |
 | general | WebTool | 全量 | 是（见 5e 节） |

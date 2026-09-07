@@ -195,7 +195,7 @@ class PromptAssemblerTest {
     /** 工具用途元数据：登记工具返回用途，未登记/空名返回空串 */
     @Test
     void purposeOf_registeredAndUnregisteredTools() {
-        assertEquals("抓取网页正文（去噪并按查询意图提取相关段落，仅 http/https）",
+        assertEquals("抓取网页正文（jsoup 解析为 Markdown 并提取主内容，可按 query 过滤段落，仅 http/https）",
                 toolAssignments.purposeOf("fetchUrl"));
         assertEquals("在沙箱容器内执行 Python 代码并返回输出", toolAssignments.purposeOf("run_ipython_cell"));
         assertEquals("", toolAssignments.purposeOf("no_such_tool"), "未登记返回空串");

@@ -328,7 +328,7 @@ src/main/java/com/dark/javaHarness/
 │   ├── api/ChatApiClient.java    # OkHttp wrapper for /api/chat, /api/chat/stream (SSE) and /api/chat/resume
 │   └── render/TerminalRenderer.java  # Claude Code-style rendering: incremental streaming + in-place spinner + tool lines
 └── tool/
-    ├── WebTools.java             # Web fetch tool (fetchUrl: HTML → plain text, http/https only, size-capped)
+    ├── WebTools.java             # Web fetch tool (fetchUrl: jsoup HTML5 parsing + main-content extraction + Markdown output + content cache)
     ├── DemoTools.java            # Demo toolset (time / calculator / weather)
     ├── SandboxToolProvider.java  # Container-level sandbox tools (Python/Shell/file + browser; bounded lazy init, graceful degradation)
     └── ToolAssignments.java      # Tool assignment table: per-expert toolsets (dual-channel injection, least privilege)

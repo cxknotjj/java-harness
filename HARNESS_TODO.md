@@ -92,7 +92,7 @@
   - [x] 6.**工具 Schema 的延迟加载:开始只注入对于工具的描述，只有agent明确需要调用时，才会按需提升暴漏完整tool参数**
 
 - [x] 修复目前会话无法创建goal的问题
-- [ ] 优化webtool工具，让他从能用到好用，可以借鉴网上现有的webtool，并且更新对于抓取的网页处理操作。
+- [x] 优化webtool工具，让他从能用到好用（借鉴 jsoup/Readability 业界管线重写抓取与网页处理，详见存档「工具与沙箱」）
 - [ ] 检查agent 角色提示词是否被写入了会话消息中。
 - [ ] 增加会话agent切换功能，当在次会话切换agent，则会话表的agentId同样需要更改。
 - [ ] 修复进入多agent时，请求卡住的问题。
@@ -208,6 +208,13 @@
   - 现存自研工具：`WebTools`（fetchUrl 真实抓取，HTML→纯文本，仅 http/https，2MB/12k 字符上限）+ `DemoTools`（本地函数示例）；网页搜索待搜索服务商 API key 后补充（已列入 P1「Web Search 接入」）
   - 已退役（能力由 Sandbox 等价承接）：`ToolSandbox`/`FileTools`/`SearchTools`/`ShellTools` 连同其治理与测试一并移除
   - `ToolAssignments`：按专家分配工具集，双通道注入（@Tool 对象走 `.tools()`、ToolCallback 走 `.toolCallbacks()`）；`MultiAgentGraphAgent.call` 按子任务专家、`GeneralAssistantAgent` 按自身 agent 名；未指派子任务回退 general（全量权限的收敛见 P0「工具分配最小权限化」）
+- [x] **WebTools 从能用到好用（2026-09-06）**：fetchUrl 从「正则去噪 + 纯文本」升级为「jsoup HTML5 解析 + 主内容启发式提取 + Markdown 输出」：
+  - 抓取：jsoup 连接（15s 超时 / 2MB 下载上限 / 重定向 / Accept-Language），编码自动嗅探（header + meta charset，GBK 中文站不再乱码），删除「先截字节再解码」的多字节切断缺陷
+  - 主内容：DOM 级去噪（噪声标签 + class/id 特征正则）+ 文本密度/链接密度评分选正文块（简化 Readability，自研纯函数；借鉴 jsoup → Readability → Markdown 业界管线，经评估未引入 Readability4J/flexmark 依赖）
+  - 输出：Markdown（标题/列表/链接绝对化/代码块/管道表）+ 元数据头（标题/来源 URL）；query 意图过滤保留（按 Markdown 段落切块，未命中回退开头）
+  - 缓存：拒绝式改内容式（URL→内容，50 条 / TTL 30 分钟）——重复抓取回放缓存而非「请勿重抓」，解决旧内容被上下文裁剪后无法重看的死路
+  - 错误结构化：全链扫描分类（DNS/超时/连接拒绝/TLS/403/404/429/5xx/非网页 Content-Type），中文可自愈提示；单测实证 WSL DNS 隧道下域名失败表现为 ConnectException 链（判据在链底 UnresolvedAddressException，需全链扫描而非只看最深一层）
+  - 测试：`WebToolsTest` 重写 16 用例（JDK 内置 HttpServer 承载本地 fixture，走真实 Jsoup.connect 链路：GBK 解码/噪声剔除/Markdown 元素/缓存回放/错误分类/截断），全量 268 用例通过；jsoup 为唯一新增依赖（MIT、零传递依赖）
 - [x] **Spring AI Alibaba Sandbox 接入**：引入 `spring-ai-alibaba-sandbox`（BOM 管理版本），工具执行从进程内软隔离升级为容器级隔离。
   **架构决策**：产品定位为通用助手（调研/报告/数据分析/跑代码），agent 不操作宿主机项目文件——模型生成的所有代码/命令只在容器内执行，宿主机零暴露；不做降级路径（沙箱是硬依赖，无 Docker 环境该功能整体不可用）。
   - `SandboxToolProvider`：懒初始化（双检锁只尝试一次），失败降级空工具面（warn、不重试、不回退宿主机）；`@PreDestroy` 释放容器

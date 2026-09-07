@@ -134,6 +134,14 @@
             <version>4.12.0</version>
         </dependency>
 
+        <!-- jsoup：WebTools 网页抓取与 HTML5 解析（编码自动嗅探，GBK 站不再乱码；DOM 级去噪）。
+             MIT、单 jar 零传递依赖，仅在服务端工具使用 -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>1.21.1</version>
+        </dependency>
+
         <!--
  JLine 3：CLI 交互输入（上下键历史 / `/` 命令补全 / 多行粘贴）。
  引入理由（不可替代性）：Windows 控制台无纯 Java 的逐键 raw 输入，

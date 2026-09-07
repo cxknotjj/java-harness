@@ -328,7 +328,7 @@ src/main/java/com/dark/javaHarness/
 │   ├── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE) / /api/chat/resume
 │   └── render/TerminalRenderer.java  # Claude Code 风格渲染：流式增量直出 + spinner 原位刷新 + 工具行
 └── tool/
-    ├── WebTools.java             # 网页抓取工具（fetchUrl：HTML→纯文本，仅 http/https，限长）
+    ├── WebTools.java             # 网页抓取工具（fetchUrl：jsoup HTML5 解析 + 主内容提取 + Markdown 输出 + 内容缓存）
     ├── DemoTools.java            # 示例工具集（时间 / 计算 / 天气）
     ├── SandboxToolProvider.java  # 容器级沙箱工具（Python/Shell/文件 + 浏览器，懒初始化、失败降级）
     └── ToolAssignments.java      # 工具分配表：按专家分配工具集（双通道注入，最小权限）

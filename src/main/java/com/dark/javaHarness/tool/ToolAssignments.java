@@ -43,7 +43,7 @@ public class ToolAssignments {
      */
     private static final java.util.Map<String, String> TOOL_PURPOSES = java.util.Map.ofEntries(
             // 自研 WebTools / 演示工具
-            java.util.Map.entry("fetchUrl", "抓取网页正文（去噪并按查询意图提取相关段落，仅 http/https）"),
+            java.util.Map.entry("fetchUrl", "抓取网页正文（jsoup 解析为 Markdown 并提取主内容，可按 query 过滤段落，仅 http/https）"),
             java.util.Map.entry("getCurrentTime", "获取服务器当前本地时间"),
             java.util.Map.entry("add", "计算两个整数相加"),
             // 沙箱执行类（base 容器）
