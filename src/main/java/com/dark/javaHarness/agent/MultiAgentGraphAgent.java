@@ -2,15 +2,17 @@ package com.dark.javaHarness.agent;
 
 import com.alibaba.cloud.ai.graph.CompileConfig;
 import com.alibaba.cloud.ai.graph.CompiledGraph;
-import com.alibaba.cloud.ai.graph.NodeOutput;
+import com.alibaba.cloud.ai.graph.KeyStrategy;
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.StateGraph;
 import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
 import com.alibaba.cloud.ai.graph.checkpoint.BaseCheckpointSaver;
+import com.alibaba.cloud.ai.graph.checkpoint.Checkpoint;
 import com.alibaba.cloud.ai.graph.checkpoint.config.SaverConfig;
 import com.alibaba.cloud.ai.graph.exception.GraphStateException;
 import com.alibaba.cloud.ai.graph.internal.node.ParallelNode;
+import com.alibaba.cloud.ai.graph.state.strategy.ReplaceStrategy;
 import com.dark.javaHarness.advisor.PromptBudgetAdvisor;
 import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
@@ -18,18 +20,15 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.prompt.PromptAssembler;
 import com.dark.javaHarness.prompt.SkillManager;
+import com.dark.javaHarness.prompt.ToolLazyManager;
 import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
-import com.dark.javaHarness.prompt.ToolLazyManager;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
@@ -45,7 +44,8 @@ import reactor.core.publisher.Sinks;
  * 每个阶段都是一次独立的 ChatClient 单次调用（复用 {@link ChatClientRegistry} 的客户端），
  * 配置（模型 + 提示词）均取自 agent 表对应角色行：
  * - lead 节点：查 {@code lead} 行（无则内置兜底），把复杂目标拆成至多 {@link #MAX_SUBTASKS} 条子任务
- *   （JSON 解析），并为每条子任务指派专家（researcher/coder/analyst/writer/general，白名单校验，非法回退）
+ *   （{@link LeadOutputParser} 解析），并为每条子任务指派专家（researcher/coder/analyst/writer/general，
+ *   白名单校验，非法回退）
  * - subtask-i 节点：并行执行，按指派的专家名查 agent 表配置取对应 ChatClient 产出该子任务结果
  * - aggregate 节点：查 {@code aggregator} 行（无则内置兜底），收集各子任务结果汇总成最终回答
  *
@@ -54,20 +54,20 @@ import reactor.core.publisher.Sinks;
  * 统一由 AgentService / ChatService 负责。
  *
  * <p>图拓扑只构建一次；同步执行 {@link #execute(Goal)} 走 invoke；
- * 流式执行 {@link #executeStreamReactive(Goal)} 采用「stream 主干帧 + 生命周期钩子旁路」双通道
- * （详见该方法说明与死锁教训）。
+ * 流式执行 {@link #executeStreamReactive(Goal)} 走「stream 主干帧 + 生命周期钩子旁路」
+ * 双通道管道（详见 {@link MultiAgentStreamPipeline}）；
+ * 编排预算熔断与 lead 产物解析分别委托 {@link OrchestrationBudget}/{@link LeadOutputParser}。
  */
 public class MultiAgentGraphAgent implements Agent {
 
     private static final Logger log = LoggerFactory.getLogger(MultiAgentGraphAgent.class);
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     /** 单个总任务拆解的子任务数上限，避免滚雪球 */
     private static final int MAX_SUBTASKS = 4;
 
     /** 节点名常量 */
-    private static final String NODE_LEAD = "lead";
-    private static final String NODE_AGGREGATE = "aggregate";
+    static final String NODE_LEAD = "lead";
+    static final String NODE_AGGREGATE = "aggregate";
 
     /** 编排环节角色名（agent 表行名）：lead 拆解器、aggregator 聚合器，与编排器 multi-agent 行解耦 */
     private static final String ROLE_LEAD = "lead";
@@ -76,41 +76,20 @@ public class MultiAgentGraphAgent implements Agent {
     /** 状态键 */
     private static final String K_OBJECTIVE = "objective";
     private static final String K_SESSION_ID = "sessionId";
-    private static final String K_SUBTASK_COUNT = "subtaskCount";
-    private static final String K_SUBTASK_PREFIX = "subtask_";
+    static final String K_SUBTASK_COUNT = "subtaskCount";
+    static final String K_SUBTASK_PREFIX = "subtask_";
     private static final String K_SUBTASK_AGENT_PREFIX = "subtaskAgent_";
     private static final String K_RESULT_PREFIX = "result_";
-    private static final String K_FINAL = "final";
-    /**
-     * 编排预算账本（input 注入，节点间共享同一 AtomicLong 实例）：
-     * 各节点调用的每轮 LLM roundtrip（含单次 call 内部工具循环）经 caller 门控句柄
-     * 增量记账并熔断复检（真实 usage 优先，无则按输出估算）。orchestration-budget=0
-     * 时不注入（不记账不熔断，存量行为）。
-     */
-    private static final String K_TOKEN_LEDGER = "tokenLedger";
-    /** 账本估算标记：任一调用无真实 usage 回包（按输出估算）时置位，聚合降级说明注明口径 */
-    private static final String K_TOKEN_ESTIMATED = "tokenEstimated";
+    static final String K_FINAL = "final";
 
     /** 子任务节点名前缀 */
-    private static final String SUBTASK_NODE_PREFIX = "subtask-";
+    static final String SUBTASK_NODE_PREFIX = "subtask-";
 
     /**
      * 预算超限跳过的子任务占位 result：聚合据此识别未执行子任务数（排除出真实结果），
      * 并在 prompt 注入降级说明；非空保证状态键有值、与「子任务失败无结果」区分。
      */
     static final String SKIPPED_RESULT = "（预算超限跳过：编排 token 消费已达上限）";
-
-    /** lead 拆解可指派的专家白名单：不在名单中的 agent 名一律回退默认（general 语义） */
-    private static final Set<String> EXPERT_WHITELIST = Set.of(
-            AgentConstants.EXPERT_RESEARCHER,
-            AgentConstants.EXPERT_CODER,
-            AgentConstants.EXPERT_ANALYST,
-            AgentConstants.EXPERT_WRITER,
-            AgentConstants.DEFAULT_AGENT);
-
-    /** lead 拆解产物：子任务描述 + 指派专家（agent 可为 null = 未指派，执行时回退默认） */
-    record Subtask(String desc, String agent) {
-    }
 
     private final String agentName;
     /** Prompt 组装器：子任务专家 persona 与各环节 system 段统一经此组装 */
@@ -128,6 +107,10 @@ public class MultiAgentGraphAgent implements Agent {
     private final BaseCheckpointSaver checkpointSaver;
     /** 上下文预算配置（lead/聚合静态 prompt 预算；null 时用内置默认值，单测场景） */
     private final ContextBudgetProperties budgets;
+    /** 编排消费上限熔断：各节点共享的预算账本（依赖 {@link #budgets}） */
+    private final OrchestrationBudget orchestrationBudget;
+    /** 流式管道：主干帧 + 旁路合并（依赖 {@link #streamPipeline} 建图回调） */
+    private final MultiAgentStreamPipeline streamPipeline;
 
     public MultiAgentGraphAgent(String agentName,
                                 ChatClientRegistry clientRegistry,
@@ -216,6 +199,11 @@ public class MultiAgentGraphAgent implements Agent {
                 new LlmRetry(), budgets, this.promptAssembler, memoryStore, lazy, skillManager);
         this.checkpointSaver = checkpointSaver;
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
+        this.orchestrationBudget = new OrchestrationBudget(this.budgets);
+        this.streamPipeline = new MultiAgentStreamPipeline(
+                (liveTokens, contentSent, toolEvents, cancelled, listener) ->
+                        buildStateGraph(liveTokens, contentSent, toolEvents, cancelled)
+                                .compile(compileConfig(listener)));
         try {
             this.stateGraph = buildStateGraph();
             // 同步执行用的常驻实例（带检查点时每个 superstep 自动落库）
@@ -268,16 +256,20 @@ public class MultiAgentGraphAgent implements Agent {
         return agentName;
     }
 
+    /** 编排 input 组装：objective/sessionId + 预算账本（开关开启时注入共享账本） */
+    private Map<String, Object> inputOf(Goal goal) {
+        Map<String, Object> input = new HashMap<>();
+        input.put(K_OBJECTIVE, goal.objective());
+        input.put(K_SESSION_ID, goal.sessionId());
+        orchestrationBudget.putLedger(input);
+        return input;
+    }
+
     /** 执行复杂目标：把客观目标注入 StateGraph，返回最终回答。 */
     @Override
     public String execute(Goal goal) {
         log.info("[multi-agent] 开始编排复杂目标: {}", goal.objective());
-        Map<String, Object> input = new HashMap<>();
-        input.put(K_OBJECTIVE, goal.objective());
-        input.put(K_SESSION_ID, goal.sessionId());
-        putLedger(input);
-
-        return graph.invoke(input, runnableConfig(goal.id()))
+        return graph.invoke(inputOf(goal), runnableConfig(goal.id()))
                 .flatMap(s -> s.value(K_FINAL, String.class))
                 .orElse(goal.objective());
     }
@@ -285,21 +277,15 @@ public class MultiAgentGraphAgent implements Agent {
     /**
      * 流式执行复杂目标：stream 主干帧 + 双旁路（生命周期钩子 + 聚合 token）。
      *
-     * <p>主干：{@link CompiledGraph#stream(Map)} 帧 → {@link #toRows} 行；
-     * 旁路一：{@link BranchProgressListener} 补齐 stream 合并掉的并行分支「子任务完成」事件；
-     * 旁路二：聚合节点内逐 token 实时推送最终回答（含首个 token 前的「聚合」进度行）——
-     * 图节点是同步动作，token 在节点内经回调旁路发射，节点返回时 state 已含完整内容，
-     * 主干对已推送内容的帧不再重复发射（见 {@link #toRows} 的 contentSent 短路）。
+     * <p>主干：{@link CompiledGraph#stream(Map)} 帧 → {@link MultiAgentStreamPipeline#toRows} 行；
+     * 旁路与死锁教训详见 {@link MultiAgentStreamPipeline}。
      *
      * <p>子任务节点保持阻塞调用：多子任务并行执行，token 直推会交错乱序；用户体感关键
      * 在最终回答的打字机效果，由聚合节点承担。lead 产出为 JSON 中间产物，不推送 token。
-     *
-     * <p>⚠️ 死锁教训：关闸 {@code doFinally} 必须挂在 mergeWith **之前**的主干段上——
-     * merge 要求两源都终结才向下传 complete，关闸挂 merge 之后会循环等待、永不收尾。
      */
     @Override
     public Flux<String> executeStreamReactive(Goal goal) {
-        return reactivePipeline(goal, runnableConfig(goal.id()));
+        return streamPipeline.run(inputOf(goal), goal.objective(), runnableConfig(goal.id()));
     }
 
     /**
@@ -317,7 +303,7 @@ public class MultiAgentGraphAgent implements Agent {
      * 而 saver.get() 对带 checkPointId 的 config 按 ID 精确匹配——
      * 因此先探测最新 checkpoint，再以其真实 ID 组装续跑 config。
      *
-     * <p>恢复点选择（{@link #selectResumeCheckpoint}）：
+     * <p>恢复点选择（{@link MultiAgentStreamPipeline#selectResumeCheckpoint}）：
      * 编排已完成（final 有效）→ 从最终检查点零调用回放；
      * 否则回退到「子任务批完成、聚合前」的检查点（nextNodeId=aggregate）补跑聚合。
      */
@@ -326,15 +312,14 @@ public class MultiAgentGraphAgent implements Agent {
             throw new IllegalStateException("未启用检查点存储，无法续跑");
         }
         RunnableConfig probe = runnableConfig(goal.id());
-        com.alibaba.cloud.ai.graph.checkpoint.Checkpoint target;
+        Checkpoint target;
         try {
-            java.util.Collection<com.alibaba.cloud.ai.graph.checkpoint.Checkpoint> checkpoints =
-                    checkpointSaver.list(probe);
+            java.util.Collection<Checkpoint> checkpoints = checkpointSaver.list(probe);
             if (checkpoints.isEmpty()) {
                 throw new IllegalStateException(
                         "无可续跑的编排：goal " + goal.id() + " 没有检查点（可能未走过复杂路径）");
             }
-            target = selectResumeCheckpoint(checkpoints);
+            target = MultiAgentStreamPipeline.selectResumeCheckpoint(checkpoints);
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
@@ -342,143 +327,16 @@ public class MultiAgentGraphAgent implements Agent {
         }
         log.info("[multi-agent] 断点续跑 goal {}: 从检查点 {} 继续（nextNodeId={}，已完成节点不再重跑）",
                 goal.id(), target.getId(), target.getNextNodeId());
-        RunnableConfig config = runnableConfig(goal.id(), target.getId());
-        return reactivePipeline(goal, config);
-    }
-
-    /**
-     * 恢复点选择：
-     * - 编排已完整跑完（存在 nextNodeId=END 且 final 有效的检查点）→ 选它，续跑零 LLM 调用、直接回放最终回答；
-     * - 聚合未完成（客户端断开时聚合被短路，最新检查点无有效 final）→ 回退到聚合前的检查点
-     *   （nextNodeId=aggregate，state 已含子任务结果），续跑只补跑聚合；
-     * - 都没有（断开极早，如 lead 中断）→ 兜底取任一检查点（通常 lead 之后，重跑缺口最小）。
-     */
-    private static com.alibaba.cloud.ai.graph.checkpoint.Checkpoint selectResumeCheckpoint(
-            java.util.Collection<com.alibaba.cloud.ai.graph.checkpoint.Checkpoint> checkpoints) {
-        com.alibaba.cloud.ai.graph.checkpoint.Checkpoint any = checkpoints.iterator().next();
-        return checkpoints.stream()
-                .filter(cp -> StateGraph.END.equals(cp.getNextNodeId()))
-                .filter(cp -> {
-                    Object fin = cp.getState() == null ? null : cp.getState().get(K_FINAL);
-                    return fin instanceof String s && !s.isBlank();
-                })
-                .findFirst()
-                .orElseGet(() -> checkpoints.stream()
-                        .filter(cp -> NODE_AGGREGATE.equals(cp.getNextNodeId()))
-                        .findFirst()
-                        .orElse(any));
-    }
-
-    /**
-     * 流式管道共用体：构建带旁路的图 → 编译（挂监听器 + 检查点）→ 主干帧合并旁路流。
-     * execute（全新执行）与 resume（断点续跑）仅 RunnableConfig 不同。
-     */
-    private Flux<String> reactivePipeline(Goal goal, RunnableConfig config) {
-        Map<String, Object> input = new HashMap<>();
-        input.put(K_OBJECTIVE, goal.objective());
-        input.put(K_SESSION_ID, goal.sessionId());
-        putLedger(input);
-        AtomicBoolean contentSent = new AtomicBoolean(false);
-        // 客户端断开（Reactor cancel）置位：后续 superstep 的节点短路，不再发起新的 LLM 调用
-        AtomicBoolean cancelled = new AtomicBoolean(false);
-
-        Sinks.Many<String> branchEvents = Sinks.many().unicast().onBackpressureBuffer();
-        Sinks.Many<String> liveTokens = Sinks.many().unicast().onBackpressureBuffer();
-        // 旁路三：子任务节点内的工具调用起止（专家执行工具时 CLI 展示工具调用行）
-        Sinks.Many<String> toolEvents = Sinks.many().unicast().onBackpressureBuffer();
-        CompiledGraph streamingGraph;
-        try {
-            // 流式拓扑每次执行独立构建（聚合节点绑定本次执行的 token 旁路，保证并发安全）
-            streamingGraph = buildStateGraph(liveTokens, contentSent, toolEvents, cancelled)
-                    .compile(compileConfig(new BranchProgressListener(
-                            branchEvents, SUBTASK_NODE_PREFIX, K_SUBTASK_PREFIX)));
-        } catch (GraphStateException e) {
-            throw new IllegalStateException("编译带监听器的 StateGraph 失败", e);
-        }
-
-        // 关闸在 merge 之前（见死锁说明）；complete 与 next 共用同一把锁，防迟到事件竞争。
-        // 注意：图节点异常终止时 graph-core 也会以 CANCEL 清理主干订阅，因此主干段的
-        // doFinally 不能用于判定「客户端断开」（会把编排异常误报为断开）；
-        // 真实断开判定挂在外层合并流上——只有下游（CLI/HTTP）真正断开才会 cancel 到这里。
-        Flux<String> mainLine = streamingGraph.stream(input, config)
-                .concatMap(out -> toRows(out, goal.objective(), contentSent))
-                .doFinally(sig -> {
-                    // 主干终结（完成/异常/被取消）后关闸旁路 sink，防止 merge 永久挂起
-                    BranchProgressListener.tryCompleteSerialized(branchEvents);
-                    BranchProgressListener.tryCompleteSerialized(liveTokens);
-                    BranchProgressListener.tryCompleteSerialized(toolEvents);
-                });
-
-        return mainLine
-                .mergeWith(branchEvents.asFlux())
-                .mergeWith(liveTokens.asFlux())
-                .mergeWith(toolEvents.asFlux())
-                .doOnCancel(() -> {
-                    // 客户端断开（Reactor cancel）置位：后续 superstep 的节点短路，不再发起新的 LLM 调用
-                    cancelled.set(true);
-                    log.warn("[multi-agent] 客户端已断开，终止编排：不再发起新的 LLM 调用（进行中的调用等待自然结束）");
-                })
-                .onErrorResume(e -> {
-                    log.warn("[multi-agent] 流式执行异常：{}", safe(e));
-                    return Flux.just(ProgressLine.encode("编排", "异常，已回退：" + safe(e)));
-                });
-    }
-
-    /**
-     * 把一个主干节点输出帧映射为 0..n 条输出行（保序）：
-     * START→编排开始；lead→拆解结果；aggregate→聚合进度+最终内容；END→内容兜底。
-     * 并行 subtask 分支事件由生命周期钩子旁路提供，不走此处。
-     */
-    private Flux<String> toRows(NodeOutput out, String objective,
-                                java.util.concurrent.atomic.AtomicBoolean contentSent) {
-        if (out == null) {
-            return Flux.empty();
-        }
-        String node = out.node();
-        OverAllState state = out.state();
-        if (out.isSTART()) {
-            return Flux.just(ProgressLine.encode("编排", "开始拆解复杂目标…"));
-        }
-        // END 帧：确保一定有内容行。优先取 state 中的最终回答（断点续跑越过聚合节点时，
-        // final 已在检查点状态里，兜底 objective 会答非所问）；都缺失时才回退 objective
-        if (out.isEND()) {
-            if (contentSent.get()) {
-                return Flux.empty();
-            }
-            String fin = state == null ? null
-                    : state.value(K_FINAL, String.class).orElse(null);
-            return Flux.just(fin == null || fin.isBlank() ? objective : fin);
-        }
-        if (NODE_LEAD.equals(node)) {
-            int n = state.value(K_SUBTASK_COUNT, Integer.class).orElse(0);
-            return Flux.just(ProgressLine.encode("拆解", n + " 个子任务已就绪"));
-        }
-        if (NODE_AGGREGATE.equals(node)) {
-            // 流式模式：token 已由聚合节点内旁路实时推送，此处不再重复发射
-            if (contentSent.get()) {
-                return Flux.empty();
-            }
-            String fin = state.value(K_FINAL, String.class).orElse(null);
-            if (fin != null && !fin.isBlank()) {
-                contentSent.set(true);
-                // 先发聚合进度，再发最终回答内容行（不加进度前缀）
-                return Flux.just(
-                        ProgressLine.encode("聚合", "汇总子任务结果，生成最终回答"),
-                        fin);
-            }
-            return Flux.just(ProgressLine.encode("聚合", "正在生成最终回答…"));
-        }
-        return Flux.empty(); // subtask 等其它 superstep 合并帧：由钩子旁路负责
-    }
-
-    /* ---------------- 工具方法 ---------------- */
-
-    /** 子任务节点名 */
-    private String subtaskName(int i) {
-        return SUBTASK_NODE_PREFIX + i;
+        return streamPipeline.run(inputOf(goal), goal.objective(),
+                runnableConfig(goal.id(), target.getId()));
     }
 
     /* ---------------- StateGraph 构建 ---------------- */
+
+    /** 子任务节点名 */
+    private static String subtaskName(int i) {
+        return SUBTASK_NODE_PREFIX + i;
+    }
 
     private StateGraph buildStateGraph() throws GraphStateException {
         return buildStateGraph(null, null, null, null);
@@ -489,7 +347,7 @@ public class MultiAgentGraphAgent implements Agent {
      *
      * @param liveTokens  非 null 时聚合节点走流式调用并把 token 旁路发射到该 sink（含首个 token 前的「聚合」进度行）；
      *                    null 时聚合节点阻塞调用（同步 execute 路径）
-     * @param contentSent 流式模式的内容已发射标志（与主干 {@link #toRows} 共享，防重复发射）；可为 null
+     * @param contentSent 流式模式的内容已发射标志（与主干 {@link MultiAgentStreamPipeline#toRows} 共享，防重复发射）；可为 null
      * @param toolEvents  非 null 时子任务节点注入追踪版工具（执行起止经该 sink 发进度行，供 CLI 工具调用行）
      * @param cancelled   非 null 时节点执行前检查该标志：客户端已断开则短路（不再发起新的 LLM 调用）
      */
@@ -539,17 +397,16 @@ public class MultiAgentGraphAgent implements Agent {
      * 编排 state 全部键的注册策略（覆盖语义，与节点直接 put 的现有行为一致）：
      * 输入键 + 拆解产物 + 各子任务槽位 + 最终回答。
      */
-    private static Map<String, com.alibaba.cloud.ai.graph.KeyStrategy> stateKeyStrategies() {
-        Map<String, com.alibaba.cloud.ai.graph.KeyStrategy> strategies = new HashMap<>();
-        com.alibaba.cloud.ai.graph.KeyStrategy replace =
-                new com.alibaba.cloud.ai.graph.state.strategy.ReplaceStrategy();
+    private static Map<String, KeyStrategy> stateKeyStrategies() {
+        Map<String, KeyStrategy> strategies = new HashMap<>();
+        KeyStrategy replace = new ReplaceStrategy();
         strategies.put(K_OBJECTIVE, replace);
         strategies.put(K_SESSION_ID, replace);
         strategies.put(K_SUBTASK_COUNT, replace);
         strategies.put(K_FINAL, replace);
         // 编排预算账本（可空：budget=0 时不注入；Replace 策略保证续跑时新账本覆盖旧值）
-        strategies.put(K_TOKEN_LEDGER, replace);
-        strategies.put(K_TOKEN_ESTIMATED, replace);
+        strategies.put(OrchestrationBudget.K_TOKEN_LEDGER, replace);
+        strategies.put(OrchestrationBudget.K_TOKEN_ESTIMATED, replace);
         for (int i = 0; i < MAX_SUBTASKS; i++) {
             strategies.put(K_SUBTASK_PREFIX + i, replace);
             strategies.put(K_SUBTASK_AGENT_PREFIX + i, replace);
@@ -563,78 +420,6 @@ public class MultiAgentGraphAgent implements Agent {
     /** 客户端已断开则跳过本节点的 LLM 调用（同步路径 cancelled 为 null，恒不短路） */
     private static boolean isCancelled(AtomicBoolean cancelled) {
         return cancelled != null && cancelled.get();
-    }
-
-    /* ---------------- 编排消费上限熔断（预算账本） ---------------- */
-
-    /**
-     * 编排预算开关开启（orchestration-budget > 0）时向 input 注入共享账本：
-     * AtomicLong 累计消耗 + AtomicBoolean 估算标记，节点经 state 读取（Replace 策略注册，
-     * 续跑时新账本覆盖旧值）。0 = 不限制：不注入不记账不熔断，存量行为不变。
-     */
-    private void putLedger(Map<String, Object> input) {
-        if (budgets.getOrchestrationBudget() > 0) {
-            input.put(K_TOKEN_LEDGER, new java.util.concurrent.atomic.AtomicLong());
-            input.put(K_TOKEN_ESTIMATED, new AtomicBoolean(false));
-        }
-    }
-
-    /** 当前账本累计消耗（无账本返回 0，仅日志展示用） */
-    private static long ledgerValue(OverAllState state) {
-        return state.value(K_TOKEN_LEDGER, java.util.concurrent.atomic.AtomicLong.class)
-                .map(java.util.concurrent.atomic.AtomicLong::get).orElse(0L);
-    }
-
-    /**
-     * 预算账本句柄工厂（无账本返回 null = 不记账不熔断）：
-     * <ul>
-     *   <li>{@code enforceBudget=true}（lead/子任务节点）：门控句柄——caller 在发起调用前与
-     *       每轮 LLM roundtrip 的 usage 帧上做熔断判定。并行扇出下各调用共享同一 AtomicLong，
-     *       任一调用的消耗入账后其余调用的下一轮 roundtrip 即可见（原「批前检查只见 lead 消耗」
-     *       的结构性盲区由此消除）；配合 subtask-concurrency 限并发错峰，超额窗口进一步收窄；
-     *   <li>{@code enforceBudget=false}（聚合节点）：record-only 句柄——聚合必发不受熔断，
-     *       overBudget 恒 false，仅记账。
-     * </ul>
-     * AtomicLong/AtomicBoolean 保证并行写安全（熔断为近似判定，竞态窗口见限并发说明）。
-     */
-    private AgentChatCaller.BudgetLedger ledgerHandle(OverAllState state, boolean enforceBudget) {
-        java.util.concurrent.atomic.AtomicLong ledger =
-                state.value(K_TOKEN_LEDGER, java.util.concurrent.atomic.AtomicLong.class).orElse(null);
-        if (ledger == null) {
-            return null;
-        }
-        AtomicBoolean estimated = state.value(K_TOKEN_ESTIMATED, AtomicBoolean.class).orElse(null);
-        int budget = budgets.getOrchestrationBudget();
-        return new AgentChatCaller.BudgetLedger() {
-            @Override
-            public boolean overBudget() {
-                return enforceBudget && budget > 0 && ledger.get() >= budget;
-            }
-
-            @Override
-            public void recordUsage(int totalTokens, boolean est) {
-                ledger.addAndGet(totalTokens);
-                if (est && estimated != null) {
-                    estimated.set(true);
-                }
-            }
-        };
-    }
-
-    /**
-     * 预算降级说明（聚合 prompt 前置，聚合节点必发不受熔断）：
-     * N 个子任务因预算超限未执行 + 已消耗/上限数字 + 消耗口径（估算标记置位时注明含估算值，
-     * 与 llm_call_log.tokens_estimated 语义一致；全为真实 usage 则注明）。
-     */
-    private String budgetDegradationNote(int skipped, OverAllState state) {
-        AtomicBoolean estimated = state.value(K_TOKEN_ESTIMATED, AtomicBoolean.class).orElse(null);
-        String caliber = estimated != null && estimated.get()
-                ? "消耗含估算值（部分调用无真实 usage 回包，按输出文本估算）"
-                : "消耗为真实 usage 统计";
-        return "【预算降级说明】本次编排 token 消费已达上限（已消耗 " + ledgerValue(state)
-                + " / 上限 " + budgets.getOrchestrationBudget() + " token，" + caliber + "），"
-                + skipped + " 个子任务因预算超限未执行，以下子任务结果不完整。"
-                + "请基于已有内容汇总最终回答，并在回答开头简要说明部分内容因预算限制未覆盖。";
     }
 
     /**
@@ -653,26 +438,28 @@ public class MultiAgentGraphAgent implements Agent {
         String sessionId = state.value(K_SESSION_ID, String.class).orElse(null);
         String content;
         try {
-            content = predictLeadLogged(sessionId, objective, cancelled, ledgerHandle(state, true));
+            content = predictLeadLogged(sessionId, objective, cancelled,
+                    orchestrationBudget.ledgerHandle(state, true));
         } catch (AgentChatCaller.BudgetExceededException e) {
             log.warn("[multi-agent][lead] 编排预算超限中止拆解（已消耗 {} / 上限 {}），退化为单子任务",
-                    ledgerValue(state), budgets.getOrchestrationBudget());
+                    OrchestrationBudget.ledgerValue(state), budgets.getOrchestrationBudget());
             content = null; // 拆解产物缺失 → 退化为单个子任务=objective，执行前被熔断跳过
         }
-        List<Subtask> items = parseSubtasks(content);
+        List<LeadOutputParser.Subtask> items = LeadOutputParser.parseSubtasks(content);
         if (items.isEmpty()) {
-            items.add(new Subtask(objective, null)); // 拆解失败：退化为单个子任务=objective
+            // 拆解失败：退化为单个子任务=objective
+            items.add(new LeadOutputParser.Subtask(objective, null));
         }
         Map<String, Object> updates = new HashMap<>();
         int n = Math.min(items.size(), MAX_SUBTASKS);
         updates.put(K_SUBTASK_COUNT, n);
         for (int i = 0; i < n; i++) {
-            Subtask item = items.get(i);
+            LeadOutputParser.Subtask item = items.get(i);
             updates.put(K_SUBTASK_PREFIX + i, item.desc());
             updates.put(K_SUBTASK_AGENT_PREFIX + i, item.agent());
         }
         log.info("[multi-agent][lead] 拆解为 {} 个子任务，指派：{}", n,
-                items.subList(0, n).stream().map(Subtask::agent).toList());
+                items.subList(0, n).stream().map(LeadOutputParser.Subtask::agent).toList());
         return updates;
     }
 
@@ -699,10 +486,10 @@ public class MultiAgentGraphAgent implements Agent {
         String result;
         try {
             result = predictSubtask(sessionId, task, expert, toolEmitter, cancelled,
-                    ledgerHandle(state, true));
+                    orchestrationBudget.ledgerHandle(state, true));
         } catch (AgentChatCaller.BudgetExceededException e) {
             log.warn("[multi-agent][subtask-{}] 编排 token 消费已达上限（{} / {}），跳过专家调用",
-                    idx, ledgerValue(state), budgets.getOrchestrationBudget());
+                    idx, OrchestrationBudget.ledgerValue(state), budgets.getOrchestrationBudget());
             Map<String, Object> updates = new HashMap<>();
             updates.put(K_RESULT_PREFIX + idx, SKIPPED_RESULT);
             return updates;
@@ -753,14 +540,15 @@ public class MultiAgentGraphAgent implements Agent {
         } else {
             String user = aggregateUserPrompt(results);
             if (skipped > 0) {
-                user = budgetDegradationNote(skipped, state) + "\n\n" + user;
+                user = orchestrationBudget.degradationNote(skipped, state) + "\n\n" + user;
             }
             if (liveTokens == null) {
                 // 同步路径 cancelled 为 null（无取消语义），流式路径传共享断连标志
-                finalAnswer = predictAggregate(sessionId, user, cancelled, ledgerHandle(state, false));
+                finalAnswer = predictAggregate(sessionId, user, cancelled,
+                        orchestrationBudget.ledgerHandle(state, false));
             } else {
                 finalAnswer = predictAggregateStreaming(sessionId, user, liveTokens, contentSent,
-                        cancelled, ledgerHandle(state, false));
+                        cancelled, orchestrationBudget.ledgerHandle(state, false));
             }
         }
         Map<String, Object> updates = new HashMap<>();
@@ -933,43 +721,6 @@ public class MultiAgentGraphAgent implements Agent {
             sb.append("【子任务").append(i + 1).append("】\n").append(results.get(i)).append("\n\n");
         }
         return sb.toString();
-    }
-
-    /**
-     * 解析 lead 拆解返回的 JSON 子任务列表；非法返回空表。
-     * 兼容两种格式：新格式 {@code {"subtasks":[{"desc":"..","agent":"researcher"}]}}，
-     * 旧格式 {@code {"subtasks":[".."]}}（无指派，agent=null）；agent 名不在白名单一律回退 null。
-     */
-    private List<Subtask> parseSubtasks(String content) {
-        if (content == null || content.isBlank()) {
-            return new ArrayList<>();
-        }
-        try {
-            JsonNode node = OBJECT_MAPPER.readTree(content);
-            List<Subtask> out = new ArrayList<>();
-            for (JsonNode s : node.path("subtasks")) {
-                if (s.isTextual()) {
-                    out.add(new Subtask(s.asText(), null)); // 旧格式：纯字符串
-                } else {
-                    String desc = s.path("desc").asText("");
-                    String agent = normalizeAgent(s.path("agent").asText(null));
-                    out.add(new Subtask(desc, agent));
-                }
-            }
-            return out;
-        } catch (Exception e) {
-            log.warn("[multi-agent] 拆解返回非法 JSON，回退处理：{}", safe(e));
-            return new ArrayList<>();
-        }
-    }
-
-    /** 专家名归一化：空白视为未指派；不在白名单的回退 null（执行时走默认客户端）。 */
-    private static String normalizeAgent(String agent) {
-        if (agent == null || agent.isBlank()) {
-            return null;
-        }
-        String name = agent.trim();
-        return EXPERT_WHITELIST.contains(name) ? name : null;
     }
 
     private static String safe(Throwable t) {
