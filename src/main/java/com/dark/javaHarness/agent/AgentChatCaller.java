@@ -1,6 +1,5 @@
 package com.dark.javaHarness.agent;
 
-import com.dark.javaHarness.advisor.ContextAssemblingAdvisor;
 import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
@@ -13,21 +12,13 @@ import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
-import com.dark.javaHarness.tool.ToolCallBudget;
-import com.dark.javaHarness.tool.ToolCallTracer;
 import com.dark.javaHarness.prompt.ToolLazyManager;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
-import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.metadata.Usage;
-import org.springframework.ai.openai.OpenAiChatOptions;
-import org.springframework.ai.support.ToolCallbacks;
-import org.springframework.ai.tool.ToolCallback;
 
 /**
  * 编排环节的 LLM 单次调用器：查 agent 表配置 → 取注册客户端 → 组装请求 → 调用。
@@ -126,6 +117,8 @@ final class AgentChatCaller {
     private final LlmRetry retry;
     /** 上下文预算配置（工具次数/结果预算等；null 时用内置默认值，单测场景） */
     private final ContextBudgetProperties budgets;
+    /** 请求规格组装工厂：system/记忆/选项/工具注入的统一组装链（与路径 A 共用） */
+    private final AgentRequestSpecFactory specFactory;
 
     AgentChatCaller(ChatClientRegistry clientRegistry,
                     AgentService agentService,
@@ -228,6 +221,8 @@ final class AgentChatCaller {
         this.recorder = recorder;
         this.retry = retry;
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
+        this.specFactory = new AgentRequestSpecFactory(clientRegistry, promptAssembler,
+                toolAssignments, this.lazyTools, skillManager, memoryStore, this.budgets);
     }
 
     /** 带会话观测的单次调用（推荐入口：sessionId 用于 llm_call_log 归因） */
@@ -375,35 +370,8 @@ final class AgentChatCaller {
         // 与上一轮差值即本轮新增消耗（各轮 prompt 单调递增，差值非负、求和=末轮 total，不重复计数）
         java.util.concurrent.atomic.AtomicLong prevTotal = new java.util.concurrent.atomic.AtomicLong();
         try {
-            buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
-                    .stream()
-                    .chatResponse()
-                    .doOnNext(resp -> captureUsageAndAccount(resp, usageRef, ledger, prevTotal))
-                    // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
-                    // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
-                    // filter 根本不会执行——必须用 handle 跳过空帧
-                    .handle((org.springframework.ai.chat.model.ChatResponse resp,
-                             reactor.core.publisher.SynchronousSink<String> sink) -> {
-                        String token = AgentChatCaller.contentOf(resp);
-                        if (token != null) {
-                            sink.next(token);
-                        }
-                    })
-                    // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
-                    .timeout(STREAM_IDLE_TIMEOUT)
-                    .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
-                    .doOnNext(token -> {
-                        if (cancelled != null && cancelled.getAsBoolean()) {
-                            // takeUntil 放行的终止前元素在此拦截；异常致流以错误终止，
-                            // Reactor cancel 向上游传播关闭 HTTP 连接
-                            throw cancelException();
-                        }
-                        collected.append(token);
-                        if (onToken != null) {
-                            onToken.accept(token);
-                        }
-                    })
-                    .blockLast();
+            return streamCore(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, disableTools,
+                    extraAdvisors, collected, onToken, cancelled, usageRef, prevTotal, ledger);
         } catch (RuntimeException e) {
             // 取消置位时一律按取消归因（流取消竞态下 blockLast 可能抛出其他形态异常）
             if (cancelled != null && cancelled.getAsBoolean()) {
@@ -411,6 +379,49 @@ final class AgentChatCaller {
             }
             throw e;
         }
+    }
+
+    /**
+     * 流式管道共用体（{@link #streamAttempt} 与 {@link #stream} 的重试循环体同构，抽此共用）：
+     * 组装请求 → stream → usage 捕获/预算增量记账 → 空帧跳过 → 空闲超时 → 取消拦截 → 收集返回。
+     * 取消语义：takeUntil 在下一个 token 边界中止订阅（取消向上传播关闭 HTTP 连接），
+     * doOnNext 拦截 takeUntil 放行的终止前元素；流结束后取消竞态复检（不按成功返回）。
+     */
+    private String streamCore(AgentConfig config, String sessionId, String forAgent, String fallbackSystem,
+                              String user, Consumer<String> toolEmitter, boolean disableTools,
+                              Advisor[] extraAdvisors, StringBuilder collected, Consumer<String> onToken,
+                              BooleanSupplier cancelled,
+                              java.util.concurrent.atomic.AtomicReference<Usage> usageRef,
+                              java.util.concurrent.atomic.AtomicLong prevTotal, BudgetLedger ledger) {
+        buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
+                .stream()
+                .chatResponse()
+                .doOnNext(resp -> captureUsageAndAccount(resp, usageRef, ledger, prevTotal))
+                // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
+                // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
+                // filter 根本不会执行——必须用 handle 跳过空帧
+                .handle((org.springframework.ai.chat.model.ChatResponse resp,
+                         reactor.core.publisher.SynchronousSink<String> sink) -> {
+                    String token = AgentChatCaller.contentOf(resp);
+                    if (token != null) {
+                        sink.next(token);
+                    }
+                })
+                // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
+                .timeout(STREAM_IDLE_TIMEOUT)
+                .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
+                .doOnNext(token -> {
+                    if (cancelled != null && cancelled.getAsBoolean()) {
+                        // takeUntil 放行的终止前元素在此拦截；异常致流以错误终止，
+                        // Reactor cancel 向上游传播关闭 HTTP 连接
+                        throw cancelException();
+                    }
+                    collected.append(token);
+                    if (onToken != null) {
+                        onToken.accept(token);
+                    }
+                })
+                .blockLast();
         if (cancelled != null && cancelled.getAsBoolean()) {
             throw cancelException();
         }
@@ -539,32 +550,13 @@ final class AgentChatCaller {
             // roundtrip 增量记账游标（口径同 streamAttempt，见其注释）
             java.util.concurrent.atomic.AtomicLong prevTotal = new java.util.concurrent.atomic.AtomicLong();
             try {
-                buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, false, extraAdvisors)
-                        .stream()
-                        .chatResponse()
-                        .doOnNext(resp -> captureUsageAndAccount(resp, usageRef, ledger, prevTotal))
-                        // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
-                        // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
-                        // filter 根本不会执行——必须用 handle 跳过空帧
-                        .handle((org.springframework.ai.chat.model.ChatResponse resp,
-                                 reactor.core.publisher.SynchronousSink<String> sink) -> {
-                            String token = AgentChatCaller.contentOf(resp);
-                            if (token != null) {
-                                sink.next(token);
-                            }
-                        })
-                        // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
-                        .timeout(STREAM_IDLE_TIMEOUT)
-                        .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
-                        .doOnNext(token -> {
-                            if (cancelled != null && cancelled.getAsBoolean()) {
-                                // takeUntil 放行的终止前元素在此拦截，取消向上传播关连接
-                                throw cancelException();
-                            }
-                            collected.append(token);
-                            onToken.accept(token);
-                        })
-                        .blockLast();
+                String out = streamCore(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, false,
+                        extraAdvisors, collected, onToken, cancelled, usageRef, prevTotal, ledger);
+                // streamUsage 回传真实 usage 时记真实值，无则按已收输出文本近似估算（原口径兜底）；
+                // 账本兜底入账：无真实 usage 帧时按输出估算补记（有则增量已在流帧上记账，不重复）
+                recordOkStream(sessionId, forAgent, model, start, out, usageRef.get());
+                recordEstimatedIfNoUsage(ledger, out, usageRef.get());
+                return out;
             } catch (RuntimeException e) {
                 boolean isCancel = e instanceof CancellationException
                         || (cancelled != null && cancelled.getAsBoolean());
@@ -586,125 +578,25 @@ final class AgentChatCaller {
                 }
                 throw e;
             }
-            if (cancelled != null && cancelled.getAsBoolean()) {
-                // 流正常结束但取消竞态置位：不按成功返回
-                recordError(sessionId, forAgent, model, true, start,
-                        cancelException());
-                throw cancelException();
-            }
-            // streamUsage 回传真实 usage 时记真实值，无则按已收输出文本近似估算（原口径兜底）；
-            // 账本兜底入账：无真实 usage 帧时按输出估算补记（有则增量已在流帧上记账，不重复）
-            String out = collected.toString();
-            recordOkStream(sessionId, forAgent, model, start, out, usageRef.get());
-            recordEstimatedIfNoUsage(ledger, out, usageRef.get());
-            return out;
         }
         // 理论不可达（maxAttempts>=1）
         throw new IllegalStateException("stream 重试循环异常退出");
     }
 
-    /** 组装请求（查表配置 → 取客户端 → system 经 PromptAssembler 按段组装 → 记忆策略挂载 → 请求级 model → 工具注入），call/stream 共用；config 由调用方查好传入（避免重复查表） */
+    /**
+     * 组装请求：委托 {@link AgentRequestSpecFactory} 共用组装链（与路径 A GeneralAssistantAgent
+     * 合并），编排路径差异在此声明——频率惩罚与工具硬预算启用、记忆按 {@link MemoryPolicy}
+     * 判定（仅 lead 注入）、maxTokens 按角色档位；config 由调用方查好传入（避免重复查表）。
+     */
     private ChatClient.ChatClientRequestSpec buildSpec(AgentConfig config, String sessionId, String forAgent,
                                                        String fallbackSystem, String user,
                                                        Consumer<String> toolEmitter,
                                                        boolean disableTools, Advisor... extraAdvisors) {
-        // Registry 模式：凭部署模型 id 取对应厂商的 ChatClient（未绑定/未命中回退默认 DashScope）
-        Long modelProviderId = config != null ? config.modelProviderId() : null;
-        String model = config != null ? config.model() : null;
-        ChatClient client = clientRegistry.get(modelProviderId);
-        // system 经 PromptAssembler 按段组装：角色段（表 prompt > 兜底指令 > 默认）+ 索引/纪律/约定等段；
-        // 兜底角色指令收敛为角色段兜底，不再拼进 user
-        ChatClient.ChatClientRequestSpec spec = client.prompt()
-                .system(promptAssembler.assemble(forAgent, fallbackSystem))
-                .user(user);
-        // 记忆注入（编排路径唯一注入点：lead 拆解）：策略判定 + 会话 ID + 记忆源三重把关。
-        // 只读注入：手动加载历史拼进请求消息，不挂 MessageChatMemoryAdvisor——该 advisor 会
-        // 自动写回（before 写 lead 内部 user 指令、after 写 JSON 拆解产物），编排中间产物一旦
-        // 入库会被后续轮次当历史载入，造成角色错位；会话写回统一由 ChatService 负责。
-        // 手动注入同时让 ContextAssemblingAdvisor 对「历史 + 本轮」整体做归一化与预算裁剪
-        // （advisor 方式下历史在裁剪之后才合并，既不受预算约束也不做 role 归一化）。
-        // aggregator/子任务专家不注入（子任务上下文由 lead 在子任务描述中传递）
-        if (memoryStore != null && memoryPolicy.shouldInject(forAgent, sessionId)) {
-            List<Message> history = memoryStore.get(sessionId);
-            if (history != null && !history.isEmpty()) {
-                spec.messages(history);
-            }
-            spec.advisors(new ContextAssemblingAdvisor(budgets.getHistoryBudget()));
-        }
-        // 请求级 advisor 挂载（如 lead/聚合的 PromptBudgetAdvisor）：
-        // 不用 default advisor——聚合与子任务共用同一客户端，default 挂载会连坐到无关调用
-        for (Advisor advisor : extraAdvisors) {
-            spec.advisors(advisor);
-        }
-        if (model != null && !model.isBlank()) {
-            // Registry 构建的客户端 defaultOptions 为空，必须在请求级显式指定 model，否则厂商端 400
-            // frequencyPenalty：长报告聚合场景下模型易陷入重复循环（同一段落循环生成多次），
-            // 用频率惩罚抑制；对 lead 的 JSON 输出无副作用
-            // streamUsage(true)：流式末帧回传真实 usage（OpenAI stream_options.include_usage，
-            // DashScope 兼容模式与 DeepSeek 均支持）——llm_call_log 据此记真实 prompt/completion token
-            OpenAiChatOptions.Builder options = OpenAiChatOptions.builder()
-                    .model(model)
-                    .frequencyPenalty(0.5)
-                    .streamUsage(true);
-            // 输出封顶（消费侧，生成侧防失控——复读循环/跑题长文，非事后裁剪）：
-            // 按角色档位设 maxTokens；0 = 不限制，不写入保持模型默认（存量行为兼容）
-            int maxTokens = maxTokensForRole(forAgent);
-            if (maxTokens > 0) {
-                options.maxTokens(maxTokens);
-            }
-            spec.options(options.build());
-        } else {
-            // model 空时仅设开关不覆盖客户端默认（usage 记录与模型无关）；
-            // 输出封顶按角色档位照常生效（请求级选项，只覆盖 maxTokens 单字段，不干扰模型默认）
-            OpenAiChatOptions.Builder options = OpenAiChatOptions.builder().streamUsage(true);
-            int maxTokens = maxTokensForRole(forAgent);
-            if (maxTokens > 0) {
-                options.maxTokens(maxTokens);
-            }
-            spec.options(options.build());
-        }
-        // 专家工具分配：按 agent 名注入请求级工具（与客户端 defaultTools 合并）；
-        // disableTools=true 跳过（幻觉工具调用的降级重试路径）。
-        // 双通道统一为 ToolCallback 单通道（@Tool 注解对象经 ToolCallbacks.from 转回调，与
-        // .tools 注入等价），便于 tracer/预算/延迟加载统一装饰
-        if (disableTools) {
-            return spec;
-        }
-        ToolAssignments.ToolSet toolSet = toolAssignments == null
-                ? ToolAssignments.ToolSet.EMPTY
-                : toolAssignments.forAgent(forAgent);
-        List<ToolCallback> tools = new ArrayList<>(toolSet.callbacks());
-        if (!toolSet.annotated().isEmpty()) {
-            tools.addAll(List.of(ToolCallbacks.from(toolSet.annotated().toArray())));
-        }
-        if (toolEmitter != null) {
-            // 追踪模式：tracer 装饰真实工具（执行起止经 emitter 发进度行，CLI 工具调用行）
-            tools = ToolCallTracer.trace(tools, toolEmitter);
-            if (!tools.isEmpty()) {
-                // 硬预算：单次调用内工具执行次数超限不再真执行；工具结果总量 ≤5k token，
-                // 超出的截断、耗尽后返回引导文本收束循环（防止 token 按轮数平方级膨胀）。
-                // 预算只约束真实工具执行——轻量引导与 expand_tool 元工具不计入
-                tools = ToolCallBudget.limit(tools,
-                        budgets.getToolCallLimit(), budgets.getToolResultBudget());
-            }
-        }
-        // 延迟加载加工（最外层，包 tracer/预算装饰后的 callback）：未展开→轻量包装、
-        // 已展开→透传完整 schema，末尾追加 expand_tool 元工具（不经 tracer/预算——
-        // 元工具不产生工具行噪声、不占真实执行额度）；开关关闭/无会话 ID 时全量透传现状
-        tools = lazyTools.process(sessionId, tools);
-        // load_skill 元工具（skill 索引段配套）：该 agent 有可见技能时注册——同 expand_tool 口径
-        // 不经 tracer/次数额度；skill 全文自身在 SkillManager 内按 tool-result-budget 截断
-        List<ToolCallback> loadSkill = skillManager == null ? List.of()
-                : skillManager.loadSkillTool(forAgent).map(List::of).orElse(List.of());
-        if (!loadSkill.isEmpty()) {
-            List<ToolCallback> merged = new ArrayList<>(tools);
-            merged.addAll(loadSkill);
-            tools = merged;
-        }
-        if (!tools.isEmpty()) {
-            spec.toolCallbacks(tools.toArray(new ToolCallback[0]));
-        }
-        return spec;
+        return specFactory.build(config, sessionId, forAgent, fallbackSystem, user,
+                new AgentRequestSpecFactory.Assembly(toolEmitter, disableTools,
+                        memoryStore != null && memoryPolicy.shouldInject(forAgent, sessionId),
+                        true, true, maxTokensForRole(forAgent)),
+                extraAdvisors);
     }
 
     /** 查 agent 表配置（每次 LLM 调用仅查一次，观测记录与请求组装共用） */

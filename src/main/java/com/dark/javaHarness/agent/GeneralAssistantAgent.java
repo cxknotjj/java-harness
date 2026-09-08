@@ -1,6 +1,5 @@
 package com.dark.javaHarness.agent;
 
-import com.dark.javaHarness.advisor.ContextAssemblingAdvisor;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.Goal;
@@ -11,18 +10,12 @@ import com.dark.javaHarness.service.AgentService;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
-import com.dark.javaHarness.tool.ToolCallTracer;
 import com.dark.javaHarness.prompt.ToolLazyManager;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.openai.OpenAiChatOptions;
-import org.springframework.ai.support.ToolCallbacks;
-import org.springframework.ai.tool.ToolCallback;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
 import reactor.core.publisher.SignalType;
@@ -63,8 +56,8 @@ public class GeneralAssistantAgent implements Agent {
     private final LlmCallRecorder recorder;
     /** 模型调用重试策略（最多 3 次、指数退避） */
     private final LlmRetry retry;
-    /** 会话历史裁剪预算（token），来自 app.context.history-budget 配置 */
-    private final int historyBudget;
+    /** 请求规格组装工厂：system/记忆/选项/工具注入的统一组装链（与路径 B 编排共用） */
+    private final AgentRequestSpecFactory specFactory;
     /** 输出封顶（final 档，与编排聚合同为直出用户的最终回答；0 = 不限制），来自 app.context.max-tokens-final */
     private final int maxTokensFinal;
 
@@ -134,9 +127,10 @@ public class GeneralAssistantAgent implements Agent {
         // 不在此处硬编码兜底数字，避免代码/yaml 双口径漂移
         com.dark.javaHarness.config.ContextBudgetProperties effectiveBudgets =
                 budgets != null ? budgets : new com.dark.javaHarness.config.ContextBudgetProperties();
-        this.historyBudget = effectiveBudgets.getHistoryBudget();
         this.maxTokensFinal = effectiveBudgets.getMaxTokensFinal();
         this.retry = new LlmRetry();
+        this.specFactory = new AgentRequestSpecFactory(clientRegistry, this.promptAssembler,
+                toolAssignments, this.lazyTools, skillManager, memoryStore, effectiveBudgets);
     }
 
     /** 返回 Agent 名称（用于注册与路由） */
@@ -315,7 +309,12 @@ public class GeneralAssistantAgent implements Agent {
         return buildChatRequestSpec(sessionId, objective, null);
     }
 
-    /** 组装请求（toolEmitter 非 null 时注入追踪版工具，调用起止经其发进度行） */
+    /**
+     * 组装请求（toolEmitter 非 null 时注入追踪版工具，调用起止经其发进度行）：
+     * 委托 {@link AgentRequestSpecFactory} 共用组装链（与路径 B AgentChatCaller 合并），
+     * 路径 A 差异在此声明——恒注入记忆（ContextAssemblingAdvisor 对「历史 + 本轮」整体
+     * 归一化与预算裁剪）、无频率惩罚、无工具次数预算、输出封顶走 final 档。
+     */
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective,
                                                                   Consumer<String> toolEmitter) {
         AgentConfig config = agentService.getAgentConfig(agentName)
@@ -325,64 +324,7 @@ public class GeneralAssistantAgent implements Agent {
         ChatClient client = clientRegistry.get(config.modelProviderId());
         log.info("[agent请求] agentName='{}' -> 配置 modelProviderId={}, model='{}'，实际使用 client={}",
                 name(), config.modelProviderId(), model, client == null ? "null" : client.getClass().getSimpleName());
-        ChatClient.ChatClientRequestSpec spec = client.prompt()
-                // 只读注入历史：手动加载会话上下文拼进请求消息。不挂 MessageChatMemoryAdvisor——
-                // 该 advisor 会自动写回（before 写 user、after 写 assistant），与 ChatService 的
-                // 统一写回双写污染会话；只读注入同时让 ContextAssemblingAdvisor 对「历史 + 本轮」
-                // 整体做 role 归一化与预算裁剪（advisor 方式下历史在裁剪之后才合并，不受控）
-                .advisors(new ContextAssemblingAdvisor(historyBudget))
-                // system 经 PromptAssembler 按段组装：角色段沿用 agent 表 prompt > 默认兜底，
-                // 其后按固定次序追加工具索引/工具纪律/输出约定/skill（扩展点）段
-                .system(promptAssembler.assemble(agentName, DEFAULT_SYSTEM_PROMPT))
-                .user(objective);
-        // 会话历史只读注入（空会话/空历史跳过；写入由 ChatService 统一负责，本类不写）
-        List<Message> history = memoryStore.get(sessionId);
-        if (history != null && !history.isEmpty()) {
-            spec.messages(history);
-        }
-        // 请求级工具注入（本 agent 名分配到的工具集，general=全量；与客户端 defaultTools 合并）：
-        // 双通道统一为 ToolCallback 单通道（@Tool 注解对象经 ToolCallbacks.from 转回调，与
-        // .tools 注入等价），便于 tracer 装饰与延迟加载统一加工
-        ToolAssignments.ToolSet toolSet = toolAssignments == null
-                ? ToolAssignments.ToolSet.EMPTY
-                : toolAssignments.forAgent(agentName);
-        List<ToolCallback> tools = new ArrayList<>(toolSet.callbacks());
-        if (!toolSet.annotated().isEmpty()) {
-            tools.addAll(List.of(ToolCallbacks.from(toolSet.annotated().toArray())));
-        }
-        if (toolEmitter != null) {
-            // 追踪模式：tracer 装饰真实工具，工具执行起止经 emitter 发进度行
-            tools = ToolCallTracer.trace(tools, toolEmitter);
-        }
-        // 延迟加载加工（最外层，包 tracer 装饰后的 callback）：未展开→轻量包装、已展开→透传，
-        // 末尾追加 expand_tool 元工具（不经 tracer——元工具不产生工具行噪声，真实工具行正常）；
-        // 开关关闭/无会话 ID 时全量透传现状
-        tools = lazyTools.process(sessionId, tools);
-        // load_skill 元工具（skill 索引段配套）：该 agent 有可见技能时注册——同 expand_tool 口径
-        // 不经 tracer/次数额度；skill 全文自身在 SkillManager 内按 tool-result-budget 截断
-        List<ToolCallback> loadSkill = skillManager == null ? List.of()
-                : skillManager.loadSkillTool(agentName).map(List::of).orElse(List.of());
-        if (!loadSkill.isEmpty()) {
-            List<ToolCallback> merged = new ArrayList<>(tools);
-            merged.addAll(loadSkill);
-            tools = merged;
-        }
-        if (!tools.isEmpty()) {
-            spec.toolCallbacks(tools.toArray(new ToolCallback[0]));
-        }
-        // streamUsage(true)：流式末帧回传真实 usage（OpenAI stream_options.include_usage，
-        // DashScope 兼容模式与 DeepSeek 均支持）——llm_call_log 据此记真实 prompt/completion
-        // token，工具 schema/skill 索引等请求侧开销可见；model 空时仅设开关不覆盖客户端默认
-        OpenAiChatOptions.Builder options = OpenAiChatOptions.builder().streamUsage(true);
-        if (model != null && !model.isBlank()) {
-            options.model(model);
-        }
-        // 输出封顶（消费侧，生成侧防失控；final 档与编排聚合同为直出用户的最终回答）：
-        // 0 = 不限制，不写入保持模型默认（存量行为兼容）
-        if (maxTokensFinal > 0) {
-            options.maxTokens(maxTokensFinal);
-        }
-        spec.options(options.build());
-        return spec;
+        return specFactory.build(config, sessionId, agentName, DEFAULT_SYSTEM_PROMPT, objective,
+                new AgentRequestSpecFactory.Assembly(toolEmitter, false, true, false, false, maxTokensFinal));
     }
 }
