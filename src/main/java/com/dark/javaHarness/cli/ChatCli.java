@@ -1,6 +1,7 @@
 package com.dark.javaHarness.cli;
 
 import com.dark.javaHarness.cli.api.ChatApiClient;
+import com.dark.javaHarness.cli.input.TerminalInput;
 import com.dark.javaHarness.cli.render.TerminalRenderer;
 import com.dark.javaHarness.domain.dto.ChatResponse;
 import com.dark.javaHarness.domain.dto.ProviderAddResult;
@@ -23,8 +24,9 @@ import java.util.function.Consumer;
  * 阶段进度 spinner 原位刷新 + 完成折叠归档、工具调用行（⏺ 工具名(参数) → ✓ 耗时 · ±行数着色）、
  * 内容逐 token 流式 Markdown 着色、回合小结。
  *
- * 输入层：真实终端下由 JLine 3 接管——上下键翻阅输入历史（持久化到用户目录）、
+ * 输入层由 {@link TerminalInput} 承担：真实终端下由 JLine 3 接管——上下键翻阅输入历史（持久化到用户目录）、
  * `/` 命令自动补全菜单、多行粘贴；无 TTY 环境（如 exec:java 内嵌 JVM）自动降级为行式读取。
+ * /resume 续跑目标的本地持久化由 {@link ResumeStateStore} 承担（跨 CLI 进程保留）。
  *
  * 重要：CLI 是纯 HTTP 客户端，不监听任何端口，占用的是你当前的终端进程。
  * 主服务（JavaHarnessApplication）负责监听 8080、保留日志、执行 Agent 编排。
@@ -59,9 +61,8 @@ public class ChatCli {
      */
     private String lastOrchestratedGoalId;
 
-    /** /resume 无参续跑目标的持久化文件（sessionId + goalId 两行，跨 CLI 进程保留） */
-    private static final java.nio.file.Path RESUME_STATE_FILE =
-            java.nio.file.Path.of(System.getProperty("user.home"), ".javaHarness_resume_state");
+    /** /resume 无参续跑目标的持久化存储（sessionId + goalId 两行，跨 CLI 进程保留） */
+    private final ResumeStateStore resumeStore = new ResumeStateStore();
 
     /**
      * 当前选中的 Agent ID：null 表示交由服务端「主 Agent 前置判断」分流
@@ -98,7 +99,7 @@ public class ChatCli {
     /** 交互式循环（独立终端使用） */
     public void chatLoop() {
         // 先定输入源，再定输出通道（JLine 模式下 renderer 与 banner 全走 terminal.output() 防乱码）
-        LineInput input = openInput();
+        TerminalInput.LineInput input = TerminalInput.open();
         ui = input.out();
         renderer.useOutput(ui);
 
@@ -150,201 +151,8 @@ public class ChatCli {
     }
 
     // ================================================================
-    // 输入层：JLine（历史/补全/粘贴）+ 无 TTY 降级
+    // 输入层已拆至 cli/input/TerminalInput（LineInput/JLineInput/WriterBridge/legacyInput）
     // ================================================================
-
-    /** 行输入源抽象：read() 返回 null 表示 EOF；out() 为配套 UI 输出通道 */
-    private interface LineInput {
-        String read();
-
-        /** 配套输出通道：JLine 实现返回 terminal.output()（宽字符，免代码页乱码）；降级实现走 stdout */
-        default PrintStream out() {
-            return System.out;
-        }
-
-        default void shutdown() {
-        }
-    }
-
-    /** 优先 JLine 终端（真实 TTY）；dumb 终端（无键盘接管能力，如 exec:java 内嵌 JVM）降级行式读取 */
-    private LineInput openInput() {
-        try {
-            org.jline.terminal.Terminal terminal = org.jline.terminal.TerminalBuilder.terminal();
-            if (terminal.getType().contains("dumb")) {
-                terminal.close();
-                System.out.println("\033[90m（非交互终端，输入降级：无历史翻阅/补全；"
-                        + "用 mvn -Pcli compile exec:exec 可获完整体验）\033[0m");
-                return legacyInput();
-            }
-            return new JLineInput(terminal);
-        } catch (Exception e) {
-            System.out.println("\033[90m（终端初始化失败，输入降级: " + e.getMessage() + "）\033[0m");
-            return legacyInput();
-        }
-    }
-
-    /** JLine 行读取：上下键历史（持久化）+ `/` 命令补全 + 多行粘贴（bracketed paste） */
-    private record JLineInput(org.jline.terminal.Terminal terminal,
-                              org.jline.reader.LineReader reader) implements LineInput {
-
-        JLineInput(org.jline.terminal.Terminal terminal) {
-            this(terminal, org.jline.reader.LineReaderBuilder.builder()
-                    .terminal(terminal)
-                    .completer(commandCompleter())
-                    // 历史持久化到用户目录：跨进程保留，↑↓ 可翻阅
-                    .variable(org.jline.reader.LineReader.HISTORY_FILE,
-                            java.nio.file.Path.of(System.getProperty("user.home"), ".javaHarness_history"))
-                    .build());
-        }
-
-        @Override
-        public String read() {
-            try {
-                return reader.readLine("你> ");
-            } catch (org.jline.reader.EndOfFileException e) {
-                return null; // Ctrl+D / 流关闭
-            } catch (org.jline.reader.UserInterruptException e) {
-                return ""; // Ctrl+C：清空当前行继续
-            }
-        }
-
-        /**
-         * UI 输出经 {@link WriterBridge} 桥到 terminal.writer()：宽字符通道（WriteConsoleW），
-         * 与控制台代码页（GBK/65001）无关，中文与 ✓/⏺ 永不乱码。
-         * ⚠️ 不能用 terminal.output()：那是 jansi 字节通道，ANSI 序列被翻译但普通文本字节
-         * 直传控制台按代码页解读——UTF-8 中文在 GBK 代码页必乱（LineReader 的提示符正常
-         * 正是因为它走 writer()）。
-         */
-        @Override
-        public PrintStream out() {
-            return new PrintStream(new WriterBridge(terminal.writer()), true,
-                    StandardCharsets.UTF_8);
-        }
-
-        @Override
-        public void shutdown() {
-            terminal.writer().flush();
-        }
-
-        /** `/` 命令补全：根命令直接列出，/agent 的参数补全 off */
-        private static org.jline.reader.Completer commandCompleter() {
-            return (reader, line, candidates) -> {
-                String buffer = line.toString();
-                String word = line.word().toString();
-                if (buffer.stripLeading().startsWith("/agent")) {
-                    if ("off".startsWith(word)) {
-                        candidates.add(new org.jline.reader.Candidate("off"));
-                    }
-                    return;
-                }
-                if (!word.startsWith("/")) {
-                    return;
-                }
-                for (String cmd : new String[]{"/help", "/new", "/agent", "/resume", "/provider", "/exit", "/quit"}) {
-                    if (cmd.startsWith(word)) {
-                        candidates.add(new org.jline.reader.Candidate(cmd));
-                    }
-                }
-            };
-        }
-    }
-
-    /**
-     * PrintStream → Writer 桥：把 UTF-8 字节流经 CharsetDecoder 解码成字符，写入 JLine writer
-     * （jansi 宽字符通道 WriteConsoleW，与控制台代码页无关）。
-     * 不完整的多字节尾字符由 decoder 状态机保留，跨 write 调用安全。
-     */
-    private static final class WriterBridge extends java.io.OutputStream {
-
-        private final java.io.Writer writer;
-        private final java.nio.charset.CharsetDecoder decoder =
-                StandardCharsets.UTF_8.newDecoder();
-        private java.nio.ByteBuffer in = java.nio.ByteBuffer.allocate(1024);
-
-        WriterBridge(java.io.Writer writer) {
-            this.writer = writer;
-        }
-
-        @Override
-        public synchronized void write(int b) {
-            if (!in.hasRemaining()) {
-                grow(in.capacity());
-            }
-            in.put((byte) b);
-            drain();
-        }
-
-        @Override
-        public synchronized void write(byte[] b, int off, int len) {
-            if (len > in.remaining()) {
-                grow(len);
-            }
-            in.put(b, off, len);
-            drain();
-        }
-
-        /** 扩容到能容纳 need 字节（保留已缓冲内容） */
-        private void grow(int need) {
-            java.nio.ByteBuffer nio = java.nio.ByteBuffer
-                    .allocate(Math.max(in.capacity() * 2, in.position() + need));
-            in.flip();
-            nio.put(in);
-            in = nio;
-        }
-
-        /** 解码缓冲中所有完整字符；不完整多字节尾留 decoder（compact 后待后续补齐） */
-        private void drain() {
-            if (in.position() == 0) {
-                return;
-            }
-            in.flip();
-            while (in.hasRemaining()) {
-                java.nio.CharBuffer out = java.nio.CharBuffer
-                        .allocate(Math.max(16, in.remaining()));
-                decoder.decode(in, out, false);
-                out.flip();
-                if (out.hasRemaining()) {
-                    char[] chars = new char[out.remaining()];
-                    out.get(chars);
-                    try {
-                        writer.write(chars);
-                    } catch (IOException e) {
-                        // 终端已不可写：输出静默丢弃（PrintStream 语义同为吞错）
-                    }
-                }
-            }
-            in.compact();
-        }
-
-        @Override
-        public void flush() {
-            try {
-                writer.flush();
-            } catch (IOException ignored) {
-                // 同上
-            }
-        }
-
-        @Override
-        public void close() {
-            flush();
-        }
-    }
-
-    /** 降级输入：标准行式读取（无历史/补全，但任何环境可用） */
-    private LineInput legacyInput() {
-        java.io.BufferedReader br = new java.io.BufferedReader(
-                new java.io.InputStreamReader(System.in));
-        return () -> {
-            try {
-                ui.print("你> ");
-                ui.flush();
-                return br.readLine();
-            } catch (IOException e) {
-                return null;
-            }
-        };
-    }
 
     /** 帮助信息（命令名青色着色） */
     private void printHelp() {
@@ -581,9 +389,7 @@ public class ChatCli {
     /** 把当前 sessionId + goalId 写入持久化文件（失败仅提示，不影响主流程） */
     private void persistResumeState() {
         try {
-            java.nio.file.Files.writeString(RESUME_STATE_FILE,
-                    "sessionId=" + (sessionId == null ? "" : sessionId) + "\n"
-                            + "goalId=" + (lastOrchestratedGoalId == null ? "" : lastOrchestratedGoalId) + "\n");
+            resumeStore.save(sessionId, lastOrchestratedGoalId);
         } catch (Exception e) {
             ui.println("\033[90m（续跑状态持久化失败: " + e.getMessage() + "）\033[0m");
         }
@@ -595,18 +401,12 @@ public class ChatCli {
             return;
         }
         try {
-            if (!java.nio.file.Files.exists(RESUME_STATE_FILE)) {
+            ResumeStateStore.State state = resumeStore.load();
+            if (state == null) {
                 return;
             }
-            String stateSessionId = null;
-            String stateGoalId = null;
-            for (String line : java.nio.file.Files.readAllLines(RESUME_STATE_FILE)) {
-                if (line.startsWith("sessionId=")) {
-                    stateSessionId = line.substring("sessionId=".length()).trim();
-                } else if (line.startsWith("goalId=")) {
-                    stateGoalId = line.substring("goalId=".length()).trim();
-                }
-            }
+            String stateSessionId = state.sessionId();
+            String stateGoalId = state.goalId();
             if (stateGoalId == null || stateGoalId.isBlank() || !sessionId.equals(stateSessionId)) {
                 return;
             }
