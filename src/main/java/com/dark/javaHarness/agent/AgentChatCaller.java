@@ -74,6 +74,38 @@ final class AgentChatCaller {
         return new CancellationException(CANCELLED_MSG);
     }
 
+    /**
+     * 编排预算账本句柄（MultiAgentGraphAgent 按节点注入，同一编排共享同一账本）：
+     * <ul>
+     *   <li>{@link #overBudget()}：熔断判定（budget>0 且已消耗 ≥ 上限）。调用器在两个时点
+     *       检查——发起调用前（零 HTTP 短路）与每次 LLM roundtrip 的 usage 帧到达时（含
+     *       单次 call 内部工具循环的每轮，超限即断流，阻止下一轮发起）；
+     *   <li>{@link #recordUsage(int, boolean)}：按 roundtrip 增量同步累计消耗（同一调用栈内
+     *       可读，不依赖 llm_call_log 异步落库时序）。真实 usage 优先（streamUsage 帧），
+     *       全程无 usage 时按输出文本估算并置 estimated=true（口径与 tokens_estimated 一致）。
+     * </ul>
+     * 聚合等「必发不受熔断」的调用方传 record-only 句柄（overBudget 恒 false，仅记账）。
+     */
+    interface BudgetLedger {
+
+        /** 熔断判定：true = 已达编排消费上限 */
+        boolean overBudget();
+
+        /** 累计消耗（estimated=true 表示含估算值，降级说明注明口径） */
+        void recordUsage(int totalTokens, boolean estimated);
+    }
+
+    /**
+     * 编排预算熔断异常：超限断流/拒绝发起新调用时抛出。编排节点捕获后写
+     * 「预算超限跳过」占位并注入聚合降级说明；非可重试错误（LlmRetry 天然旁路）。
+     */
+    static final class BudgetExceededException extends RuntimeException {
+
+        BudgetExceededException() {
+            super("budget-exceeded: 编排 token 消费已达上限，熔断中止调用");
+        }
+    }
+
     private final ChatClientRegistry clientRegistry;
     private final AgentService agentService;
     /** 专家工具分配表：按 agent 名注入请求级工具 */
@@ -224,6 +256,16 @@ final class AgentChatCaller {
      */
     String call(String sessionId, String forAgent, String fallbackSystem, String user,
                 Consumer<String> toolEmitter, Advisor[] extraAdvisors, BooleanSupplier cancelled) {
+        return call(sessionId, forAgent, fallbackSystem, user, toolEmitter, extraAdvisors, cancelled, null);
+    }
+
+    /**
+     * 带取消令牌与预算账本的单次调用（编排节点传账本句柄：发起前与每轮 roundtrip 的
+     * usage 帧上熔断判定；按 roundtrip 增量同步累计消耗）。ledger 可为 null（无账本场景）。
+     */
+    String call(String sessionId, String forAgent, String fallbackSystem, String user,
+                Consumer<String> toolEmitter, Advisor[] extraAdvisors, BooleanSupplier cancelled,
+                BudgetLedger ledger) {
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
         // 模型调用失败自动重试（最多 3 次、指数退避）；单次调用含观测埋点
@@ -233,12 +275,19 @@ final class AgentChatCaller {
                 java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
                         new java.util.concurrent.atomic.AtomicReference<>();
                 String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                        toolEmitter, false, extraAdvisors, null, cancelled, usageRef);
+                        toolEmitter, false, extraAdvisors, null, cancelled, usageRef, ledger);
                 recordOkStream(sessionId, forAgent, model, start, content, usageRef.get());
+                recordEstimatedIfNoUsage(ledger, content, usageRef.get());
                 return content;
             } catch (RuntimeException e) {
                 // 客户端断连中止：记录后立即上抛（CancellationException 不可重试，直接放行）
                 if (e instanceof CancellationException) {
+                    recordError(sessionId, forAgent, model, true, start, e);
+                    throw e;
+                }
+                // 编排预算熔断：政策性中止（非模型错误），记录后立即上抛（不可重试，
+                // 编排节点捕获后写「预算超限跳过」占位）
+                if (e instanceof BudgetExceededException) {
                     recordError(sessionId, forAgent, model, true, start, e);
                     throw e;
                 }
@@ -257,8 +306,9 @@ final class AgentChatCaller {
                         java.util.concurrent.atomic.AtomicReference<Usage> usageRef2 =
                                 new java.util.concurrent.atomic.AtomicReference<>();
                         String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                                null, true, extraAdvisors, null, cancelled, usageRef2);
+                                null, true, extraAdvisors, null, cancelled, usageRef2, ledger);
                         recordOkStream(sessionId, forAgent, model, start2, content, usageRef2.get());
+                        recordEstimatedIfNoUsage(ledger, content, usageRef2.get());
                         return content;
                     } catch (RuntimeException e2) {
                         recordError(sessionId, forAgent, model, true, start2, e2);
@@ -278,7 +328,7 @@ final class AgentChatCaller {
         java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
                 new java.util.concurrent.atomic.AtomicReference<>();
         String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                toolEmitter, disableTools, extraAdvisors, null, null, usageRef);
+                toolEmitter, disableTools, extraAdvisors, null, null, usageRef, null);
         recordOkStream(sessionId, forAgent, model, start, content, usageRef.get());
         return content;
     }
@@ -304,20 +354,31 @@ final class AgentChatCaller {
      * 停止生成），部分输出不返回。
      *
      * <p>usageRef 非 null 时捕获 streamUsage 末帧真实 usage，供记录真实 token（null 则纯收集）。
+     *
+     * <p>预算门控（ledger 非 null）：发起前超限直接抛 {@link BudgetExceededException}
+     * （零 HTTP 请求）；每轮 LLM roundtrip 的 usage 帧到达时按增量记账并复检——
+     * 单次 call 内部工具循环的下一轮在超限后不再发起（断流阻止后续消耗）。
      */
     private String streamAttempt(AgentConfig config, String sessionId, String forAgent, String fallbackSystem,
                                  String user, Consumer<String> toolEmitter, boolean disableTools,
                                  Advisor[] extraAdvisors, Consumer<String> onToken, BooleanSupplier cancelled,
-                                 java.util.concurrent.atomic.AtomicReference<Usage> usageRef) {
+                                 java.util.concurrent.atomic.AtomicReference<Usage> usageRef,
+                                 BudgetLedger ledger) {
         if (cancelled != null && cancelled.getAsBoolean()) {
             throw cancelException();
         }
+        if (ledger != null && ledger.overBudget()) {
+            throw new BudgetExceededException();
+        }
         StringBuilder collected = new StringBuilder();
+        // roundtrip 增量记账游标：usage 帧的 total 为该轮完整 prompt+completion，
+        // 与上一轮差值即本轮新增消耗（各轮 prompt 单调递增，差值非负、求和=末轮 total，不重复计数）
+        java.util.concurrent.atomic.AtomicLong prevTotal = new java.util.concurrent.atomic.AtomicLong();
         try {
             buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
                     .stream()
                     .chatResponse()
-                    .doOnNext(resp -> captureUsage(resp, usageRef))
+                    .doOnNext(resp -> captureUsageAndAccount(resp, usageRef, ledger, prevTotal))
                     // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
                     // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
                     // filter 根本不会执行——必须用 handle 跳过空帧
@@ -367,6 +428,47 @@ final class AgentChatCaller {
         return resp != null && resp.getMetadata() != null ? resp.getMetadata().getUsage() : null;
     }
 
+    /**
+     * 流帧处理：捕获 usage（llm_call_log 末帧口径不变）+ 预算账本按 roundtrip 增量记账与熔断复检
+     * （ledger 为 null 时仅捕获）。超限即抛 {@link BudgetExceededException} 断流——Reactor
+     * 取消向上传播关闭 HTTP 连接，工具循环的下一轮不再发起。
+     */
+    private static void captureUsageAndAccount(org.springframework.ai.chat.model.ChatResponse resp,
+                                               java.util.concurrent.atomic.AtomicReference<Usage> ref,
+                                               BudgetLedger ledger,
+                                               java.util.concurrent.atomic.AtomicLong prevTotal) {
+        captureUsage(resp, ref);
+        if (ledger == null) {
+            return;
+        }
+        Usage usage = usageOf(resp);
+        if (usage == null || usage.getTotalTokens() == null || usage.getTotalTokens() <= 0) {
+            return;
+        }
+        int total = usage.getTotalTokens();
+        int delta = (int) Math.max(0, total - prevTotal.getAndSet(total));
+        if (delta > 0) {
+            ledger.recordUsage(delta, false);
+        }
+        if (ledger.overBudget()) {
+            throw new BudgetExceededException();
+        }
+    }
+
+    /**
+     * 全程无真实 usage 回包时按输出文本估算入账（estimated=true，口径与 llm_call_log.tokens_estimated
+     * 一致）；有 usage 时增量已在流帧上记账，此处不再累计（避免重复计数）。ledger 可 null 直通。
+     */
+    private static void recordEstimatedIfNoUsage(BudgetLedger ledger, String content, Usage usage) {
+        if (ledger == null) {
+            return;
+        }
+        boolean hasRealUsage = usage != null && usage.getTotalTokens() != null && usage.getTotalTokens() > 0;
+        if (!hasRealUsage) {
+            ledger.recordUsage(LlmCallRecorder.estimateTokens(content), true);
+        }
+    }
+
     private static String safeMsg(Exception e) {
         // 原因链展开：供应商 4xx/5xx 的响应体（报错 JSON）在 HttpStatusCodeException 里，
         // 外层 wrapper 的 getMessage() 常为空或泛化，直接取会丢真实报错
@@ -404,10 +506,24 @@ final class AgentChatCaller {
     String stream(String sessionId, String forAgent, String fallbackSystem, String user,
                   Consumer<String> onToken, Consumer<String> toolEmitter, Advisor[] extraAdvisors,
                   BooleanSupplier cancelled) {
+        return stream(sessionId, forAgent, fallbackSystem, user, onToken, toolEmitter, extraAdvisors,
+                cancelled, null);
+    }
+
+    /**
+     * 带取消令牌与预算账本的流式调用（编排节点传账本句柄：发起前熔断判定 + 成功结束后
+     * 估算兜底入账/真实增量入账）。ledger 可为 null（无账本场景）。
+     */
+    String stream(String sessionId, String forAgent, String fallbackSystem, String user,
+                  Consumer<String> onToken, Consumer<String> toolEmitter, Advisor[] extraAdvisors,
+                  BooleanSupplier cancelled, BudgetLedger ledger) {
         if (cancelled != null && cancelled.getAsBoolean()) {
             recordError(sessionId, forAgent, null, true, System.currentTimeMillis(),
                     cancelException());
             throw cancelException();
+        }
+        if (ledger != null && ledger.overBudget()) {
+            throw new BudgetExceededException();
         }
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
@@ -420,11 +536,13 @@ final class AgentChatCaller {
             // streamUsage 末帧真实 usage（无则估算兜底）
             java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
                     new java.util.concurrent.atomic.AtomicReference<>();
+            // roundtrip 增量记账游标（口径同 streamAttempt，见其注释）
+            java.util.concurrent.atomic.AtomicLong prevTotal = new java.util.concurrent.atomic.AtomicLong();
             try {
                 buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, false, extraAdvisors)
                         .stream()
                         .chatResponse()
-                        .doOnNext(resp -> captureUsage(resp, usageRef))
+                        .doOnNext(resp -> captureUsageAndAccount(resp, usageRef, ledger, prevTotal))
                         // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
                         // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
                         // filter 根本不会执行——必须用 handle 跳过空帧
@@ -474,9 +592,11 @@ final class AgentChatCaller {
                         cancelException());
                 throw cancelException();
             }
-            // streamUsage 回传真实 usage 时记真实值，无则按已收输出文本近似估算（原口径兜底）
+            // streamUsage 回传真实 usage 时记真实值，无则按已收输出文本近似估算（原口径兜底）；
+            // 账本兜底入账：无真实 usage 帧时按输出估算补记（有则增量已在流帧上记账，不重复）
             String out = collected.toString();
             recordOkStream(sessionId, forAgent, model, start, out, usageRef.get());
+            recordEstimatedIfNoUsage(ledger, out, usageRef.get());
             return out;
         }
         // 理论不可达（maxAttempts>=1）
@@ -522,14 +642,26 @@ final class AgentChatCaller {
             // 用频率惩罚抑制；对 lead 的 JSON 输出无副作用
             // streamUsage(true)：流式末帧回传真实 usage（OpenAI stream_options.include_usage，
             // DashScope 兼容模式与 DeepSeek 均支持）——llm_call_log 据此记真实 prompt/completion token
-            spec.options(OpenAiChatOptions.builder()
+            OpenAiChatOptions.Builder options = OpenAiChatOptions.builder()
                     .model(model)
                     .frequencyPenalty(0.5)
-                    .streamUsage(true)
-                    .build());
+                    .streamUsage(true);
+            // 输出封顶（消费侧，生成侧防失控——复读循环/跑题长文，非事后裁剪）：
+            // 按角色档位设 maxTokens；0 = 不限制，不写入保持模型默认（存量行为兼容）
+            int maxTokens = maxTokensForRole(forAgent);
+            if (maxTokens > 0) {
+                options.maxTokens(maxTokens);
+            }
+            spec.options(options.build());
         } else {
-            // model 空时仅设开关不覆盖客户端默认（usage 记录与模型无关）
-            spec.options(OpenAiChatOptions.builder().streamUsage(true).build());
+            // model 空时仅设开关不覆盖客户端默认（usage 记录与模型无关）；
+            // 输出封顶按角色档位照常生效（请求级选项，只覆盖 maxTokens 单字段，不干扰模型默认）
+            OpenAiChatOptions.Builder options = OpenAiChatOptions.builder().streamUsage(true);
+            int maxTokens = maxTokensForRole(forAgent);
+            if (maxTokens > 0) {
+                options.maxTokens(maxTokens);
+            }
+            spec.options(options.build());
         }
         // 专家工具分配：按 agent 名注入请求级工具（与客户端 defaultTools 合并）；
         // disableTools=true 跳过（幻觉工具调用的降级重试路径）。
@@ -579,6 +711,23 @@ final class AgentChatCaller {
     private AgentConfig configOf(String forAgent) {
         return agentService == null ? null
                 : agentService.getAgentConfig(forAgent).orElse(null);
+    }
+
+    /**
+     * 输出封顶档位映射（消费侧 maxTokens，0 = 不限制）：
+     * lead 拆解 → lead 档（JSON 中间产物本就该短）；aggregator → final 档
+     * （与路径 A 直出对话同为直出用户的最终回答，共用一档）；其余（编排子任务专家
+     * researcher/coder/analyst/writer/general）→ expert 档。
+     * 角色名字面量与 {@link MemoryPolicy} / MultiAgentGraphAgent 的编排角色名同源。
+     */
+    private int maxTokensForRole(String forAgent) {
+        if ("lead".equals(forAgent)) {
+            return budgets.getMaxTokensLead();
+        }
+        if ("aggregator".equals(forAgent)) {
+            return budgets.getMaxTokensFinal();
+        }
+        return budgets.getMaxTokensExpert();
     }
 
     /** 成功记录（流式）：streamUsage 末帧回传真实 usage 时记真实 token，无则按输出文本估算兜底 */

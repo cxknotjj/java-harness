@@ -1,8 +1,8 @@
 # 上下文管理优化方案
 
-> 状态：**已实现**（2026-09-06 核对）——`app.context.*` 预算配置（`config/ContextBudgetProperties`）、静态 prompt 预算拦截器（`advisor/PromptBudgetAdvisor`，lead/聚合节点接入）、`tool/ToolCallBudget` 均已落地，由 `MultiAgentGraphAgent` / `GeneralAssistantAgent` 消费；本文保留为设计依据与参数口径说明。
-> 关联代码：`advisor/ContextAssemblingAdvisor`、`advisor/PromptBudgetAdvisor`、`tool/ToolCallBudget`、`tool/TokenEstimator`、`agent/MultiAgentGraphAgent`
-> 背景：262 万 prompt token 事故复盘后，输入侧防线已补齐（工具预算/内容过滤/白名单），本方案补齐最后一个缺口——**静态 prompt 无预算**。
+> 状态：**已实现**（2026-09-06 核对；2026-09-08 增补消费侧预算——输出 maxTokens 分档与编排全程消费上限熔断，见第五节）——`app.context.*` 预算配置（`config/ContextBudgetProperties`）、静态 prompt 预算拦截器（`advisor/PromptBudgetAdvisor`，lead/聚合节点接入）、`tool/ToolCallBudget` 均已落地，由 `MultiAgentGraphAgent` / `GeneralAssistantAgent` 消费；本文保留为设计依据与参数口径说明。
+> 关联代码：`advisor/ContextAssemblingAdvisor`、`advisor/PromptBudgetAdvisor`、`tool/ToolCallBudget`、`tool/TokenEstimator`、`agent/MultiAgentGraphAgent`、`agent/AgentChatCaller`
+> 背景：262 万 prompt token 事故复盘后，输入侧防线已补齐（工具预算/内容过滤/白名单），本方案补齐最后一个缺口——**静态 prompt 无预算**；消费侧（输出生成与编排累计）防线见第五节。
 
 ---
 
@@ -166,3 +166,55 @@ lead prompt = persona（拆解约束）
 - **只读不写**：memory 的唯一写入方保持为服务层 `writeBackContext`，lead 不回写，避免拆解 JSON 污染 general 对话历史
 - **机械压缩优先**：保留用户消息 + assistant 回答首句，不引入额外 LLM 调用；质量不足再升级为 LLM 摘要
 - **收益**：编排入口能感知之前聊定的偏好/口径与历史编排结论，「按我们刚才说好的做」这类指代目标不再失效
+
+---
+
+## 五、消费侧预算（输出封顶 + 编排消费上限熔断，2026-09-08 已实现）
+
+输入侧防线（前四节）只管「喂给模型多少」，不管「模型吐出多少、一次编排总共烧多少」。本节补齐消费侧两道防线。全部预算数值的唯一来源是 `application.yaml` 的 `app.context` 块（代码零默认，`ContextBudgetProperties` 只做绑定载体）；全键统一 **0 = 不限制**——该层预算关闭，行为等同无预算，暂时不需要某项限制时在 yaml 置 0 即可，无需改代码。
+
+### 5.1 输出封顶：maxTokens 按角色分档（生成侧防失控）
+
+在生成侧设 `maxTokens` 防失控（复读循环/跑题长文），**不做事后裁剪**（截断已生成文本会切掉结论、伤表达质量）。`AgentChatCaller.buildSpec` 按调用角色落档：
+
+| 配置键 | 生产默认 | 适用调用 | 档位依据 |
+|--------|---------|---------|---------|
+| `max-tokens-lead` | 2000 | 编排 lead 拆解 | JSON 中间产物，本就该短 |
+| `max-tokens-final` | 8000 | 编排聚合 + 路径 A 直出对话（`GeneralAssistantAgent`） | 两者同为直出用户的最终回答，共用一档 |
+| `max-tokens-expert` | 4000 | 编排子任务专家（researcher/coder/analyst/writer/general） | 单路子任务结果 |
+
+- 0 = 不限制：不写入 maxTokens，保持模型默认（全键统一口径，也是配置类缺省值）。
+- 生效机制：请求级 `OpenAiChatOptions.maxTokens`，模型在生成侧截停在限额内；model 未配置时同样生效（只覆盖 maxTokens 单字段，不干扰客户端默认模型）。
+
+### 5.2 编排全程消费上限：熔断（`orchestration-budget`）
+
+单次编排（lead + N 子任务 + 聚合）的全程 token 消费上限，默认 60000：
+
+```
+input 注入账本（AtomicLong 累计 + AtomicBoolean 估算标记，Replace 策略注册进 state）
+  → lead：caller 门控句柄——发起调用前检查 + 每轮 roundtrip usage 帧增量记账并复检
+  → 子任务（并行扇出限并发 subtask-concurrency，信号量排队错峰）：同上门控；
+    未发起的在预检拒绝（零 HTTP），已在途的在下一轮 roundtrip 熔断断流
+    （BudgetExceededException，Reactor 取消关闭 HTTP 连接），result 写
+    「预算超限跳过」占位（与「子任务失败无结果」区分）
+  → 聚合必发不受熔断（record-only 句柄，仅记账）：占位不计入真实结果，
+    prompt 前置【预算降级说明】（N 个子任务未执行 + 已消耗/上限数字 + 消耗口径），
+    聚合产出降级版最终回答，编排正常终态（非 FAILED）
+```
+
+- **熔断下沉到 caller 的 roundtrip 粒度（2026-09-08 C1 评审修正）**：`AgentChatCaller.BudgetLedger` 在两个时点检查——发起调用前（零 HTTP 短路）与每轮 LLM roundtrip 的 usage 帧到达时（含单次 call 内部工具循环的每轮，超限即断流）。原「子任务批前检查」在并行扇出下各调用共享账本但检查只见 lead 消耗，生产默认配置下熔断结构性不可达，且单次 call 内多轮工具循环可绕过检查烧穿预算——roundtrip 粒度同时消除两个盲区（并行扇出下任一调用的消耗入账后，其余调用的下一轮 roundtrip 立即可见）。
+- **同步累计，不依赖落库时序**：按 roundtrip 增量记账（真实 usage 帧 `delta = total - prevTotal`，同一调用栈内可读），`llm_call_log` 异步落库只承担观测，不承担熔断判定。
+- **口径**：真实 usage 优先（streamUsage 末帧）；无 usage 回包按输出文本估算并置估算标记（与 `llm_call_log.tokens_estimated` 语义一致），降级说明注明「含估算值」或「真实 usage 统计」。流式与同步路径同口径（流式同样在 usage 帧增量记账 + 无 usage 时估算兜底）。
+- **续跑**：断点续跑时新账本随 input 注入覆盖旧值（Replace 策略），已复用的历史节点消耗不计入本次账本（近似口径，可接受）。
+- **并行竞态**：并行子任务共享同一账本实例（`AtomicLong` 写安全），熔断为近似判定——检查与累加非原子，超限瞬间在途调用至多再消耗一轮 roundtrip 即被断流；配合 `subtask-concurrency` 限并发错峰，在途超额窗口从「整批」收窄到「至多 N 个在途调用」。熔断目的是止损不是精确计量。
+
+### 5.3 会话累计不设硬配额（评估结论）
+
+单次消耗已被输入预算 + maxTokens 双侧封顶、单次编排已被 orchestration-budget 封顶，会话累计只反映正常用量增长。硬拦截（聊着聊着突然不能聊）体验伤害大且无安全收益（换 sessionId 即可绕过）。消费量观测由既有 `llm_call_log` / `GET /api/llm-calls` 承担，零新增代码。
+
+### 5.4 验收对照
+
+- 模拟编排内超限：剩余子任务零 LLM 调用（mock 零交互断言），聚合带降级说明正常终态 → `MultiAgentGraphAgentTest.execute_overBudget_*` / `execute_withinBudget_*`（同步 + 流式）
+- 真实部分跳过（lead + 前序子任务累计超限 → 后续子任务跳过、前序结果保留进聚合）：`MultiAgentGraphAgentTest.execute_partialBudgetExhaustion_skipsOnlyRemainingSubtasks`（限并发=1 使跳过数确定）
+- caller 门控/记账：发起前超限零 HTTP、usage 帧真实入账、无 usage 估算兜底、流式与同步同口径 → `AgentChatCallerTest.call_ledgerPreCheckOverBudget_zeroHttp` / `call_realUsageFrame_recordsActualTokens` / `stream_reportsRealUsageToLedger` / `stream_ledgerPreCheckOverBudget_zeroHttp`
+- 档位映射：lead/final/expert 三档捕获 `ChatOptions.maxTokens` 断言；0 时不写入 → `AgentChatCallerTest.call_maxTokens*`

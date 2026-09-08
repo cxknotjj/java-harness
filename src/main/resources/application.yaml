@@ -57,14 +57,27 @@ server:
 # 解析规则：app.providers.<provider>.api-key 优先，未配置时回退环境变量 <PROVIDER大写>_API_KEY。
 # 因此新增供应商通常零配置——设置 MOONSHOT_API_KEY 之类的环境变量即可。
 app:
-  # 上下文预算（token，全项目统一口径 TokenEstimator）：集中管理四层预算，
-  # 详见 docs/guides/context-optimization.md——调整此处即可，无需改代码
+  # 上下文预算（token，全项目统一口径 TokenEstimator）：输入侧四层预算 + 消费侧预算
+  # （输出 maxTokens 分档 / 编排全程消费上限），详见 docs/guides/context-optimization.md。
+  # 本块是全部预算数值的唯一来源（代码零默认，只做绑定载体）；全键统一 0 = 不限制
+  # （该层预算关闭，行为等同无预算），暂时不需要某项限制时置 0 即可
   context:
     history-budget: 4000      # 路径 A 会话历史裁剪（ContextAssemblingAdvisor）
     lead-budget: 4000         # 编排 lead 拆解 prompt（超出对目标文本尾截）
     aggregate-budget: 12000   # 编排聚合 prompt（超出按子任务等份额截断）
     tool-result-budget: 5000  # 单次调用工具结果注入上下文的总预算
     tool-call-limit: 8       # 单次调用工具执行次数硬上限
+    # —— 消费侧：输出封顶（生成侧防失控，设 maxTokens，0 = 不限制）——
+    max-tokens-lead: 2000     # lead 拆解单次输出上限（JSON 中间产物，本就该短）
+    max-tokens-final: 8000    # 聚合与路径 A 直出单次输出上限（直出用户的最终回答）
+    max-tokens-expert: 4000   # 编排子任务专家单次输出上限
+    # —— 消费侧：编排全程消费上限（0 = 不限制）——
+    orchestration-budget: 60000 # 单次编排全程 token 消费上限：内存账本同步累计（真实 usage 优先），
+                                # 每轮 LLM 调用（含单次 call 内部工具循环）前经 caller 熔断检查，超限断流，
+                                # 剩余子任务写「预算超限跳过」占位，聚合照常执行并在 prompt 注入降级说明
+    # —— 消费侧：编排子任务并行限并发（0 = 不限并发，全部并行）——
+    subtask-concurrency: 2    # 子任务并行扇出经信号量排队错峰执行：收敛下游 LLM 并发压力，
+                              # 并把熔断后的在途超额窗口从「整批」收窄到「至多 N 个在途调用」
   # 工具 Schema 延迟加载（两段式工具暴露）：开启后请求级工具面轻量注入（名称+用途，schema 置空），
   # system 附工具索引段，模型经 expand_tool 元工具按需展开获取完整参数说明；
   # 关闭后回退全量注入现状（expand_tool 不注册）

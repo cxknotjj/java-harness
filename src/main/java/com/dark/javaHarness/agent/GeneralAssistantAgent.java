@@ -65,6 +65,8 @@ public class GeneralAssistantAgent implements Agent {
     private final LlmRetry retry;
     /** 会话历史裁剪预算（token），来自 app.context.history-budget 配置 */
     private final int historyBudget;
+    /** 输出封顶（final 档，与编排聚合同为直出用户的最终回答；0 = 不限制），来自 app.context.max-tokens-final */
+    private final int maxTokensFinal;
 
     public GeneralAssistantAgent(String agentName,
                                  ChatClientRegistry clientRegistry,
@@ -128,7 +130,12 @@ public class GeneralAssistantAgent implements Agent {
                 : new PromptAssembler(agentService, toolAssignments, List.of(), this.lazyTools.isEnabled());
         this.skillManager = skillManager;
         this.recorder = recorder;
-        this.historyBudget = budgets != null ? budgets.getHistoryBudget() : 4000;
+        // budgets 缺省时取配置类默认（与 application.yaml 生产默认一致的单一数值源），
+        // 不在此处硬编码兜底数字，避免代码/yaml 双口径漂移
+        com.dark.javaHarness.config.ContextBudgetProperties effectiveBudgets =
+                budgets != null ? budgets : new com.dark.javaHarness.config.ContextBudgetProperties();
+        this.historyBudget = effectiveBudgets.getHistoryBudget();
+        this.maxTokensFinal = effectiveBudgets.getMaxTokensFinal();
         this.retry = new LlmRetry();
     }
 
@@ -369,6 +376,11 @@ public class GeneralAssistantAgent implements Agent {
         OpenAiChatOptions.Builder options = OpenAiChatOptions.builder().streamUsage(true);
         if (model != null && !model.isBlank()) {
             options.model(model);
+        }
+        // 输出封顶（消费侧，生成侧防失控；final 档与编排聚合同为直出用户的最终回答）：
+        // 0 = 不限制，不写入保持模型默认（存量行为兼容）
+        if (maxTokensFinal > 0) {
+            options.maxTokens(maxTokensFinal);
         }
         spec.options(options.build());
         return spec;

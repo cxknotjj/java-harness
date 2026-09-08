@@ -86,8 +86,11 @@ public final class PromptBudgetAdvisor implements CallAdvisor, StreamAdvisor {
         return chain.nextStream(apply(request));
     }
 
-    /** 预算纯函数（便于单测）：预算内原样返回；超预算改写最后一条 user 消息后重建请求 */
+    /** 预算纯函数（便于单测）：maxTokens ≤ 0 视为不限制直通；预算内原样返回；超预算改写最后一条 user 消息后重建请求 */
     public ChatClientRequest apply(ChatClientRequest request) {
+        if (maxTokens <= 0) {
+            return request; // 0 = 不限制（app.context 预算键统一口径），该层预算关闭
+        }
         Prompt prompt = request.prompt();
         List<Message> messages = prompt.getInstructions();
         if (messages == null || messages.isEmpty()) {

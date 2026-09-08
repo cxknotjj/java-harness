@@ -14,7 +14,6 @@ import org.springframework.ai.chat.client.advisor.api.StreamAdvisorChain;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
-import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.core.Ordered;
 import reactor.core.publisher.Flux;
@@ -38,11 +37,10 @@ public class ContextAssemblingAdvisor implements CallAdvisor, StreamAdvisor {
 
     private final int tokenBudget;
 
-    public ContextAssemblingAdvisor() {
-        // 默认 token 预算（生产由 GeneralAssistantAgent 从 app.context.history-budget 注入）
-        this(4000);
-    }
-
+    /**
+     * @param tokenBudget 会话历史 token 预算（生产由 GeneralAssistantAgent 从
+     *                    app.context.history-budget 注入，yaml 为唯一数值源）；≤ 0 = 不裁剪
+     */
     public ContextAssemblingAdvisor(int tokenBudget) {
         this.tokenBudget = tokenBudget;
     }
@@ -103,7 +101,10 @@ public class ContextAssemblingAdvisor implements CallAdvisor, StreamAdvisor {
         List<Message> cleaned = filterNoise(raw);
         // 2. 归一化 role 顺序
         List<Message> normalized = normalizeRoles(cleaned);
-        // 3. token 预算从旧丢弃（保留 system + 最近消息）
+        // 3. token 预算从旧丢弃（保留 system + 最近消息）；预算 ≤ 0 = 不限制，跳过裁剪
+        if (tokenBudget <= 0) {
+            return normalized;
+        }
         return trimToBudget(normalized);
     }
 

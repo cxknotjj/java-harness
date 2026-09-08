@@ -72,9 +72,12 @@
 - [ ] **并发 / 资源控制**：流式连接数限制、模型调用超时兜底与熔断降级（COMPLEX 编排失败可降级为 SIMPLE 单模型重答）
   - 2026-09 部分完成：异步线程池隔离与参数化已落地（`goalExecutor` 有界池 + 拒绝兜底 + MVC 异步槽位，见存档「异步治理与发布工程」）；连接数限制与熔断降级待做
   - 验收：并发提交多个流式请求稳定，无连接/线程池耗尽（线程池部分已由 10 并发 submit 用例覆盖）
-- [ ] **Token 预算统一控制**：预算口径目前散落多处且只有输入侧裁剪、无消费侧封顶——上下文裁剪（`ContextAssemblingAdvisor`）、工具结果截断（tool-result-budget）、skill 正文截断各自独立配置，一次 COMPLEX 编排（lead + 4 子任务 + 聚合）可无上限消耗 token
-  - 改造要点：集中预算配置与裁决，分三档——单次调用输入预算 / 编排全程消费上限 / 会话累计配额；消费侧复用 `llm_call_log` 真实 usage（streamUsage 末帧）累计编排内各段调用，超预算熔断剩余子任务并降级聚合，与会话轮次清除的被动裁剪区分开
-  - 验收：模拟编排内 token 超限，后续子任务不再发起 LLM 调用，聚合带降级说明返回；各预算项集中配置、口径一致（估算 vs 真实值标记）
+- [x] **Token 预算统一控制**（2026-09-08 落地，详见 `docs/guides/context-optimization.md` 第五节）：预算集中配置（`app.context.*` / `ContextBudgetProperties`），消费侧新增两项——
+  - 输出封顶（生成侧防失控，非事后裁剪）：`AgentChatCaller.buildSpec` 按角色分档设 `maxTokens`——lead 2000（JSON 中间产物）/ 聚合与路径 A 直出 8000（同直出最终回答共档）/ 子任务专家 4000；0 = 不限保持模型默认
+  - 编排全程消费上限熔断（`orchestration-budget` 60000）：input 注入内存账本（AtomicLong + 估算标记），`AgentChatCaller` 经 `BudgetLedger` 按 roundtrip 增量同步累计，发起调用前与每轮 usage 帧两时点熔断（含单次 call 内部工具循环每轮，超限断流；真实 usage 优先，无则估算并与 `tokens_estimated` 同口径，不依赖异步落库时序）；未发起子任务超限即短路跳过（零 LLM 调用，result 写「预算超限跳过」占位），已在途的在下一轮熔断停止；聚合必发不受熔断（record-only 仅记账）、prompt 前置【预算降级说明】（跳过数 + 已消耗/上限 + 口径），编排正常终态；子任务并行限并发 `subtask-concurrency` 错峰，收窄在途超额窗口（2026-09-08 评审 C1 按方向 b 修正：熔断下沉 caller roundtrip 粒度，消除并行扇出检查盲区与工具循环烧穿）
+  - 会话累计不设硬配额（评估结论：输入/输出双侧已封顶单次消耗，会话累计只反映正常用量，硬拦截伤聊天体验且无安全收益），消费量观测由 `llm_call_log` 与 `GET /api/llm-calls` 承担
+  - 验收 ✅：熔断用例（同步 + 流式 + 真实部分跳过）子任务 mock 零交互、聚合带降级说明正常返回；三档 maxTokens 捕获 ChatOptions 断言、0 时不写入；caller 门控/记账 + 配置绑定用例（共新增 17 用例）
+  - 遗留（P1）：子任务结果喂聚合前按预算分摊裁剪，前移聚合侧 sections 兜底——避免输出都长时靠后子任务整段被剪
 - [ ] **工具分配最小权限化**：现状按「能力类别」粒度分配（`ToolAssignments` 给整组工具），存在权限漏洞：
   - **`general`** **全量过宽且是所有回退路径的落点**：路由兜底、未识别专家、lead 漏指派全部落 general——最宽权限（执行/容器写/网页）给了最不可控的场景，违背最小权限原则
   - 改造项（沙箱语境下已简化：沙箱原生分执行/只读文件/写入三类，无需再拆类）：
@@ -85,6 +88,13 @@
 - [x] **异步任务治理**：`CompletableFuture.runAsync` 改为受管线程池（`@Async` 注解因自调用陷阱弃用，直接注入 Executor）
   - 落地：`GoalExecutorConfig` 双池（`goal-exec-` 后台 Goal 池 core=max=8 / 队列 50 / 优雅停机；`applicationTaskExecutor` MVC 异步槽位）；队列满拒绝 → Goal 落 FAILED 终态；`run()` catch Throwable 堵 Error 逃逸卡 RUNNING
   - 验收 ✅：并发提交 10 个 Goal 稳定执行全 SUCCEEDED、无拒绝无卡 RUNNING（单测覆盖）；失败重投部分经评估另立任务（见 P2「Goal 失败重投」），详见存档「异步治理与发布工程」
+
+- [ ] **工具调用与 MCP 日志记录**：现状仅 `ToolCallTracer` 装饰 ToolCallback 发 `tool`/`tool-done` SSE 进度行（无 emitter 的调用链路不可见），工具调用不落库——`llm_call_log` 只记 LLM 调用，工具侧无成本/审计账本；MCP server 连接/发现失败仅 warn 单行，无 server 维度可查询记录
+  - 改造要点：仿照 `llm_call_log` 落库工具调用（工具名/参数摘要/耗时/成败/所属 agent 与 sessionId），MCP 工具标注来源 server；MCP 连接失败、懒连接失败结构化记录（`McpToolProvider` 每 server 独立记录，失败隔离后仍可追溯）
+  - 验收：`/api/tool-calls?sessionId=` 可查询一次编排内全部工具调用（含 MCP 工具及来源 server）；MCP 某 server 故障时能从日志定位到该 server
+- [ ] **沙箱读写工具的重置与安全校验**：沙箱容器懒创建一次后无重置/重建机制（坏状态无法自愈，仅停服 `@PreDestroy` 销毁，强杀进程还会残留容器）；写入/执行工具完全信任模型输出透传容器，容器内无路径越界与危险命令拦截
+  - 改造要点：容器健康探测 + 调用失败自动重建（限重建次数、超限降级空工具面并告警）；写入类工具（`WriteFileTool`/`EditFileTool`/`MoveFileTool` 等）限制在容器工作目录内，拒绝绝对路径与 `..` 越界；执行类工具（`RunShellCommandTool`/`RunPythonCodeTool`）危险命令黑名单拦截（`rm -rf /`、mkfs、fork 炸弹等）并返回可自愈提示
+  - 验收：手动 kill 容器后下次工具调用自动重建成功；写入工作目录外路径被拒绝；危险命令被拦截且编排不中断
 
 * [x] **prompt的动态加载：**
   - [x] 1.skill的动态装配
@@ -100,9 +110,9 @@
 
 - [x] 修复目前会话无法创建goal的问题
 - [x] 优化webtool工具，让他从能用到好用（借鉴 jsoup/Readability 业界管线重写抓取与网页处理，详见存档「工具与沙箱」）
-- [ ] 检查agent 角色提示词是否被写入了会话消息中。
-- [ ] 增加会话agent切换功能，当在次会话切换agent，则会话表的agentId同样需要更改。
-- [ ] 修复进入多agent时，请求卡住的问题。
+- [x] 检查agent 角色提示词是否被写入了会话消息中。
+- [x] 增加会话agent切换功能，当在次会话切换agent，则会话表的agentId同样需要更改。
+- [x] 修复进入多agent时，请求卡住的问题。
 - [x] 客户端断开后，服务端应该终止大模型请求，避免浪费token
   - 实现：`AgentChatCaller.call()` 统一流式背书（RestClient 阻塞调用不可中断，流式是唯一可中止通道），`BooleanSupplier` 取消令牌贯穿 call/stream，`takeUntil` 在 token 边界中止在途请求；详见存档「并发断连的可观测处理」
 

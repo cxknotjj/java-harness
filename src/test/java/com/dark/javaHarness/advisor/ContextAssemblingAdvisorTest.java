@@ -24,7 +24,7 @@ class ContextAssemblingAdvisorTest {
     private static final long BIG_TEXT = 4000L; // 用于触发 token 预算裁剪
 
     private ContextAssemblingAdvisor advisor() {
-        return new ContextAssemblingAdvisor();
+        return new ContextAssemblingAdvisor(4000);
     }
 
     private String longText(long n) {

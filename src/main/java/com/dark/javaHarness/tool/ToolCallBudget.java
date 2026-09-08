@@ -49,12 +49,19 @@ public final class ToolCallBudget {
      * 包装回调列表：共享计数器与 token 预算——
      * 前 {@code maxCalls} 次正常执行（结果裁剪到剩余 token 预算内），
      * 次数或 token 任一超限后一律返回引导文本（不触发真实工具）。
+     * 统一口径：{@code maxCalls}/{@code maxTokens} ≤ 0 视为该维度不限制；
+     * 两者均不限时原列表直通，不包装。
      */
     public static List<ToolCallback> limit(List<ToolCallback> callbacks, int maxCalls, int maxTokens) {
+        int calls = maxCalls > 0 ? maxCalls : Integer.MAX_VALUE;
+        int tokens = maxTokens > 0 ? maxTokens : Integer.MAX_VALUE;
+        if (calls == Integer.MAX_VALUE && tokens == Integer.MAX_VALUE) {
+            return callbacks;
+        }
         AtomicInteger counter = new AtomicInteger();
         AtomicInteger usedTokens = new AtomicInteger();
         return callbacks.stream()
-                .map(cb -> (ToolCallback) new BudgetedCallback(cb, counter, maxCalls, usedTokens, maxTokens))
+                .map(cb -> (ToolCallback) new BudgetedCallback(cb, counter, calls, usedTokens, tokens))
                 .toList();
     }
 

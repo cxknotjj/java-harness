@@ -654,4 +654,153 @@ class MultiAgentGraphAgentTest {
         assertTrue(rows.stream().noneMatch(fixedContent()::equals),
                 "部分输出后不应出现完整重发内容, 实际帧序列: " + rows);
     }
+
+    /* ---------------- 编排消费上限熔断（预算账本） ---------------- */
+
+    /**
+     * 同步路径熔断：orchestration-budget=1（极小），lead 拆解消耗已超限 →
+     * 2 个子任务全部短路（零 LLM 调用、result 写占位），聚合照常执行且 prompt
+     * 前置降级说明（跳过数 + 已消耗/上限数字 + 估算口径），编排正常终态。
+     */
+    @Test
+    void execute_overBudget_skipsSubtasks_aggregatesWithDegradationNote() {
+        stubChat(fixedContent());
+        com.dark.javaHarness.config.ContextBudgetProperties budgets =
+                new com.dark.javaHarness.config.ContextBudgetProperties();
+        budgets.setOrchestrationBudget(1);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments,
+                null, null, budgets);
+
+        String reply = agent.execute(new Goal("gover1", "调研竞品并输出报告"));
+
+        // 编排正常终态：聚合产出最终回答（非 FAILED、非「未生成最终回答」兜底）
+        assertEquals(fixedContent(), reply, "熔断后聚合节点应照常执行并产出最终回答");
+        // lead(1) + 聚合(1) = 2 次流式调用；2 个子任务全部熔断（mock 零交互）
+        verify(requestSpec, org.mockito.Mockito.times(2)).stream();
+        // 聚合 prompt 前置降级说明（最后一次 user 调用）：跳过数 + 消耗数字 + 估算口径
+        org.mockito.ArgumentCaptor<String> userCaptor =
+                org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(requestSpec, atLeastOnce()).user(userCaptor.capture());
+        String aggPrompt = userCaptor.getAllValues().get(userCaptor.getAllValues().size() - 1);
+        assertTrue(aggPrompt.contains("预算降级说明"), "聚合 prompt 应前置降级说明: " + aggPrompt);
+        assertTrue(aggPrompt.contains("2 个子任务因预算超限未执行"),
+                "降级说明应含跳过子任务数: " + aggPrompt);
+        assertTrue(aggPrompt.contains("已消耗") && aggPrompt.contains("上限"),
+                "降级说明应含已消耗/上限数字: " + aggPrompt);
+        assertTrue(aggPrompt.contains("估算"), "降级说明应注明消耗口径（无 usage 回包按估算）: " + aggPrompt);
+    }
+
+    /** 未超限（预算宽裕）：子任务全部执行、行为与现状一致、聚合 prompt 无降级说明 */
+    @Test
+    void execute_withinBudget_allSubtasksRun_noDegradation() {
+        stubChat(fixedContent());
+        com.dark.javaHarness.config.ContextBudgetProperties budgets =
+                new com.dark.javaHarness.config.ContextBudgetProperties();
+        budgets.setOrchestrationBudget(60000);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments,
+                null, null, budgets);
+
+        String reply = agent.execute(new Goal("gover2", "调研竞品并输出报告"));
+
+        assertEquals(fixedContent(), reply);
+        // lead(1) + 2 子任务 + 聚合 = 4 次调用（子任务全部执行，零熔断）
+        verify(requestSpec, org.mockito.Mockito.times(4)).stream();
+        org.mockito.ArgumentCaptor<String> userCaptor =
+                org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(requestSpec, atLeastOnce()).user(userCaptor.capture());
+        String aggPrompt = userCaptor.getAllValues().get(userCaptor.getAllValues().size() - 1);
+        assertFalse(aggPrompt.contains("预算降级说明"),
+                "未超限时聚合 prompt 不得含降级说明: " + aggPrompt);
+    }
+
+    /** 流式路径熔断：行为与同步路径一致，聚合 token 旁路照常推流收尾 */
+    @Test
+    void executeStreamReactive_overBudget_skipsSubtasks_aggregatesWithDegradationNote() {
+        stubChat(fixedContent());
+        com.dark.javaHarness.config.ContextBudgetProperties budgets =
+                new com.dark.javaHarness.config.ContextBudgetProperties();
+        budgets.setOrchestrationBudget(1);
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments,
+                null, null, budgets);
+
+        java.util.List<String> rows = agent
+                .executeStreamReactive(new Goal("gover3", "调研竞品并输出报告"))
+                .collectList()
+                .block(java.time.Duration.ofSeconds(10));
+
+        assertNotNull(rows);
+        assertEquals(fixedContent(), rows.get(rows.size() - 1), "流式熔断后聚合应照常推流最终回答");
+        // lead(1) + 聚合流式(1) = 2 次；子任务零调用
+        verify(requestSpec, org.mockito.Mockito.times(2)).stream();
+        org.mockito.ArgumentCaptor<String> userCaptor =
+                org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(requestSpec, atLeastOnce()).user(userCaptor.capture());
+        String aggPrompt = userCaptor.getAllValues().get(userCaptor.getAllValues().size() - 1);
+        assertTrue(aggPrompt.contains("预算降级说明"), "聚合 prompt 应前置降级说明: " + aggPrompt);
+        assertTrue(aggPrompt.contains("2 个子任务因预算超限未执行"),
+                "降级说明应含跳过子任务数: " + aggPrompt);
+    }
+
+    /**
+     * 真实部分跳过（C1 方向 b + I2 场景）：熔断下沉到 caller 后，共享账本在每轮 LLM roundtrip
+     * 上增量记账并复检——lead + 前序子任务累计消耗后超限，后续子任务熔断跳过，而前序子任务
+     * 的真实结果保留进聚合。限并发=1 使子任务错峰串行，跳过数确定（与执行次序无关：
+     * 各子任务消耗相同 → 恰好 1 个成功、其余熔断跳过）。
+     *
+     * <p>消耗编排：budget=200；lead usage=50（账本 50）→ 子任务 A usage=100（账本 150，放行）
+     * → 子任务 B usage=100（入账后 250 ≥ 200，usage 帧上断流熔断）→ 子任务 C/D 预检拒绝。
+     */
+    @Test
+    void execute_partialBudgetExhaustion_skipsOnlyRemainingSubtasks() {
+        com.dark.javaHarness.config.ContextBudgetProperties budgets =
+                new com.dark.javaHarness.config.ContextBudgetProperties();
+        budgets.setOrchestrationBudget(200);
+        budgets.setSubtaskConcurrency(1);
+        when(clientRegistry.get(any())).thenReturn(chatClient);
+        when(agentService.getAgentConfig(any())).thenReturn(java.util.Optional.empty());
+        lenient().when(toolAssignments.forAgent(any())).thenReturn(ToolAssignments.ToolSet.EMPTY);
+        when(chatClient.prompt()).thenReturn(requestSpec);
+        when(requestSpec.system(anyString())).thenReturn(requestSpec);
+        when(requestSpec.user(anyString())).thenReturn(requestSpec);
+        when(requestSpec.stream()).thenReturn(streamSpec);
+        // 调用序列（限并发串行）：lead → 子任务A（放行）→ 子任务B（usage 帧熔断）→ 聚合；
+        // 子任务 C/D 预检拒绝零 HTTP，不再消耗流桩
+        when(streamSpec.chatResponse()).thenReturn(
+                fluxWithUsage(50, "{\"subtasks\":[\"任务一\",\"任务二\",\"任务三\",\"任务四\"]}"),
+                fluxWithUsage(100, "子任务结果"),
+                fluxWithUsage(100, "子任务结果"),
+                fluxOf("最终回答"));
+        agent = new MultiAgentGraphAgent("multi-agent", clientRegistry, agentService, toolAssignments,
+                null, null, budgets);
+
+        String reply = agent.execute(new Goal("gpart1", "调研竞品并输出报告"));
+
+        assertEquals("最终回答", reply, "部分熔断后聚合应照常产出最终回答");
+        // lead(1) + 子任务A(1) + 子任务B(1，中途断流) + 聚合(1) = 4 次 HTTP
+        verify(requestSpec, org.mockito.Mockito.times(4)).stream();
+        // 聚合 prompt：前置降级说明（1 个跳过）+ 前序子任务真实结果保留
+        org.mockito.ArgumentCaptor<String> userCaptor =
+                org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(requestSpec, atLeastOnce()).user(userCaptor.capture());
+        String aggPrompt = userCaptor.getAllValues().get(userCaptor.getAllValues().size() - 1);
+        assertTrue(aggPrompt.contains("预算降级说明"), "聚合 prompt 应前置降级说明: " + aggPrompt);
+        assertTrue(aggPrompt.contains("3 个子任务因预算超限未执行"),
+                "降级说明应含部分跳过数（1 个真实执行，其余 3 个熔断跳过）: " + aggPrompt);
+        assertTrue(aggPrompt.contains("【子任务1】") && aggPrompt.contains("子任务结果"),
+                "前序子任务的真实结果应保留进聚合: " + aggPrompt);
+    }
+
+    /** 文本 token + 末帧 usage（total 为该轮完整 prompt+completion 的累计口径）→ ChatResponse 流 */
+    private static Flux<ChatResponse> fluxWithUsage(int total, String... tokens) {
+        java.util.List<ChatResponse> frames = new java.util.ArrayList<>();
+        for (String t : tokens) {
+            frames.add(new ChatResponse(List.of(new Generation(new AssistantMessage(t)))));
+        }
+        frames.add(new ChatResponse(List.of(),
+                org.springframework.ai.chat.metadata.ChatResponseMetadata.builder()
+                        .usage(new org.springframework.ai.chat.metadata.DefaultUsage(
+                                total / 2, total - total / 2, total))
+                        .build()));
+        return Flux.fromIterable(frames);
+    }
 }
