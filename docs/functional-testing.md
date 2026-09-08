@@ -55,13 +55,13 @@
 
 ```bash
 # 全量
-mvnw.cmd test
+mvn -s .mvn/settings.xml test
 
 # 单个测试类
-mvnw.cmd test -Dtest=MultiAgentGraphAgentTest
+mvn -s .mvn/settings.xml test -Dtest=MultiAgentGraphAgentTest
 
 # 单个用例
-mvnw.cmd test -Dtest=ChatServiceImplTest#streamReactive_shouldMapProgressRowToProgressEvent
+mvn -s .mvn/settings.xml test -Dtest=ChatServiceImplTest#streamReactive_shouldMapProgressRowToProgressEvent
 ```
 
 IDEA 中直接点测试方法旁的绿色按钮即可；报告输出在 `target/surefire-reports/`。
