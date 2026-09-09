@@ -200,6 +200,7 @@ final class AgentChatCaller {
     /**
      * 全参构造（含 skill 装配）：skillManager 为 null 时不注册 load_skill 元工具
      * （单测/旧构造链场景）；正式装配由 MultiAgentGraphAgent 透传共享实例。
+     * knowledgeRetriever 为 null 时零行为变化（知识库禁用/单测场景）。
      */
     AgentChatCaller(ChatClientRegistry clientRegistry,
                     AgentService agentService,
@@ -211,6 +212,25 @@ final class AgentChatCaller {
                     SessionService memoryStore,
                     ToolLazyManager lazyTools,
                     SkillManager skillManager) {
+        this(clientRegistry, agentService, toolAssignments, recorder, retry, budgets,
+                promptAssembler, memoryStore, lazyTools, skillManager, null);
+    }
+
+    /**
+     * 全参构造（含 skill 装配与 RAG 知识检索）：knowledgeRetriever 仅知识库启用时非 null
+     * （MultiAgentGraphAgent 经 ObjectProvider 传入），null 时无知识段注入、行为退化现状。
+     */
+    AgentChatCaller(ChatClientRegistry clientRegistry,
+                    AgentService agentService,
+                    ToolAssignments toolAssignments,
+                    LlmCallRecorder recorder,
+                    LlmRetry retry,
+                    ContextBudgetProperties budgets,
+                    PromptAssembler promptAssembler,
+                    SessionService memoryStore,
+                    ToolLazyManager lazyTools,
+                    SkillManager skillManager,
+                    com.dark.javaHarness.knowledge.KnowledgeRetriever knowledgeRetriever) {
         this.clientRegistry = clientRegistry;
         this.agentService = agentService;
         this.toolAssignments = toolAssignments;
@@ -222,7 +242,8 @@ final class AgentChatCaller {
         this.retry = retry;
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
         this.specFactory = new AgentRequestSpecFactory(clientRegistry, promptAssembler,
-                toolAssignments, this.lazyTools, skillManager, memoryStore, this.budgets);
+                toolAssignments, this.lazyTools, skillManager, memoryStore, this.budgets,
+                knowledgeRetriever);
     }
 
     /** 带会话观测的单次调用（推荐入口：sessionId 用于 llm_call_log 归因） */

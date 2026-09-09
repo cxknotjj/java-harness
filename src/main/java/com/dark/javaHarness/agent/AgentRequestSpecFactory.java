@@ -4,6 +4,7 @@ import com.dark.javaHarness.advisor.ContextAssemblingAdvisor;
 import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
+import com.dark.javaHarness.knowledge.KnowledgeRetriever;
 import com.dark.javaHarness.prompt.PromptAssembler;
 import com.dark.javaHarness.prompt.SkillManager;
 import com.dark.javaHarness.prompt.ToolLazyManager;
@@ -60,6 +61,8 @@ final class AgentRequestSpecFactory {
     private final SkillManager skillManager;
     private final SessionService memoryStore;
     private final ContextBudgetProperties budgets;
+    /** 知识检索器（RAG 注入面）；null 时零行为变化（知识库禁用/单测场景，沿用 skillManager==null 约定） */
+    private final KnowledgeRetriever knowledgeRetriever;
 
     AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
                             PromptAssembler promptAssembler,
@@ -68,6 +71,18 @@ final class AgentRequestSpecFactory {
                             SkillManager skillManager,
                             SessionService memoryStore,
                             ContextBudgetProperties budgets) {
+        this(clientRegistry, promptAssembler, toolAssignments, lazyTools, skillManager,
+                memoryStore, budgets, null);
+    }
+
+    AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
+                            PromptAssembler promptAssembler,
+                            ToolAssignments toolAssignments,
+                            ToolLazyManager lazyTools,
+                            SkillManager skillManager,
+                            SessionService memoryStore,
+                            ContextBudgetProperties budgets,
+                            KnowledgeRetriever knowledgeRetriever) {
         this.clientRegistry = clientRegistry;
         this.promptAssembler = promptAssembler;
         this.toolAssignments = toolAssignments;
@@ -75,6 +90,7 @@ final class AgentRequestSpecFactory {
         this.skillManager = skillManager;
         this.memoryStore = memoryStore;
         this.budgets = budgets;
+        this.knowledgeRetriever = knowledgeRetriever;
     }
 
     /** 组装请求（取客户端 → system 按段组装 → 记忆只读注入 → 请求级 advisor → 选项 → 工具注入） */
@@ -86,9 +102,18 @@ final class AgentRequestSpecFactory {
         String model = config != null ? config.model() : null;
         ChatClient client = clientRegistry.get(modelProviderId);
         // system 经 PromptAssembler 按段组装：角色段（表 prompt > 兜底指令 > 默认）+ 索引/纪律/约定等段；
-        // 兜底角色指令收敛为角色段兜底，不再拼进 user
+        // 兜底角色指令收敛为角色段兜底，不再拼进 user。
+        // 知识检索（RAG）：按当前 user 文本检索知识库，命中则追加【出处N】知识段——
+        // retriever 为 null（禁用/单测）或无命中时原样，退化现状；aggregator 角色策略跳过
+        String system = promptAssembler.assemble(forAgent, fallbackSystem);
+        if (knowledgeRetriever != null) {
+            String knowledgeBlock = knowledgeRetriever.buildKnowledgeBlock(forAgent, sessionId, user);
+            if (knowledgeBlock != null && !knowledgeBlock.isBlank()) {
+                system = system + "\n\n" + knowledgeBlock;
+            }
+        }
         ChatClient.ChatClientRequestSpec spec = client.prompt()
-                .system(promptAssembler.assemble(forAgent, fallbackSystem))
+                .system(system)
                 .user(user);
         // 记忆注入（只读，注入条件由调用方判定）：手动加载历史拼进请求消息，不挂
         // MessageChatMemoryAdvisor——该 advisor 会自动写回（before 写 user、after 写 assistant），

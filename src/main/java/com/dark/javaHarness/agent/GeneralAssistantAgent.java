@@ -101,6 +101,7 @@ public class GeneralAssistantAgent implements Agent {
      * 全参构造（含 skill 装配）：promptAssembler/skillManager 为 null 时内部裸构建
      * （旧构造链/单测场景，无 skill 段、不注册 load_skill）；正式装配由 ChatAgentConfig/
      * AgentRegistry 注入共享实例（skill 段提供者与 toolLazyManager 开关对齐）。
+     * knowledgeRetriever 为 null 时零行为变化（知识库禁用/单测场景）。
      */
     public GeneralAssistantAgent(String agentName,
                                  ChatClientRegistry clientRegistry,
@@ -112,6 +113,25 @@ public class GeneralAssistantAgent implements Agent {
                                  ToolLazyManager lazyTools,
                                  PromptAssembler promptAssembler,
                                  SkillManager skillManager) {
+        this(agentName, clientRegistry, memoryStore, agentService, toolAssignments,
+                recorder, budgets, lazyTools, promptAssembler, skillManager, null);
+    }
+
+    /**
+     * 全参构造（含 skill 装配与 RAG 知识检索）：knowledgeRetriever 仅知识库启用时非 null
+     * （AgentRegistry 经 ObjectProvider 注入），null 时无知识段注入、行为退化现状。
+     */
+    public GeneralAssistantAgent(String agentName,
+                                 ChatClientRegistry clientRegistry,
+                                 SessionService memoryStore,
+                                 AgentService agentService,
+                                 ToolAssignments toolAssignments,
+                                 LlmCallRecorder recorder,
+                                 com.dark.javaHarness.config.ContextBudgetProperties budgets,
+                                 ToolLazyManager lazyTools,
+                                 PromptAssembler promptAssembler,
+                                 SkillManager skillManager,
+                                 com.dark.javaHarness.knowledge.KnowledgeRetriever knowledgeRetriever) {
         this.agentName = agentName;
         this.clientRegistry = clientRegistry;
         this.memoryStore = memoryStore;
@@ -130,7 +150,8 @@ public class GeneralAssistantAgent implements Agent {
         this.maxTokensFinal = effectiveBudgets.getMaxTokensFinal();
         this.retry = new LlmRetry();
         this.specFactory = new AgentRequestSpecFactory(clientRegistry, this.promptAssembler,
-                toolAssignments, this.lazyTools, skillManager, memoryStore, effectiveBudgets);
+                toolAssignments, this.lazyTools, skillManager, memoryStore, effectiveBudgets,
+                knowledgeRetriever);
     }
 
     /** 返回 Agent 名称（用于注册与路由） */

@@ -4,6 +4,7 @@ import com.dark.javaHarness.cli.api.ChatApiClient;
 import com.dark.javaHarness.cli.input.TerminalInput;
 import com.dark.javaHarness.cli.render.TerminalRenderer;
 import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.KnowledgeSource;
 import com.dark.javaHarness.domain.dto.ProviderAddResult;
 import com.dark.javaHarness.domain.dto.ProviderRowView;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -366,6 +367,19 @@ public class ChatCli {
                     (resp.error() == null ? "（无详细信息）" : resp.error()));
             if (ok) {
                 ui.println("\033[90m（会话 " + sessionId + " / " + goalId + "）\033[0m");
+                // RAG 知识出处尾注（meta.sources：本次会话最近一次知识命中的文档；无命中不打印）
+                List<KnowledgeSource> sources = resp.sources();
+                if (sources != null && !sources.isEmpty()) {
+                    StringBuilder sb = new StringBuilder("\033[90m来源: ");
+                    for (int i = 0; i < sources.size(); i++) {
+                        if (i > 0) {
+                            sb.append(" · ");
+                        }
+                        KnowledgeSource s = sources.get(i);
+                        sb.append("【出处").append(i + 1).append("】").append(s.docName());
+                    }
+                    ui.println(sb.append("\033[0m").toString());
+                }
             }
         } catch (ConnectException e) {
             renderer.endTurn(false, "无法连接主服务 " + baseUrl);

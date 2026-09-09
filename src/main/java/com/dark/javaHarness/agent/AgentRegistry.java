@@ -50,6 +50,8 @@ public class AgentRegistry {
     private final PromptAssembler promptAssembler;
     /** skill 装配管理器（load_skill 元工具来源）；null 时不注册元工具（测试场景） */
     private final SkillManager skillManager;
+    /** 知识检索器（RAG 注入面）；null 时零行为变化（知识库禁用/测试场景） */
+    private final com.dark.javaHarness.knowledge.KnowledgeRetriever knowledgeRetriever;
 
     /** 已注册路由表（agentName → 实例）；computeIfAbsent 保证并发惰性注册单次构造 */
     private final ConcurrentHashMap<String, Agent> agents = new ConcurrentHashMap<>();
@@ -78,6 +80,22 @@ public class AgentRegistry {
                          ToolLazyManager lazyTools,
                          PromptAssembler promptAssembler,
                          SkillManager skillManager) {
+        this(provider, agentServiceProvider, clientRegistry, memoryStore, toolAssignments,
+                recorder, budgets, lazyTools, promptAssembler, skillManager, null);
+    }
+
+    /** 全参构造（含 RAG 知识检索）：knowledgeRetriever 仅知识库启用时非 null（ChatAgentConfig 经 ObjectProvider 注入） */
+    public AgentRegistry(AgentConfigProvider provider,
+                         ObjectProvider<AgentService> agentServiceProvider,
+                         ChatClientRegistry clientRegistry,
+                         SessionService memoryStore,
+                         ToolAssignments toolAssignments,
+                         LlmCallRecorder recorder,
+                         ContextBudgetProperties budgets,
+                         ToolLazyManager lazyTools,
+                         PromptAssembler promptAssembler,
+                         SkillManager skillManager,
+                         com.dark.javaHarness.knowledge.KnowledgeRetriever knowledgeRetriever) {
         this.provider = provider;
         this.agentServiceProvider = agentServiceProvider;
         this.clientRegistry = clientRegistry;
@@ -88,6 +106,7 @@ public class AgentRegistry {
         this.lazyTools = lazyTools;
         this.promptAssembler = promptAssembler;
         this.skillManager = skillManager;
+        this.knowledgeRetriever = knowledgeRetriever;
     }
 
     /** 启动注册：注册 agent 表全部对话 Agent 行（is_internal=0），逐行容错；general 行缺失时代码兜底注册。 */
@@ -156,7 +175,7 @@ public class AgentRegistry {
     private Agent createGeneralAssistant(String agentName) {
         return new GeneralAssistantAgent(agentName, clientRegistry, memoryStore,
                 agentServiceProvider.getObject(), toolAssignments, recorder, budgets, lazyTools,
-                promptAssembler, skillManager);
+                promptAssembler, skillManager, knowledgeRetriever);
     }
 
     /** 统一「未知 Agent」文案：含可用列表，不泄漏底层异常。 */

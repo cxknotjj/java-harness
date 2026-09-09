@@ -83,10 +83,11 @@ public class ChatAgentConfig {
                                        ToolLazyManager toolLazyManager,
                                        PromptAssembler promptAssembler,
                                        SkillManager skillManager,
-                                       MultiAgentGraphAgent multiAgent) {
+                                       MultiAgentGraphAgent multiAgent,
+                                       ObjectProvider<com.dark.javaHarness.knowledge.KnowledgeRetriever> knowledgeRetriever) {
         AgentRegistry agentRegistry = new AgentRegistry(agentConfigProvider, agentService, registry,
                 memoryStore, toolAssignments, recorder, budgets, toolLazyManager,
-                promptAssembler, skillManager);
+                promptAssembler, skillManager, knowledgeRetriever.getIfAvailable());
         agentRegistry.register(multiAgent);
         agentRegistry.init();
         return agentRegistry;
@@ -106,7 +107,7 @@ public class ChatAgentConfig {
                 .build();
     }
 
-    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合），带 MySQL 检查点与静态 prompt 预算；memoryStore 与 GeneralAssistantAgent 同源，lead 拆解据此注入会话记忆；toolLazyManager 与路径 A 共享（会话展开集跨路径通用）；promptAssembler/skillManager 共享实例（skill 索引段与 load_skill 跨路径一致） */
+    /** 复杂路径执行体：多 Agent 编排（lead 拆解 → 并行子任务 → 聚合），带 MySQL 检查点与静态 prompt 预算；memoryStore 与 GeneralAssistantAgent 同源，lead 拆解据此注入会话记忆；toolLazyManager 与路径 A 共享（会话展开集跨路径通用）；promptAssembler/skillManager 共享实例（skill 索引段与 load_skill 跨路径一致）；knowledgeRetriever 仅知识库启用时非 null（getIfAvailable 惰性解析，禁用时编排退化为无知识段） */
     @Bean
     public MultiAgentGraphAgent multiAgent(ChatClientRegistry registry,
                                            @Lazy AgentService agentService,
@@ -117,9 +118,10 @@ public class ChatAgentConfig {
                                            com.dark.javaHarness.config.ContextBudgetProperties budgets,
                                            ToolLazyManager toolLazyManager,
                                            PromptAssembler promptAssembler,
-                                           SkillManager skillManager) {
+                                           SkillManager skillManager,
+                                           ObjectProvider<com.dark.javaHarness.knowledge.KnowledgeRetriever> knowledgeRetriever) {
         return new MultiAgentGraphAgent(AgentConstants.MULTI_AGENT, registry, agentService,
                 toolAssignments, recorder, graphCheckpointSaver, budgets, memoryStore,
-                toolLazyManager, promptAssembler, skillManager);
+                toolLazyManager, promptAssembler, skillManager, knowledgeRetriever.getIfAvailable());
     }
 }

@@ -178,6 +178,7 @@ public class MultiAgentGraphAgent implements Agent {
      * 全参构造（含 skill 装配）：promptAssembler/skillManager 为 null 时内部裸构建
      * （旧构造链/单测场景，无 skill 段、不注册 load_skill）；正式装配由 ChatAgentConfig
      * 注入共享实例——编排三节点与路径 A 共用同一组装器与 skill 技能面。
+     * knowledgeRetriever 为 null 时零行为变化（知识库禁用/单测场景）。
      */
     public MultiAgentGraphAgent(String agentName,
                                 ChatClientRegistry clientRegistry,
@@ -190,13 +191,36 @@ public class MultiAgentGraphAgent implements Agent {
                                 ToolLazyManager lazyTools,
                                 PromptAssembler promptAssembler,
                                 SkillManager skillManager) {
+        this(agentName, clientRegistry, agentService, toolAssignments, recorder,
+                checkpointSaver, budgets, memoryStore, lazyTools, promptAssembler,
+                skillManager, null);
+    }
+
+    /**
+     * 全参构造（含 skill 装配与 RAG 知识检索）：knowledgeRetriever 仅知识库启用时非 null
+     * （ChatAgentConfig 经 ObjectProvider 注入），透传给编排调用器后 lead/各子任务按
+     * 各自 user 文本检索（aggregator 由检索器角色策略跳过）。
+     */
+    public MultiAgentGraphAgent(String agentName,
+                                ChatClientRegistry clientRegistry,
+                                AgentService agentService,
+                                ToolAssignments toolAssignments,
+                                LlmCallRecorder recorder,
+                                BaseCheckpointSaver checkpointSaver,
+                                ContextBudgetProperties budgets,
+                                SessionService memoryStore,
+                                ToolLazyManager lazyTools,
+                                PromptAssembler promptAssembler,
+                                SkillManager skillManager,
+                                com.dark.javaHarness.knowledge.KnowledgeRetriever knowledgeRetriever) {
         ToolLazyManager lazy = lazyTools != null ? lazyTools : new ToolLazyManager(toolAssignments, false);
         this.agentName = agentName;
         // 工具索引段与延迟加载同源：开启时索引段追加 expand_tool 使用引导（与轻量态工具面对齐）
         this.promptAssembler = promptAssembler != null ? promptAssembler
                 : new PromptAssembler(agentService, toolAssignments, List.of(), lazy.isEnabled());
         this.chatCaller = new AgentChatCaller(clientRegistry, agentService, toolAssignments, recorder,
-                new LlmRetry(), budgets, this.promptAssembler, memoryStore, lazy, skillManager);
+                new LlmRetry(), budgets, this.promptAssembler, memoryStore, lazy, skillManager,
+                knowledgeRetriever);
         this.checkpointSaver = checkpointSaver;
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
         this.orchestrationBudget = new OrchestrationBudget(this.budgets);

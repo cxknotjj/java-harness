@@ -5,6 +5,7 @@ import com.dark.javaHarness.domain.Goal;
 import com.dark.javaHarness.domain.RouteDecision;
 import com.dark.javaHarness.domain.dto.ChatRequest;
 import com.dark.javaHarness.domain.dto.ChatResponse;
+import com.dark.javaHarness.domain.dto.KnowledgeSource;
 import com.dark.javaHarness.domain.dto.SseMeta;
 import com.dark.javaHarness.enums.AgentConstants;
 import com.dark.javaHarness.enums.GoalStatus;
@@ -17,6 +18,7 @@ import com.dark.javaHarness.service.GoalService;
 import com.dark.javaHarness.service.RouteJudge;
 import com.dark.javaHarness.service.SessionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -44,13 +46,24 @@ public class ChatServiceImpl implements ChatService {
     private final SessionService sessionService;
     private final RouteJudge routeJudge;
     private final GoalService goalService;
+    /** 知识检索器（RAG 出处透出源）；null 时 meta.sources 恒空（知识库禁用场景，Demo 规模 pragmatic 方案） */
+    private final com.dark.javaHarness.knowledge.KnowledgeRetriever knowledgeRetriever;
 
     public ChatServiceImpl(AgentService agentService, SessionService sessionService,
                            RouteJudge routeJudge, GoalService goalService) {
+        this(agentService, sessionService, routeJudge, goalService, null);
+    }
+
+    /** Spring 装配入口（多构造需显式标注）：knowledgeRetriever 仅知识库启用时非 null */
+    @org.springframework.beans.factory.annotation.Autowired
+    public ChatServiceImpl(AgentService agentService, SessionService sessionService,
+                           RouteJudge routeJudge, GoalService goalService,
+                           com.dark.javaHarness.knowledge.KnowledgeRetriever knowledgeRetriever) {
         this.agentService = agentService;
         this.sessionService = sessionService;
         this.routeJudge = routeJudge;
         this.goalService = goalService;
+        this.knowledgeRetriever = knowledgeRetriever;
     }
 
     private static final Logger log = LoggerFactory.getLogger(ChatServiceImpl.class);
@@ -75,7 +88,8 @@ public class ChatServiceImpl implements ChatService {
         if (goal.status() == GoalStatus.FAILED) {
             return ChatResponse.failure(sessionId, newSession, goal.id(), goal.summary());
         }
-        return ChatResponse.success(sessionId, newSession, goal.id(), goal.summary());
+        return ChatResponse.success(sessionId, newSession, goal.id(), goal.summary(),
+                recentKnowledgeSources(sessionId));
     }
 
     /** 同步执行成功后写回会话记忆 */
@@ -228,12 +242,21 @@ public class ChatServiceImpl implements ChatService {
 
     /** 组装 SSE meta 事件单元素块（event+data 同元素，保证成对不被交叉）：{@code event: meta\n data: {json}} */
     private Flux<String> metaEvent(String sessionId, boolean newSession, String goalId, String status, String error) {
-        SseMeta meta = new SseMeta(sessionId, newSession, goalId, status, error);
+        SseMeta meta = new SseMeta(sessionId, newSession, goalId, status, error, recentKnowledgeSources(sessionId));
         try {
             return Flux.just("event: " + SseProtocol.EVENT_META + "\ndata: " + OBJECT_MAPPER.writeValueAsString(meta));
         } catch (Exception e) {
             return Flux.just("event: " + SseProtocol.EVENT_META + "\ndata: {\"error\":\"meta serialization failed\"}");
         }
+    }
+
+    /** 本次会话最近一次知识命中的出处（RAG 出处透出；禁用/无命中返回 null，旧客户端兼容） */
+    private List<KnowledgeSource> recentKnowledgeSources(String sessionId) {
+        if (knowledgeRetriever == null) {
+            return null;
+        }
+        List<KnowledgeSource> sources = knowledgeRetriever.recentSources(sessionId);
+        return sources.isEmpty() ? null : sources;
     }
 
     /** 安全取异常信息，避免 getMessage 为空导致行文本不规范；换行替换为空格避免破坏逐行解析 */
