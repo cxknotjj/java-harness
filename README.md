@@ -52,6 +52,7 @@
 | 💾 | **会话记忆** | 多轮上下文自动组装：过滤 / token 预算截断 / 角色归一化 |
 | 🔁 | **断点续跑** | graph-core 检查点落库（MySQL），长编排中断后 `/resume` 从断点继续，已完成节点不重跑 |
 | 🧮 | **调用观测** | 每次 LLM 调用落库：耗时 / token / 成败，可按会话查询 |
+| 📚 | **RAG 知识库** | knowledge/ 目录文档增量摄取（pgvector + DashScope 嵌入），路径 A/B 回答前检索注入，带【出处N】内联引用与来源尾注；PG 未就绪不影响启动 |
 | 🖥️ | **Claude Code 风格 CLI** | spinner 原位刷新、工具调用行、回合小结，终端体验对标 Claude Code |
 
 ## 🏗️ 架构总览
@@ -84,6 +85,8 @@ flowchart TD
 | 🤖 AI 接入 | Spring AI 1.1.4 + `spring-ai-starter-model-openai` | OpenAI 兼容协议接入多服务商（DashScope / DeepSeek），`Registry` 模式按 model 路由 |
 | 🕸️ Graph 编排 | `spring-ai-alibaba-graph-core` 1.1.2.2 | StateGraph 多 Agent 编排 + 生命周期钩子进度推送 + 检查点断点续跑 |
 | 📦 沙箱 | `spring-ai-alibaba-sandbox` 1.1.2.2 | 容器级工具执行隔离（agentscope-runtime）：Python/Shell/文件 + 浏览器，需本机 Docker |
+| 🔌 MCP | `spring-ai-starter-mcp-client` + `server-webmvc`（SDK 锁定 0.17.0） | client 多 server 接入外部工具（懒连接 + 失败隔离）；server 以 Streamable-HTTP 暴露 `/mcp` 端点 |
+| 📚 RAG | `spring-ai-pgvector-store` + PostgreSQL（pgvector）+ DashScope text-embedding-v4 | 知识库向量检索：增量摄取 + 路径 A/B 检索增强（可选依赖，PG 未就绪不影响启动） |
 | 🗄️ ORM | MyBatis-Plus 3.5.7 | `goal` / `session` / `session_messages` / `agent` / `model_provider` 等 CRUD |
 | 🛫 Schema | Flyway | 启动自动执行迁移脚本，无需手动建表 |
 | 🖥️ CLI | 自研 `ChatCli` + OkHttp 4.12 | 独立进程纯 HTTP 客户端，SSE 解析 + 终端渲染 |
@@ -100,6 +103,7 @@ flowchart TD
 | 🛠️ Maven | ✅ | 3.8+（项目自带 settings，无需全局额外配置） |
 | 🗄️ MySQL | ✅ | `harness` 库，Flyway 启动自动建表 |
 | 🐳 Docker Desktop | ⚠️ 沙箱必需 | Python/Shell/浏览器工具的容器隔离；无 Docker 时仅沙箱类工具不可用，其余功能正常（需预拉取镜像，见 `docs/TECH_STACK.md`） |
+| 🐘 PostgreSQL（pgvector） | 🔄 可选 | 仅 RAG 知识库使用：需启用 vector 扩展；未安装/未配置时应用照常启动，知识面为空 |
 | 🔑 API Key | 🔄 可选 | DashScope（通义千问）/ DeepSeek；不配置可启动，调用模型会返回 `invalid_api_key` |
 
 ### ⚡ 一键启动
@@ -180,13 +184,30 @@ CLI 是纯 HTTP 客户端（**不监听任何端口**），通过 REST 调用主
 | `POST` | `/api/harness/submit?agent=general&objective=...` | 📤 提交一个异步目标 |
 | `POST` | `/api/harness/sessions` | 🆕 新建会话（可选 `name`），返回 sessionId/name |
 | `GET` | `/api/llm-calls?sessionId=&limit=` | 🧮 LLM 调用观测：耗时 / token / 成败（默认 50 条） |
+| `POST` | `/api/knowledge/sync` | 📚 知识库增量摄取：扫描 knowledge/ 目录，mtime 变更文档重嵌入 |
+| `GET` | `/api/knowledge/documents?page=&size=` | 📚 知识库摄取台账分页 |
+| `GET` | `/api/knowledge/search?q=` | 📚 调试检索：向量检索命中片段与相关度（不注入 prompt） |
+| `DELETE` | `/api/knowledge/documents/{name}` | 📚 删除指定知识文档（向量 chunk + 台账） |
 
 > [!NOTE]
 > `agentId` 可选（对应 agent 表主键）：为空走默认 Agent（general）。
+> 知识库端点需 `app.knowledge.enabled=true`（默认 true）且配置好 pgvector/嵌入端点；未启用时返回 503。
+
+### 📚 知识库问答（RAG）
+
+把文档放进 `knowledge/` 目录（`.md` / `.txt`，支持 front-matter `title:`），摄取后路径 A/B 回答自动检索注入：
+
+```bash
+mkdir -p knowledge && cp 你的文档.md knowledge/
+curl -X POST http://localhost:8080/api/knowledge/sync          # 增量摄取（只处理 mtime 变更的文档）
+curl 'http://localhost:8080/api/knowledge/search?q=部署步骤'     # 调试检索看命中
+```
+
+回答中出现 `【出处N】` 内联引用时，CLI 回合末尾会打印「来源:」尾注；`meta.sources` / `ChatResponse.sources` 携带结构化出处（文档名/标题/相关度）。配置（top-k / 相似度阈值 / 注入预算等）见 `application.yaml` 的 `app.knowledge.*`。
 
 ## 📡 SSE 流式协议
 
-响应 `Content-Type: text/event-stream`，事件流示例：
+响应 `Content-Type: text/plain`（SSE 风格行协议，每个 Flux 元素独占一行，`event:` + `data:` 成对），事件流示例：
 
 ```text
 event: progress
@@ -207,7 +228,7 @@ data: {"sessionId":"9","newSession":true,"goalId":null,"status":"SUCCEEDED","err
 |---|---|
 | 📺 `event: token` | 模型生成的文本片段（逐 token 推送；行内换行已转义保证单行完整） |
 | 📣 `event: progress` | 编排各阶段实时进度（编排/拆解/子任务完成/聚合），**不计入会话记忆** |
-| 🏷️ `event: meta` | 回合末尾的会话信息：`sessionId` / `newSession` / `goalId` / `status`；失败时 `status=FAILED` 且追加 `error` |
+| 🏷️ `event: meta` | 回合末尾的会话信息：`sessionId` / `newSession` / `goalId` / `status`；失败时 `status=FAILED` 且追加 `error`；知识命中时携带 `sources`（文档名/标题/相关度） |
 | ⚠️ `event: error` | 流内错误信息 |
 
 > [!IMPORTANT]
@@ -277,33 +298,36 @@ flowchart LR
 src/main/java/com/dark/javaHarness/
 ├── JavaHarnessApplication.java   # Spring Boot 启动类（@MapperScan 指向 mapper 包）
 ├── controller/                   # 表现层：REST 接口 + SSE 流式
-│   ├── ChatController.java       # 聊天接口（/api/chat、/api/chat/stream、/api/chat/resume）
-│   ├── HarnessController.java    # 管理接口（agents / submit / goals / sessions）
+│   ├── ChatController.java       # 聊天接口（/api/chat、/stream、/resume、/goal-status）
+│   ├── HarnessController.java    # 管理接口（agents / submit / goals / sessions / 会话绑定 Agent）
+│   ├── ProviderAdminController.java  # 模型映射管理（/api/providers 查看与热刷新新增）
 │   └── LlmCallController.java    # LLM 调用观测查询（/api/llm-calls）
-├── service/                      # 业务层（接口）
-│   ├── AgentService.java         # Agent 编排：路由、执行目标、回写状态
-│   ├── GoalService.java          # 目标生命周期管理
-│   ├── SessionService.java       # 多轮会话记忆（session + session_messages）
-│   ├── ChatService.java          # 聊天用例编排（同步 / 流式 / SSE / 断点续跑）
+├── service/                      # 业务层（接口 + impl/ 实现）
+│   ├── AgentService / GoalService / SessionService / ChatService  # 编排、目标、会话记忆、聊天用例
 │   ├── RouteJudge.java           # 主 Agent 路由判断（SIMPLE / COMPLEX 分流）
 │   ├── AgentConfigProvider.java  # 从 agent 表读取运行配置（路由映射）
-│   └── impl/                     # 业务实现（AgentServiceImpl / ChatServiceImpl / LlmRouteJudge / LlmCallRecorder 等）
+│   ├── ProviderAdminService.java # model_provider 映射管理（新增即热刷新注册表）
+│   └── impl/                     # AgentServiceImpl / ChatServiceImpl / LlmRouteJudge / LlmCallRecorder 等
 ├── advisor/                      # Spring AI Advisor 拦截器（Agent 流程横切管理）
-│   ├── ContextAssemblingAdvisor.java  # 上下文组装：过滤/截断/role 归一化（token 预算）
+│   ├── ContextAssemblingAdvisor.java  # 上下文组装：过滤/token 预算截断/role 归一化
 │   └── PromptBudgetAdvisor.java  # Prompt 分段预算（历史/user/工具结果三段裁剪）
 ├── config/                       # 应用配置
 │   ├── GoalExecutorConfig.java   # 执行线程池：goal-exec- 后台 Goal 池 + mvc-async- MVC 异步槽位
-│   ├── ContextBudgetProperties.java  # token 预算配置（app.context.*）
+│   ├── ContextBudgetProperties.java  # 上下文预算统一配置（app.context.*，yaml 为唯一数值源）
+│   ├── KnowledgeProperties.java  # RAG 知识库配置载体（app.knowledge.*）
+│   ├── KnowledgeConfig.java      # 知识库装配：向量库数据源/嵌入模型/PgVectorStore（条件装配+懒连接）
+│   ├── PrimaryDataSourceConfig.java  # 主库（MySQL）显式声明（@Primary，多数据源下 Flyway/MyBatis 归属）
 │   ├── MybatisPlusConfig.java    # MyBatis-Plus 分页等配置
 │   └── agent/                    # Agent 配置与装配
 │       ├── ChatAgentConfig.java  # 注册各 Agent bean + graph-core 检查点存储器（MysqlSaver）
 │       ├── ChatClientFactory.java    # 按服务商构建 OpenAI 兼容 ChatClient（Registry 模式）
-│       ├── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（从 model_provider 表加载）
+│       ├── ChatClientRegistry.java   # 模型名 → ChatClient 注册表（支持热刷新）
 │       └── ThinkingSwitchChatModel.java  # 按 model_provider.disable_thinking 注入思考开关
 ├── prompt/                       # Prompt 组装管线（两路径统一）
 │   ├── PromptAssembler.java      # 五段式 system prompt 组装（角色/工具索引/纪律/输出约定/skill）
 │   ├── MemoryPolicy.java         # 会话记忆按角色注入矩阵
-│   ├── ToolLazyManager.java      # 工具 Schema 两段式延迟加载（轻量态 → expand_tool 展开）
+│   ├── SkillManager.java / SkillRepository.java  # Markdown 技能库动态装配（按需注入 system）
+│   ├── ToolLazyManager.java      # 工具 Schema 两段式延迟加载（轻量索引 → expand_tool 展开）
 │   └── PromptSection.java / SkillSectionProvider.java  # 段模型与 skill 扩展点
 ├── mapper/                       # 数据访问层：MyBatis-Plus Mapper
 │   └── AgentMapper / GoalMapper / SessionMapper / SessionMessageMapper / ModelProviderMapper / LlmCallLogMapper
@@ -316,22 +340,41 @@ src/main/java/com/dark/javaHarness/
 │   └── entity/                   # 数据库实体（对应 agent / goal / session / model_provider / llm_call_log 表）
 ├── enums/                        # 枚举与共享常量：GoalStatus、AgentConstants、SseProtocol
 ├── exception/                    # 全局异常处理（@RestControllerAdvice，统一 {code, message}）
-├── agent/                        # Agent 抽象与实现
-│   ├── Agent.java                # Agent 接口：name() / execute() / executeStreamReactive()
-│   ├── GeneralAssistantAgent.java  # 路径 A：单次调用大模型（同步 call() / 真·逐 token stream()）
-│   ├── MultiAgentGraphAgent.java   # 路径 B：StateGraph 编排（lead→并行子任务→聚合）+ 检查点断点续跑
-│   ├── AgentChatCaller.java        # LLM 单次调用封装（查表配置 → 取客户端 → 组装 → 工具注入）
+├── agent/                        # Agent 抽象、编排与 LLM 调用
+│   ├── Agent.java / AgentRegistry.java    # Agent 接口与注册表
+│   ├── GeneralAssistantAgent.java  # 路径 A：单模型对话（真·逐 token stream）
+│   ├── MultiAgentGraphAgent.java   # 路径 B：StateGraph 编排门面（lead→并行子任务→聚合 + 断点续跑）
+│   ├── AgentChatCaller.java        # LLM 调用封装（工具循环、幻觉工具容错、BudgetLedger 熔断记账）
+│   ├── AgentRequestSpecFactory.java  # 两路径共用请求组装工厂（system/记忆注入/工具装饰/输出档位）
+│   ├── LeadOutputParser.java       # lead 拆解 JSON 解析（子任务数 + 专家指派白名单）
+│   ├── OrchestrationBudget.java    # 编排预算账本（AtomicLong 共享记账 + 降级说明）
+│   ├── MultiAgentStreamPipeline.java  # 编排流式管道（进度行 → SSE 事件装配、续跑检查点选择）
 │   ├── BranchProgressListener.java # graph-core 生命周期钩子旁路（并行分支完成事件串行发射）
+│   ├── LlmRetry.java               # LLM 调用重试策略
 │   └── ProgressLine.java           # 进度行线协议（MARK+stage+SEP+detail）编解码
-├── cli/
-│   ├── ChatCli.java              # 命令行聊天客户端（独立进程，纯 HTTP 连 8080）
-│   ├── api/ChatApiClient.java    # OkHttp 封装 /api/chat 与 /api/chat/stream(SSE) / /api/chat/resume
-│   └── render/TerminalRenderer.java  # Claude Code 风格渲染：流式增量直出 + spinner 原位刷新 + 工具行
-└── tool/
-    ├── WebTools.java             # 网页抓取工具（fetchUrl：jsoup HTML5 解析 + 主内容提取 + Markdown 输出 + 内容缓存）
-    ├── DemoTools.java            # 示例工具集（时间 / 计算 / 天气）
+├── knowledge/                    # RAG 知识库
+│   ├── KnowledgeDocumentScanner.java  # 知识目录扫描（.md/.txt、front-matter 标题、坏文件跳过）
+│   ├── MarkdownChunker.java      # 段落感知切分（~700 字符 + 重叠，纯函数）
+│   ├── KnowledgeService(Impl).java  # 增量摄取（mtime 比对删旧写新）/ 删除 / 分页 / 检索
+│   └── KnowledgeRetriever.java   # 检索注入器：user 文本→top-k 命中→【出处N】知识段（预算截断）
+├── cli/                          # 命令行客户端（独立进程，纯 HTTP 连 8080）
+│   ├── ChatCli.java              # 门面：main / chatLoop / 命令分发 / 回合执行
+│   ├── ResumeStateStore.java     # /resume 续跑目标持久化（状态文件读写 + 宽容解析）
+│   ├── input/TerminalInput.java  # 终端输入层：JLine 历史/补全/粘贴；无 TTY 降级行式读取
+│   ├── api/ChatApiClient.java    # OkHttp 封装聊天/流式/续跑/供应商/会话接口（SSE 解析）
+│   └── render/                   # Claude Code 风格渲染
+│       ├── TerminalRenderer.java # 门面：流式增量直出 + spinner 折叠协作 + 工具调用行
+│       ├── MarkdownAnsiRenderer.java / Ansi.java  # Markdown 行级 ANSI 着色
+│       └── Spinner.java          # 阶段进度 spinner（原位刷新）
+└── tool/                         # 工具层
+    ├── WebTools.java             # 网页抓取门面（fetchUrl：抓取 + 30min 内容缓存 + 相关段落裁剪）
+    ├── HtmlToMarkdown.java / ContentRelevance.java  # 噪声剔除/主内容 Markdown 化 / 按查询意图裁剪
     ├── SandboxToolProvider.java  # 容器级沙箱工具（Python/Shell/文件 + 浏览器，懒初始化、失败降级）
-    └── ToolAssignments.java      # 工具分配表：按专家分配工具集（双通道注入，最小权限）
+    ├── McpToolProvider.java / McpConfigParser.java  # MCP 工具接入（多 server 懒连接、失败隔离）/ mcp-config.json 解析
+    ├── McpServerTools.java       # 内置 MCP Server 暴露的演示工具（Streamable-HTTP /mcp）
+    ├── ToolAssignments.java      # 工具分配表：按专家分配工具集（双通道注入，最小权限）
+    ├── ToolCallBudget.java / ToolCallTracer.java    # 工具次数/结果硬预算 / 调用起止进度行
+    └── TokenEstimator.java       # 全项目统一 token 估算口径
 ```
 
 </details>
@@ -341,7 +384,7 @@ src/main/java/com/dark/javaHarness/
 
 ## 🧪 运行测试
 
-单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**（当前 262 个用例全绿）：
+单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**（当前 327 个用例全绿）：
 
 ```bash
 mvn -s .mvn/settings.xml test
@@ -350,22 +393,17 @@ mvn -s .mvn/settings.xml test
 <details>
 <summary><b>🔍 点击展开测试覆盖清单</b></summary>
 
-| 测试 | 验证点 |
-|---|---|
-| `LlmRouteJudgeTest` | 🧭 主 Agent 分流判定：简单/复杂/异常 JSON 兜底 |
-| `AgentServiceImplTest` | 🎭 多 Agent 路由：`agentId` → `writer` / 未命中回退 `general` |
-| `AgentConfigProviderTest` | ⚙️ 从 `agent` 表读取配置（model / prompt）：命中、缺失、空白降级 |
-| `ChatClientRegistryTest` | 🔌 多服务商：新增模型命中、禁用模型回退默认客户端 |
-| `ChatControllerTest` | 🌐 Controller 层：流式 Flux 逐元素 + 换行、同步接口契约 |
-| `ContextAssemblingAdvisorTest` | 💾 上下文组装：token 预算裁剪、role 归一化边界 |
-| `ChatServiceImplTest` | 💬 多轮记忆、SSE 契约、resume 校验（400/409）与断点续跑委托 |
-| `GeneralAssistantAgentTest` | ⚡ 路径 A：逐 token 渐进发射（防伪流式回归）、同步 execute |
-| `MultiAgentGraphAgentTest` | 🕸️ 路径 B：编排闭环、进度时序（防死锁/丢事件）、专家派遣白名单、**断点续跑**（已完成节点不重跑 / 缺口补跑） |
-| `ProgressLineTest` | 📣 进度线协议编解码 |
-| `ToolAssignmentsTest` | 🛡️ 工具分配：双通道注入、最小权限、重名工具去重 |
-| `McpToolProviderTest` | 🔗 MCP 工具接入：STDIO 传输、超时配置 |
-| `WebToolsTest` | 🌍 网页抓取：HTML→纯文本、协议白名单 |
-| `TerminalRendererTest` | 🖥️ CLI 渲染：Markdown 行级着色、流式增量直出（防整段重影回归） |
+| 分组 | 测试 | 验证点 |
+|---|---|---|
+| 🧭 路由与会话 | `LlmRouteJudgeTest` `AgentServiceImplTest` `AgentConfigProviderTest` `SessionServiceImplTest` `GoalServiceImplTest` | SIMPLE/COMPLEX 分流与异常 JSON 兜底、多 Agent 路由与回退、会话与目标生命周期 |
+| 🤖 Agent 调用 | `AgentChatCallerTest` `AgentChatCallerRetryTest` `LlmRetryTest` `GeneralAssistantAgentTest` | 工具循环与预算熔断记账、未知工具幻觉容错重试、重试策略、逐 token 渐进发射（防伪流式回归） |
+| 🕸️ 编排 | `MultiAgentGraphAgentTest` `ProgressLineTest` | 编排闭环、进度时序（防死锁/丢事件）、专家派遣白名单、断点续跑（缺口补跑/回放）、**预算部分熔断降级**（剩余子任务跳过、聚合保留前序结果） |
+| 🧩 Prompt 装配 | `PromptAssemblerTest` `MemoryPolicyTest` `SkillManagerTest` `SkillRepositoryTest` `ToolLazyManagerTest` | 五段式组装、记忆按角色注入矩阵、skill 动态装配、工具 Schema 两段式延迟加载 |
+| 🎚️ 预算与观测 | `ContextBudgetPropertiesTest` `ContextAssemblingAdvisorTest` `PromptBudgetAdvisorTest` `ToolCallBudgetTest` `ToolCallTracerTest` `LlmCallRecorderTest` | yaml 绑定与 0=不限制口径、上下文/分段裁剪、工具次数与结果预算、调用起止进度行、落库观测 |
+| 🔌 工具与 MCP | `WebToolsTest` `SandboxToolProviderTest` `McpToolProviderTest` `ToolAssignmentsTest` | HTML→Markdown 提取与协议白名单、沙箱懒初始化降级、MCP 多 server 配置解析、工具分配最小权限与去重 |
+| 📚 知识库 RAG | `MarkdownChunkerTest` `KnowledgeDocumentScannerTest` `KnowledgeServiceImplTest` `KnowledgeRetrieverTest` | 段落感知切分与重叠续接、front-matter 解析与坏文件跳过、增量摄取/删除/分页/检索（mock VectorStore+Mapper）、角色跳过/预算截断/【出处N】渲染 |
+| 🖥️ CLI | `TerminalRendererTest` `TerminalInputTest` `ResumeStateStoreTest` | Markdown 行级着色与流式增量直出（防整段重影回归）、无 TTY 降级输入、续跑状态读写往返 |
+| 🌐 接口与基建 | `ChatControllerTest` `HarnessControllerTest` `ChatServiceImplTest` `GlobalExceptionHandlerTest` `ChatClientRegistryTest` `ChatClientFactoryTest` `ThinkingSwitchChatModelTest` `ProviderAdminServiceImplTest` `AgentRegistryTest` `ClientAbortLogFilterTest` `ModelQuotaExceptionTest` | REST 契约（流式逐元素/换行）、SSE 契约与 resume 校验（400/409）、异常统一 {code,message}、多服务商注册表与热刷新、思考开关 |
 
 </details>
 
@@ -390,4 +428,7 @@ mvn -s .mvn/settings.xml test
 
  Made with ☕ and ❤️ by javaHarness contributors
 
+</div>
+
+</div>
 </div>

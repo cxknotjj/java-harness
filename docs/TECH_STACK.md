@@ -28,6 +28,8 @@
 | Web      | Spring MVC                 | 随 Boot | REST + 响应式 SSE（Controller 返回 `Flux<String>`，`text/event-stream`）+ 全局异常处理 |
 | ORM      | MyBatis-Plus               | 3.5.7  | `mybatis-plus-spring-boot3-starter`，goal / session / session\_messages / agent 表的 CRUD |
 | 数据库      | MySQL                      | 9.2.0  | `mysql-connector-j`（runtime），连接池 HikariCP                                      |
+| 向量库      | PostgreSQL + pgvector      | 可选     | `spring-ai-pgvector-store`（BOM 管理）+ `org.postgresql:postgresql`（runtime），RAG 知识库专用数据源（与 MySQL 主库独立，懒连接，PG 未就绪不影响启动） |
+| 嵌入模型     | DashScope text-embedding-v4 | 1024 维 | `OpenAiEmbeddingModel`（OpenAI 兼容协议手动装配），知识库切分文档向量化（app.knowledge.embedding.*） |
 | Schema 迁移 | Flyway                     | 随 Boot | `flyway-core` + `flyway-mysql`，版本化迁移（`db/migration/V*__*.sql`），存量库经 baseline 接入；替代 `spring.sql.init` |
 | 参数校验     | Jakarta Validation         | 随 Boot | `spring-boot-starter-validation` + `@Valid` 注解校验                               |
 | HTTP 客户端 | OkHttp                     | 4.12.0 | CLI 端调用主服务 REST/SSE（`cli/api/ChatApiClient`）                                   |
@@ -50,6 +52,7 @@ controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测�
         │     └─ ProgressLine（进度行线协议，服务端↔CLI 共用）
         ├─ advisor（ContextAssemblingAdvisor：上下文组装/token 裁剪）
         ├─ tool（WebTools 网页抓取 / DemoTools 示例 / SandboxToolProvider 容器沙箱 / ToolAssignments 工具分配）
+        ├─ knowledge（RAG 知识库：KnowledgeDocumentScanner 扫描 / MarkdownChunker 切分 / KnowledgeServiceImpl 增量摄取与检索 / KnowledgeRetriever 检索注入）
         ├─ cli（ChatCli 交互端） + cli/api（ChatApiClient：OkHttp + SSE 解析）
         ├─ domain（领域模型父包，含 dto 与 entity；RouteDecision 分流决策枚举 / LlmCallLog 观测记录）
         ├─ mapper（Agent / Goal / Session / SessionMessage / ModelProvider / LlmCallLog）
@@ -68,6 +71,7 @@ controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测�
 - **工具调用（容器级沙箱）**：`SandboxToolProvider` 懒初始化 agentscope 沙箱（base 容器：Python/Shell/文件读写检索；browser 容器：导航/快照/点击/输入，独立镜像、独立初始化失败只降级本组），宿主机零暴露；`ToolAssignments` 按专家双通道注入（@Tool 对象走 `.tools()`、ToolCallback 走 `.toolCallbacks()`），未分配的工具对模型不可见（服务端硬边界）。researcher/general 拥有浏览器组，补 JS 渲染页面抓取空缺。
 - **统一异常响应**：`GlobalExceptionHandler` 把所有异常转成 `{code, message}` 结构（400/404/500），非法请求返回统一 400 错误体。
 - **LLM 调用观测（成本账本）**：每次 LLM 调用（路由判断 / lead 拆解 / 专家子任务 / 聚合 / 路径 A）结束经 `LlmCallRecorder` 异步写 `llm_call_log` 表——会话、角色、模型、SYNC/STREAM、成败、token（流式按输出文本近似估算）、耗时、错误；观测失败不影响主链路。`GET /api/llm-calls?sessionId=` 查询。完整链路追踪（Micrometer Tracing）见 TODO。
+- **RAG 知识库（检索增强）**：knowledge/ 目录 `.md/.txt` 文档经 `POST /api/knowledge/sync` 增量摄取（mtime 比对→`MarkdownChunker` 段落感知切分 ~700 字符+重叠→DashScope 嵌入→pgvector，确定性 chunk id=docName#idx 支持重摄取精确覆盖）；路径 A/B 共用 `AgentRequestSpecFactory` 汇合点，每次调用前 `KnowledgeRetriever` 按当前 user 文本向量检索 top-k（aggregator 角色策略跳过——其材料是子任务结果），命中渲染【出处N】知识段注入 system prompt（context-budget 预算截断）；回答内联【出处N】引用 + `meta.sources`/`ChatResponse.sources` 出处 + CLI「来源:」尾注；`GET /api/knowledge/documents|search` 调试检索、`DELETE /api/knowledge/documents/{name}` 删除。降级口径：知识库未启用（app.knowledge.enabled=false）或 PG 不可用时应用照常启动、检索返回空、不注入知识段。台账 `kb_document` 表走 Flyway V11；向量表 `vector_store` 由 PgVectorStore initializeSchema 自建（不经 Flyway，主库 schema 管理仍是 MySQL）。
 
 ***
 
@@ -79,7 +83,7 @@ controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测�
 | ------------- | ------------------------------------------------------------------------------- |
 | 更多模型接入        | 官方 DeepSeek starter、本地 Ollama、Qwen 官方 DashScope starter，按 Agent 路由不同模型          |
 | 多模态           | 图片/语音输入（DashScope 兼容模式逐步支持）                                                     |
-| **RAG（向量检索）** | 引入向量库（pgvector / Redis Stack / Elasticsearch），结合 Spring AI `VectorStore` 做知识库问答 |
+| **RAG（向量检索）** | **已实现**：pgvector + DashScope 嵌入，knowledge/ 目录增量摄取 + 路径 A/B 检索增强（见「关键设计」RAG 段）；待扩展：BM25 混合检索与重排、目录文件监听 |
 | **MCP 接入**    | 让 Agent 通过 MCP 连接外部工具/服务，扩展工具生态                                                 |
 | Agent 编排框架    | LangGraph4j / AutoGen 风格的多 Agent 协作、任务规划、反思循环                                   |
 
@@ -88,7 +92,7 @@ controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测�
 | 建议                    | 说明                                                |
 | --------------------- | ------------------------------------------------- |
 | ~~数据库迁移工具~~ 已实现        | Flyway 已接入（`db/migration` 版本化迁移，存量库经 baseline 无缝过渡） |
-| PostgreSQL + pgvector | 若做 RAG，pgvector 是现成方案                             |
+| ~~PostgreSQL + pgvector~~ 已实现 | RAG 知识库向量存储已落地（独立数据源、懒连接、PG 未就绪不影响启动） |
 | 缓存                    | `spring-boot-starter-data-redis`：会话快照缓存、限流计数、热点数据 |
 
 ### 3. 服务治理与可靠性（优先级：中）
@@ -138,7 +142,8 @@ controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测�
 
 - **版本约束**：Spring Boot 必须为 3.5.14（与 Spring AI 1.1.4 兼容），升级需整体评估 Spring AI 兼容性。
 - **模型路由**：模型按 `model_provider` 表路由到各服务商（DashScope / DeepSeek，OpenAI 兼容协议）。API Key 解析规则：`app.providers.<provider>.api-key`（yaml）→ `<PROVIDER大写>_API_KEY`（环境变量，如 `DEEPSEEK_API_KEY`）。`general`/`researcher` 走 deepseek-v4-flash，`lead`/`aggregator`/`coder`/`analyst` 等质量敏感环节走 qwen3.7-flash。
-- **DB 迁移**：schema 由 Flyway 管理（`db/migration/V1~V5`）。存量库首次接入自动 baseline（V1 跳过、增量执行）；全新库从 V1 全量建表。新增表结构变更只需追加 `V6__xxx.sql`，启动自动应用。
+- **DB 迁移**：schema 由 Flyway 管理（`db/migration/V1~V11`）。存量库首次接入自动 baseline（V1 跳过、增量执行）；全新库从 V1 全量建表。新增表结构变更只需追加 `V12__xxx.sql`，启动自动应用。
+- **RAG 可选依赖**：知识库需要自备 PostgreSQL（启用 vector 扩展）并在 `app.knowledge.*` 配置连接与嵌入端点；`knowledge/` 目录不存在或 PG 未就绪不影响启动与其它功能（检索静默降级为空，管理端点报清晰错误）。
 - **Docker 硬依赖**：沙箱工具依赖本机 Docker；两个镜像需预拉取（aliyun 新加坡 registry）：`runtime-sandbox-base:latest`（约 1.4GB）与 `runtime-sandbox-browser:latest`（约 2GB），否则首个工具调用会现场拉镜像拖慢执行。无 Docker 时沙箱工具组为空（warn 日志），其余功能不受影响。过程记录见 [docs/reports/2026-08-28-sandbox-integration.md](./reports/2026-08-28-sandbox-integration.md)。
 - **容器生命周期**：容器随首次工具调用懒创建、服务优雅停止时随 `@PreDestroy` 销毁；强杀 `mvn spring-boot:run` 不触发优雅关闭会残留容器，需正常停服或 `docker rm -f` 清理。
 
