@@ -96,6 +96,35 @@ app:
       api-key: ${QWEN_API_KEY:dummy-key-for-startup}
     deepseek:
       api-key: ${DEEPSEEK_API_KEY:dummy-deepseek-key}
+  # RAG 知识库（pgvector + DashScope 嵌入）：knowledge/ 目录的 .md/.txt 文档经
+  # POST /api/knowledge/sync 增量摄取（切分→嵌入→入向量库），路径 A/B 每次调用前
+  # 按当前 user 文本检索、注入 system 知识段，回答带【出处N】引用 + meta.sources。
+  # PostgreSQL 不可用时检索静默降级为空（应用照常启动，对齐沙箱降级先例）
+  knowledge:
+    enabled: true
+    dir: knowledge
+    # 检索条数与相似度阈值（0~1，越大越严）
+    top-k: 4
+    min-score: 0.5
+    # 注入 prompt 的知识片段总预算（token，口径同 tool-result-budget）
+    context-budget: 3000
+    # 触发检索的最短 user 文本长度（过短问题检索意义小，直接跳过）
+    min-query-chars: 8
+    # 启动时自动增量摄取（默认关：摄取要调嵌入 API，离线启动不应报错）
+    auto-sync-on-startup: false
+    embedding:
+      # OpenAI 兼容嵌入端点；key 解析同 ChatClientFactory（下方 api-key 优先，
+      # 空则回退环境变量 QWEN_API_KEY）
+      base-url: ${DASHSCOPE_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode}
+      model: text-embedding-v4
+      # 建库维度：PgVectorStore 按此建 vector 列；更换嵌入模型/维度需重建 vector_store 表
+      dimensions: 1024
+    pgvector:
+      # 知识库专用 PostgreSQL（与业务主库 MySQL 相互独立）；库需预先创建并启用 vector 扩展
+      # （超级用户执行 CREATE EXTENSION vector；initializeSchema 只建表不建扩展）
+      url: jdbc:postgresql://localhost:5432/harness_kb
+      username: harness
+      password: ""
 
 logging:
   level:

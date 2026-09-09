@@ -120,6 +120,22 @@
             <artifactId>spring-ai-starter-mcp-client</artifactId>
         </dependency>
 
+        <!-- RAG 知识库：pgvector 向量库（版本由 spring-ai-bom 管理）。
+             PostgreSQL 实例需自备且启用 vector 扩展；vector_store 表由 PgVectorStore
+             initializeSchema 自建（不经 Flyway——主库 schema 管理仍是 MySQL）。
+             手动装配（config/KnowledgeConfig），不引 starter 的 autoconfigure：
+             项目主数据源是 MySQL，pgvector autoconfigure 默认注入唯一 DataSource 的假设不成立 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-pgvector-store</artifactId>
+        </dependency>
+        <!-- PostgreSQL 驱动：仅知识库向量数据源使用 -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- MCP 服务端（本项目自建，HTTP/Streamable transport，暴露演示工具供客户端连接，
              与上面 mcp-client 形成进程内闭环演示）。版本由 BOM 管理 -->
         <dependency>
