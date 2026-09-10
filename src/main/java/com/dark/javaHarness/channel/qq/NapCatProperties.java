@@ -32,6 +32,12 @@ public class NapCatProperties {
     /** 上报验签密钥（与 onebot11 httpClients.token 一致；空 = 不校验，联调期先留空） */
     private String eventSecret;
 
+    /** 单条消息聊天超时秒数：超时放弃回复且静默（后台跑完仅落会话记忆），防 LLM 卡死占满处理线程；0 = 不限制 */
+    private int chatTimeoutSeconds;
+
+    /** 私聊白名单（QQ 号 CSV）：非空时仅名单内用户可私聊（防陌生人刷 LLM token）；空 = 不限制 */
+    private String privateAllowUsers;
+
     private final GroupTrigger groupTrigger = new GroupTrigger();
     private final RateLimit rateLimit = new RateLimit();
     private final Reply reply = new Reply();
@@ -82,6 +88,22 @@ public class NapCatProperties {
 
     public void setEventSecret(String eventSecret) {
         this.eventSecret = eventSecret;
+    }
+
+    public int getChatTimeoutSeconds() {
+        return chatTimeoutSeconds;
+    }
+
+    public void setChatTimeoutSeconds(int chatTimeoutSeconds) {
+        this.chatTimeoutSeconds = chatTimeoutSeconds;
+    }
+
+    public String getPrivateAllowUsers() {
+        return privateAllowUsers;
+    }
+
+    public void setPrivateAllowUsers(String privateAllowUsers) {
+        this.privateAllowUsers = privateAllowUsers;
     }
 
     public GroupTrigger getGroupTrigger() {

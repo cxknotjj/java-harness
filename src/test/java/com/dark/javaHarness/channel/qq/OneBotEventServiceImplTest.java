@@ -63,9 +63,13 @@ class OneBotEventServiceImplTest {
     }
 
     private static OneBotEvent privateMsg(long messageId, String text) {
-        return new OneBotEvent(1700000000L, SELF_ID, "message", "private", UID, null, messageId, text,
+        return privateMsg(UID, messageId, text);
+    }
+
+    private static OneBotEvent privateMsg(long uid, long messageId, String text) {
+        return new OneBotEvent(1700000000L, SELF_ID, "message", "private", uid, null, messageId, text,
                 List.of(new MessageSegment("text", Map.of("text", text))),
-                new OneBotEvent.Sender(UID, "tester", null));
+                new OneBotEvent.Sender(uid, "tester", null));
     }
 
     private static OneBotEvent groupMsg(long messageId, boolean withAt, String text) {
@@ -162,6 +166,59 @@ class OneBotEventServiceImplTest {
         service.handle(groupMsg(30L, true, "第一问"));
         service.handle(groupMsg(31L, true, "第二问"));
         verify(chatService, times(1)).chat(any());
+    }
+
+    @Test
+    void handle_privateChat_rateLimitedSecondMessageDropped() {
+        // 私聊同样限频（防陌生人刷 LLM token），与群聊同一间隔口径
+        props.getRateLimit().setPerUserSeconds(10);
+        service = new OneBotEventServiceImpl(chatService, sessionService, bindingMapper, apiClient, props);
+        when(bindingMapper.selectOne(any())).thenReturn(binding(31L, "qq:private:" + UID, 5L));
+        stubChatSuccess("回");
+        service.handle(privateMsg(300L, "第一问"));
+        service.handle(privateMsg(301L, "第二问"));
+        verify(chatService, times(1)).chat(any());
+    }
+
+    @Test
+    void handle_privateChat_allowlistBlocksStranger() {
+        // 白名单非空时名单外私聊直接丢弃（名单内用户不受影响）
+        props.setPrivateAllowUsers("999");
+        service = new OneBotEventServiceImpl(chatService, sessionService, bindingMapper, apiClient, props);
+        when(bindingMapper.selectOne(any())).thenReturn(binding(32L, "qq:private:999", 5L));
+        stubChatSuccess("主人好");
+        service.handle(privateMsg(UID, 310L, "陌生人私聊"));
+        service.handle(privateMsg(999L, 311L, "白名单用户私聊"));
+        verify(chatService, times(1)).chat(any());
+        verify(apiClient, never()).sendPrivateMsg(eq(UID), any());
+    }
+
+    @Test
+    void handle_resetCommand_clearsBindingAndRepliesWithoutChat() {
+        service.handle(privateMsg(320L, "/reset"));
+        org.mockito.ArgumentCaptor<com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<OneBotSessionBinding>> wc =
+                org.mockito.ArgumentCaptor.forClass(com.baomidou.mybatisplus.core.conditions.query.QueryWrapper.class);
+        verify(bindingMapper).delete(wc.capture());
+        verify(chatService, never()).chat(any());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<MessageSegment>> segCaptor = ArgumentCaptor.forClass(List.class);
+        verify(apiClient).sendPrivateMsg(eq(UID), segCaptor.capture());
+        assertTrue(segCaptor.getValue().get(0).text().contains("新对话"));
+    }
+
+    @Test
+    void handle_chatTimeout_givesUpSilently() {
+        // 超时放弃回复且静默：防 LLM 卡死占满处理线程池
+        props.setChatTimeoutSeconds(1);
+        when(bindingMapper.selectOne(any())).thenReturn(binding(34L, "qq:private:" + UID, 5L));
+        when(chatService.chat(any())).thenAnswer(inv -> {
+            Thread.sleep(2500);
+            return ChatResponse.success("1", false, null, "迟到的回复");
+        });
+        long start = System.currentTimeMillis();
+        service.handle(privateMsg(330L, "慢问题"));
+        assertTrue(System.currentTimeMillis() - start < 2000, "超时后应尽快返回而不是等聊天结束");
+        verifyNoInteractions(apiClient);
     }
 
     @Test

@@ -141,11 +141,17 @@ napcat:
   self-id: "3896564418"                  # 机器人 QQ 号（自消息过滤 + 群聊 @ 判据）
   agent-id: 10                             # 空 = 默认 Agent；填 agent 表主键后该 agent 的 knowledge 绑定自动生效
   event-secret: ${NAPCAT_EVENT_SECRET:}  # 与 onebot11 httpClients.token 一致；空 = 不校验上报签名
+  # 单条消息聊天超时秒数：超时放弃回复且静默（后台任务跑完仍落会话记忆），
+  # 防 LLM 卡死占满处理线程池；0 = 不限制
+  chat-timeout-seconds: 120
+  # 私聊白名单（QQ 号 CSV）：非空时仅名单内用户可私聊（防陌生人刷 LLM token）；
+  # 空 = 不限制。群聊不受此名单约束（@ 触发 + 限频已防刷）
+  private-allow-users: ""
   group-trigger:
     mode: at            # at=仅@机器人 | prefix=命令前缀 | all=全部响应
     prefix: "/ai"
   rate-limit:
-    per-user-seconds: 10  # 群聊同用户回复最小间隔（防风控）；0 = 不限制
+    per-user-seconds: 10  # 同用户回复最小间隔（群聊防风控 + 私聊防刷）；0 = 不限制
   reply:
     max-length: 3000      # 超长按段落边界分段；0 = 不分段
 
