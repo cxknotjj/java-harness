@@ -1,6 +1,7 @@
 package com.dark.javaHarness.tool;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
@@ -57,6 +58,38 @@ class McpToolProviderTest {
                 "server 不可达应降级为空工具面而非抛异常");
     }
 
+    // ---- 连接事件结构化落库（mcp_server_log 观测）----
+
+    @Test
+    void unreachableServer_recordsFailedServerEvent() {
+        List<com.dark.javaHarness.domain.McpServerLog> events = new java.util.ArrayList<>();
+        McpToolProvider provider = new McpToolProvider("http", "http://localhost:1/mcp", "",
+                NO_CONFIG, events::add);
+
+        assertTrue(provider.toolCallbacks().isEmpty(), "失败隔离行为不变：工具面为空");
+
+        assertEquals(1, events.size(), "连接失败应落一条结构化事件: " + events);
+        com.dark.javaHarness.domain.McpServerLog e = events.get(0);
+        assertEquals("default", e.serverName());
+        assertEquals("http", e.transport());
+        assertEquals("FAILED", e.event());
+        assertNull(e.toolCount(), "FAILED 事件无工具数");
+        assertTrue(e.errorMsg() != null && !e.errorMsg().isBlank(), "FAILED 事件应带错误摘要");
+    }
+
+    @Test
+    void stdioBadCommand_recordsFailedServerEvent() {
+        List<com.dark.javaHarness.domain.McpServerLog> events = new java.util.ArrayList<>();
+        McpToolProvider provider = new McpToolProvider("stdio", "", "cmd /c exit 1",
+                NO_CONFIG, events::add);
+
+        assertTrue(provider.toolCallbacks().isEmpty(), "失败隔离行为不变");
+        assertEquals(1, events.size());
+        assertEquals("stdio", events.get(0).transport());
+        assertEquals("FAILED", events.get(0).event());
+        assertEquals("inline", events.get(0).serverName(), "内联命令的 server 名为 inline");
+    }
+
     @Test
     void stdioBadCommand_degradesToEmpty_neverThrows() {
         // 指向一个必然立即退出的进程，验证 spawn/握手失败被吞、降级为空而非抛异常
@@ -105,14 +138,21 @@ class McpToolProviderTest {
     void liveServer_discoversMcpServerTools() {
         // 预先探测 /mcp 是否可达；不可达则跳过（说明应用未启动，非用例失败）
         Assumptions.assumeTrue(endpointReachable(), "应用未启动（/mcp 不可达），跳过实时发现用例");
+        List<com.dark.javaHarness.domain.McpServerLog> events = new java.util.ArrayList<>();
         List<ToolCallback> callbacks = new McpToolProvider(
-                "http", "http://localhost:8080/mcp", "", NO_CONFIG).toolCallbacks();
+                "http", "http://localhost:8080/mcp", "", NO_CONFIG, events::add).toolCallbacks();
         assertEquals(3, callbacks.size(), "应发现 McpServerTools 暴露的 3 个 MCP 工具");
         Set<String> names = new java.util.HashSet<>();
         for (ToolCallback c : callbacks) {
             names.add(c.getToolDefinition().name());
+            assertTrue(c instanceof ServerTaggedCallback, "MCP 工具应带来源 server 标注");
+            assertEquals("default", ((ServerTaggedCallback) c).serverName());
         }
         assertEquals(Set.of("sum", "greet", "today"), names, "工具名应与 McpServerTools 一致");
+        assertEquals(1, events.size(), "连接成功应落一条结构化事件");
+        assertEquals("CONNECTED", events.get(0).event());
+        assertEquals(3, events.get(0).toolCount());
+        assertNull(events.get(0).errorMsg());
     }
 
     private static boolean endpointReachable() {

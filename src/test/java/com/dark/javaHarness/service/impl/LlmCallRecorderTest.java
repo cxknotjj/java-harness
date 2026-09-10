@@ -9,8 +9,11 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.domain.LlmCallLog;
+import com.dark.javaHarness.domain.ToolCallLog;
 import com.dark.javaHarness.domain.entity.LlmCallLogEntity;
+import com.dark.javaHarness.domain.entity.ToolCallLogEntity;
 import com.dark.javaHarness.mapper.LlmCallLogMapper;
+import com.dark.javaHarness.mapper.ToolCallLogMapper;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -33,7 +36,7 @@ class LlmCallRecorderTest {
     @Test
     void record_insertsEntityAsynchronously() {
         LlmCallLogMapper mapper = mock(LlmCallLogMapper.class);
-        LlmCallRecorder recorder = new LlmCallRecorder(mapper);
+        LlmCallRecorder recorder = new LlmCallRecorder(mapper, mock(ToolCallLogMapper.class));
 
         recorder.record(new LlmCallLog("s1", "lead", "qwen3.8-27b", false, true,
                 100, 20, 120, false, 1500, null));
@@ -53,7 +56,7 @@ class LlmCallRecorderTest {
     void record_mapperFailure_neverThrowsToCaller() {
         LlmCallLogMapper mapper = mock(LlmCallLogMapper.class);
         when(mapper.insert(any(LlmCallLogEntity.class))).thenThrow(new IllegalStateException("db down"));
-        LlmCallRecorder recorder = new LlmCallRecorder(mapper);
+        LlmCallRecorder recorder = new LlmCallRecorder(mapper, mock(ToolCallLogMapper.class));
 
         // 不应向调用方抛出（异步边界吞掉并 warn）
         recorder.record(new LlmCallLog(null, "route-judge", "qwen3.8-27b", true, false,
@@ -65,5 +68,24 @@ class LlmCallRecorderTest {
             Thread.currentThread().interrupt();
         }
         assertTrue(true, "落库异常被观测层吞掉，未影响调用方");
+    }
+
+    @Test
+    void recordToolCall_insertsEntityAsynchronously() {
+        LlmCallLogMapper mapper = mock(LlmCallLogMapper.class);
+        ToolCallLogMapper toolCallMapper = mock(ToolCallLogMapper.class);
+        LlmCallRecorder recorder = new LlmCallRecorder(mapper, toolCallMapper);
+
+        recorder.recordToolCall(new ToolCallLog("s1", "qq-channel", "web_fetch", "default",
+                "https://example.com", true, 320, null));
+
+        verify(toolCallMapper, timeout(2000)).insert(
+                org.mockito.ArgumentMatchers.argThat((ToolCallLogEntity e) ->
+                        "s1".equals(e.getSessionId())
+                                && "qq-channel".equals(e.getAgentName())
+                                && "web_fetch".equals(e.getToolName())
+                                && "default".equals(e.getServerName())
+                                && "OK".equals(e.getStatus())
+                                && Long.valueOf(320).equals(e.getDurationMs())));
     }
 }

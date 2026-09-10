@@ -89,8 +89,10 @@
   - 落地：`GoalExecutorConfig` 双池（`goal-exec-` 后台 Goal 池 core=max=8 / 队列 50 / 优雅停机；`applicationTaskExecutor` MVC 异步槽位）；队列满拒绝 → Goal 落 FAILED 终态；`run()` catch Throwable 堵 Error 逃逸卡 RUNNING
   - 验收 ✅：并发提交 10 个 Goal 稳定执行全 SUCCEEDED、无拒绝无卡 RUNNING（单测覆盖）；失败重投部分经评估另立任务（见 P2「Goal 失败重投」），详见存档「异步治理与发布工程」
 
-- [ ] **工具调用与 MCP 日志记录**：现状仅 `ToolCallTracer` 装饰 ToolCallback 发 `tool`/`tool-done` SSE 进度行（无 emitter 的调用链路不可见），工具调用不落库——`llm_call_log` 只记 LLM 调用，工具侧无成本/审计账本；MCP server 连接/发现失败仅 warn 单行，无 server 维度可查询记录
+- [x] **工具调用与 MCP 日志记录**：现状仅 `ToolCallTracer` 装饰 ToolCallback 发 `tool`/`tool-done` SSE 进度行（无 emitter 的调用链路不可见），工具调用不落库——`llm_call_log` 只记 LLM 调用，工具侧无成本/审计账本；MCP server 连接/发现失败仅 warn 单行，无 server 维度可查询记录
   - 改造要点：仿照 `llm_call_log` 落库工具调用（工具名/参数摘要/耗时/成败/所属 agent 与 sessionId），MCP 工具标注来源 server；MCP 连接失败、懒连接失败结构化记录（`McpToolProvider` 每 server 独立记录，失败隔离后仍可追溯）
+  - 落地：V15 `tool_call_log` + V16 `mcp_server_log` 两张观测表；`LlmCallRecorder` 扩展 `recordToolCall`（两类台账同置一处，复用既有注入面零级联接线）；`ToolCallTracer` 支持「无 emitter 仅落库」装饰（emitter/recorder 任一非空即装饰），QQ 渠道、API 直调等无 SSE 链路观测盲区补齐；MCP 工具经 `ServerTaggedCallback` 标注来源 server，`McpToolProvider` 连接/发现成功与失败均结构化落库（失败隔离语义不变）；`expand_tool`/`load_skill` 元工具与 `ToolCallBudget` 预算拦截不落库；观测落库失败仅 warn 不影响主链路（与 `llm_call_log` 同口径）
+  - 注：验收中的 `/api/tool-calls` 查询端点不在本次范围（另行任务）；本次验收以单测覆盖（411 通过）
   - 验收：`/api/tool-calls?sessionId=` 可查询一次编排内全部工具调用（含 MCP 工具及来源 server）；MCP 某 server 故障时能从日志定位到该 server
 - [ ] **沙箱读写工具的重置与安全校验**：沙箱容器懒创建一次后无重置/重建机制（坏状态无法自愈，仅停服 `@PreDestroy` 销毁，强杀进程还会残留容器）；写入/执行工具完全信任模型输出透传容器，容器内无路径越界与危险命令拦截
   - 改造要点：容器健康探测 + 调用失败自动重建（限重建次数、超限降级空工具面并告警）；写入类工具（`WriteFileTool`/`EditFileTool`/`MoveFileTool` 等）限制在容器工作目录内，拒绝绝对路径与 `..` 越界；执行类工具（`RunShellCommandTool`/`RunPythonCodeTool`）危险命令黑名单拦截（`rm -rf /`、mkfs、fork 炸弹等）并返回可自愈提示

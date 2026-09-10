@@ -243,7 +243,7 @@ final class AgentChatCaller {
         this.budgets = budgets != null ? budgets : new ContextBudgetProperties();
         this.specFactory = new AgentRequestSpecFactory(clientRegistry, promptAssembler,
                 toolAssignments, this.lazyTools, skillManager, memoryStore, this.budgets,
-                knowledgeRetriever);
+                knowledgeRetriever, recorder);
     }
 
     /** 带会话观测的单次调用（推荐入口：sessionId 用于 llm_call_log 归因） */

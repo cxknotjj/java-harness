@@ -70,8 +70,22 @@ public class PromptAssembler {
      * @param roleFallback 角色段兜底文本（可空）：如 lead/aggregator 兜底 prompt、子任务专家 persona
      */
     public String assemble(String agentName, String roleFallback) {
+        return assemble(agentName, roleFallback, null);
+    }
+
+    /**
+     * 组装 system prompt（config 复载）：调用链上游（AgentChatCaller / GeneralAssistantAgent
+     * 经 {@code AgentRequestSpecFactory.build}）已查好 agent 表配置时传入，角色段直接采用
+     * config.prompt()，避免重复查表——每次 LLM 调用对 agent 表仅查一次。
+     * config 为 null 时回退按 agentName 查表（兼容测试与既有调用）。
+     *
+     * @param agentName    agent 名（工具分配面与 skill 段取值）
+     * @param roleFallback 角色段兜底文本（可空）
+     * @param config       上游已查好的 agent 表配置（可空：空则回退查表）
+     */
+    public String assemble(String agentName, String roleFallback, AgentConfig config) {
         PromptSection.Context ctx = new PromptSection.Context(
-                agentName, resolveRolePrompt(agentName, roleFallback), toolNamesOf(agentName));
+                agentName, resolveRolePrompt(agentName, roleFallback, config), toolNamesOf(agentName));
         return sections.stream()
                 .sorted(Comparator.comparingInt(PromptSection::order))
                 .map(section -> section.render(ctx))
@@ -91,9 +105,14 @@ public class PromptAssembler {
                 + "只是你的身份标识，绝不是可调用的工具。";
     }
 
-    /** 角色段取值：agent 表 prompt &gt; 调用方兜底 &gt; 默认 system prompt */
-    private String resolveRolePrompt(String agentName, String roleFallback) {
-        String tablePrompt = agentName == null || agentService == null ? null
+    /**
+     * 角色段取值：config 携带 prompt &gt; agent 表 prompt &gt; 调用方兜底 &gt; 默认 system prompt
+     * （config 非空时不再查表；config.prompt 空白视同无，与查表优先级语义一致）
+     */
+    private String resolveRolePrompt(String agentName, String roleFallback, AgentConfig config) {
+        String tablePrompt = config != null
+                ? (config.prompt() == null || config.prompt().isBlank() ? null : config.prompt())
+                : agentName == null || agentService == null ? null
                 : agentService.getAgentConfig(agentName)
                         .map(AgentConfig::prompt)
                         .filter(prompt -> !prompt.isBlank())

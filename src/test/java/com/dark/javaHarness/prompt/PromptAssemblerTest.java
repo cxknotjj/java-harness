@@ -5,7 +5,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.anyString;
 
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.service.AgentService;
@@ -132,6 +135,24 @@ class PromptAssemblerTest {
         when(agentService.getAgentConfig("writer")).thenReturn(Optional.empty());
         assertTrue(assembler.assemble("writer", null).startsWith("你是一个执行任务的 AI 助手"),
                 "兜底也缺失时用默认 system prompt");
+    }
+
+    /** config 复载：上游已查好配置时角色段直接采用，不再重复查表（每次 LLM 调用仅查一次） */
+    @Test
+    void assemble_withConfig_usesConfigPromptWithoutTableLookup() {
+        AgentConfig config = new AgentConfig(4L, "qwen3.7-flash", "来自config的角色提示词", null);
+
+        String system = assembler.assemble("aggregator", "兜底角色", config);
+
+        assertTrue(system.startsWith("来自config的角色提示词"), "角色段取 config.prompt(): " + system);
+        assertFalse(system.contains("兜底角色"), "config prompt 存在时不用兜底");
+        verify(agentService, never()).getAgentConfig(anyString());
+
+        // config.prompt 空白 → 视同无，回退兜底（与查表优先级语义一致），同样不查表
+        AgentConfig blank = new AgentConfig(4L, "m", "  ", null);
+        assertTrue(assembler.assemble("aggregator", "兜底角色", blank).startsWith("兜底角色"),
+                "空白 config prompt 视同无");
+        verify(agentService, never()).getAgentConfig(anyString());
     }
 
     /** skill 扩展点：注入 SkillSectionProvider 时其文本出现在 skill 段位（末段） */

@@ -2,6 +2,7 @@ package com.dark.javaHarness.tool;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -11,6 +12,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.dark.javaHarness.agent.ProgressLine;
+import com.dark.javaHarness.domain.ToolCallLog;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -157,6 +159,83 @@ class ToolCallTracerTest {
         ToolCallback traced = ToolCallTracer.trace(List.of(delegate), e -> {
         }).get(0);
         assertSame(def, traced.getToolDefinition(), "schema 应原样透传（模型不可见追踪）");
+    }
+
+    // ---- 持久化落库（无 emitter 链路的观测盲区补齐）----
+
+    @Test
+    void trace_emitterNullWithSinkStillDecoratesAndRecords() {
+        ToolCallback delegate = stubDelegate("WriteFile", "ok-result");
+        List<ToolCallLog> records = new ArrayList<>();
+
+        // emitter=null + sink 非空：持久化-only 模式（QQ 渠道/API 直调链路）
+        ToolCallback traced = ToolCallTracer.trace(List.of(delegate), null,
+                "general", "session-1", records::add).get(0);
+        String result = traced.call("{\"path\":\"/tmp/a.py\"}");
+
+        assertEquals("ok-result", result, "工具结果应原样返回");
+        assertEquals(1, records.size(), "执行后应落一条观测记录: " + records);
+        ToolCallLog r = records.get(0);
+        assertEquals("general", r.agentName());
+        assertEquals("session-1", r.sessionId());
+        assertEquals("WriteFile", r.toolName());
+        assertNull(r.serverName(), "非 MCP 工具 server 名应为 null");
+        assertTrue(r.ok());
+        assertTrue(r.durationMs() >= 0);
+        assertEquals("/tmp/a.py", r.argsSummary());
+        assertNull(r.errorMsg());
+    }
+
+    @Test
+    void trace_sinkRecordsFailureAndRethrows() {
+        ToolCallback delegate = mock(ToolCallback.class);
+        when(delegate.getToolDefinition()).thenReturn(def("Boom"));
+        when(delegate.call(anyString())).thenThrow(new IllegalStateException("容器执行失败"));
+        List<ToolCallLog> records = new ArrayList<>();
+
+        ToolCallback traced = ToolCallTracer.trace(List.of(delegate), null,
+                "lead", "s2", records::add).get(0);
+        assertThrows(IllegalStateException.class, () -> traced.call("{}"));
+
+        assertEquals(1, records.size(), "失败也应落观测记录: " + records);
+        ToolCallLog r = records.get(0);
+        assertFalse(r.ok());
+        assertEquals("容器执行失败", r.errorMsg());
+    }
+
+    @Test
+    void trace_sinkCapturesServerNameFromTaggedCallback() {
+        ToolCallback delegate = stubDelegate("BrowserClick", "done");
+        ServerTaggedCallback tagged = new ServerTaggedCallback("browser", delegate);
+        List<ToolCallLog> records = new ArrayList<>();
+
+        ToolCallback traced = ToolCallTracer.trace(List.of(tagged), null,
+                "general", "s3", records::add).get(0);
+        traced.call("{\"selector\":\"#btn\"}");
+
+        assertEquals("browser", records.get(0).serverName(), "MCP 工具应标注来源 server");
+    }
+
+    @Test
+    void trace_emitterAndSinkBothPresentEmitAndRecord() {
+        ToolCallback delegate = stubDelegate("T", "r");
+        List<String> events = new ArrayList<>();
+        List<ToolCallLog> records = new ArrayList<>();
+
+        ToolCallback traced = ToolCallTracer.trace(List.of(delegate), events::add,
+                "general", "s4", records::add).get(0);
+        traced.call("{}");
+
+        assertEquals(2, events.size(), "SSE 进度行行为不变");
+        assertEquals(1, records.size(), "同时落库一条");
+    }
+
+    @Test
+    void trace_noEmitterNoSinkReturnsSameList() {
+        ToolCallback delegate = stubDelegate("T", "r");
+        List<ToolCallback> callbacks = List.of(delegate);
+        assertSame(callbacks, ToolCallTracer.trace(callbacks, null, "a", "s", null),
+                "emitter 与 sink 皆空应零开销直通");
     }
 
     // ---- fixtures ----

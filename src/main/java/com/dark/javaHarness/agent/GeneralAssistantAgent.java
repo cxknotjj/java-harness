@@ -151,7 +151,7 @@ public class GeneralAssistantAgent implements Agent {
         this.retry = new LlmRetry();
         this.specFactory = new AgentRequestSpecFactory(clientRegistry, this.promptAssembler,
                 toolAssignments, this.lazyTools, skillManager, memoryStore, effectiveBudgets,
-                knowledgeRetriever);
+                knowledgeRetriever, recorder);
     }
 
     /** 返回 Agent 名称（用于注册与路由） */

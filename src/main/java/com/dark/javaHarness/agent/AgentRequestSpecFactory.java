@@ -9,6 +9,7 @@ import com.dark.javaHarness.prompt.PromptAssembler;
 import com.dark.javaHarness.prompt.SkillManager;
 import com.dark.javaHarness.prompt.ToolLazyManager;
 import com.dark.javaHarness.service.SessionService;
+import com.dark.javaHarness.service.impl.LlmCallRecorder;
 import com.dark.javaHarness.tool.ToolAssignments;
 import com.dark.javaHarness.tool.ToolCallBudget;
 import com.dark.javaHarness.tool.ToolCallTracer;
@@ -63,6 +64,8 @@ final class AgentRequestSpecFactory {
     private final ContextBudgetProperties budgets;
     /** 知识检索器（RAG 注入面）；null 时零行为变化（知识库禁用/单测场景，沿用 skillManager==null 约定） */
     private final KnowledgeRetriever knowledgeRetriever;
+    /** 工具调用观测记录器（tool_call_log 落库面）；null 时不落库（单测场景） */
+    private final LlmCallRecorder recorder;
 
     AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
                             PromptAssembler promptAssembler,
@@ -72,7 +75,7 @@ final class AgentRequestSpecFactory {
                             SessionService memoryStore,
                             ContextBudgetProperties budgets) {
         this(clientRegistry, promptAssembler, toolAssignments, lazyTools, skillManager,
-                memoryStore, budgets, null);
+                memoryStore, budgets, null, null);
     }
 
     AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
@@ -83,6 +86,20 @@ final class AgentRequestSpecFactory {
                             SessionService memoryStore,
                             ContextBudgetProperties budgets,
                             KnowledgeRetriever knowledgeRetriever) {
+        this(clientRegistry, promptAssembler, toolAssignments, lazyTools, skillManager,
+                memoryStore, budgets, knowledgeRetriever, null);
+    }
+
+    /** 全参构造：recorder 为工具调用观测记录器（tool_call_log 落库面），null 时不落库（单测场景） */
+    AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
+                            PromptAssembler promptAssembler,
+                            ToolAssignments toolAssignments,
+                            ToolLazyManager lazyTools,
+                            SkillManager skillManager,
+                            SessionService memoryStore,
+                            ContextBudgetProperties budgets,
+                            KnowledgeRetriever knowledgeRetriever,
+                            LlmCallRecorder recorder) {
         this.clientRegistry = clientRegistry;
         this.promptAssembler = promptAssembler;
         this.toolAssignments = toolAssignments;
@@ -91,6 +108,7 @@ final class AgentRequestSpecFactory {
         this.memoryStore = memoryStore;
         this.budgets = budgets;
         this.knowledgeRetriever = knowledgeRetriever;
+        this.recorder = recorder;
     }
 
     /** 组装请求（取客户端 → system 按段组装 → 记忆只读注入 → 请求级 advisor → 选项 → 工具注入） */
@@ -106,7 +124,8 @@ final class AgentRequestSpecFactory {
         // 知识检索（RAG）：按当前 user 文本检索知识库，命中则追加【出处N】知识段——
         // retriever 为 null（禁用/单测）或无命中时原样，退化现状；aggregator 角色策略跳过；
         // 多库隔离：agent 表 knowledge 列（config 携带）解析为绑定库列表，null = 不限
-        String system = promptAssembler.assemble(forAgent, fallbackSystem);
+        // config 已由调用方查好传入：经三参 assemble 复载下传，角色段不再重复查表
+        String system = promptAssembler.assemble(forAgent, fallbackSystem, config);
         if (knowledgeRetriever != null) {
             String knowledgeBlock = knowledgeRetriever.buildKnowledgeBlock(forAgent, sessionId, user,
                     KnowledgeRetriever.parseBinding(config != null ? config.knowledge() : null));
@@ -164,16 +183,18 @@ final class AgentRequestSpecFactory {
         if (!toolSet.annotated().isEmpty()) {
             tools.addAll(List.of(ToolCallbacks.from(toolSet.annotated().toArray())));
         }
-        if (assembly.toolEmitter() != null) {
-            // 追踪模式：tracer 装饰真实工具（执行起止经 emitter 发进度行，CLI 工具调用行）
-            tools = ToolCallTracer.trace(tools, assembly.toolEmitter());
-            if (assembly.toolCallBudget() && !tools.isEmpty()) {
-                // 硬预算：单次调用内工具执行次数超限不再真执行；工具结果总量 ≤5k token，
-                // 超出的截断、耗尽后返回引导文本收束循环（防止 token 按轮数平方级膨胀）。
-                // 预算只约束真实工具执行——轻量引导与 expand_tool 元工具不计入
-                tools = ToolCallBudget.limit(tools,
-                        budgets.getToolCallLimit(), budgets.getToolResultBudget());
-            }
+        if (assembly.toolEmitter() != null || recorder != null) {
+            // 追踪模式：tracer 装饰真实工具——emitter 非空发进度行（CLI 工具调用行），
+            // recorder 非空执行后落库 tool_call_log（QQ 渠道/API 直调等无 SSE 链路的观测盲区由此补齐）
+            tools = ToolCallTracer.trace(tools, assembly.toolEmitter(), forAgent, sessionId,
+                    recorder == null ? null : recorder::recordToolCall);
+        }
+        if (assembly.toolEmitter() != null && assembly.toolCallBudget() && !tools.isEmpty()) {
+            // 硬预算：单次调用内工具执行次数超限不再真执行；工具结果总量 ≤5k token，
+            // 超出的截断、耗尽后返回引导文本收束循环（防止 token 按轮数平方级膨胀）。
+            // 预算只约束真实工具执行——轻量引导与 expand_tool 元工具不计入
+            tools = ToolCallBudget.limit(tools,
+                    budgets.getToolCallLimit(), budgets.getToolResultBudget());
         }
         // 延迟加载加工（最外层，包 tracer/预算装饰后的 callback）：未展开→轻量包装、
         // 已展开→透传完整 schema，末尾追加 expand_tool 元工具（不经 tracer/预算——

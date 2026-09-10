@@ -1,5 +1,7 @@
 package com.dark.javaHarness.tool;
 
+import com.dark.javaHarness.domain.McpServerLog;
+import com.dark.javaHarness.service.impl.McpServerRecorder;
 import io.modelcontextprotocol.client.McpClient;
 import io.modelcontextprotocol.client.McpSyncClient;
 import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport;
@@ -22,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.mcp.SyncMcpToolCallbackProvider;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -69,6 +72,8 @@ public class McpToolProvider {
     private final List<ServerSpec> specs;
     /** 每 server 连接状态（懒连接 + 缓存；computeIfAbsent 按 server 原子互斥） */
     private final ConcurrentHashMap<String, ServerState> states = new ConcurrentHashMap<>();
+    /** 连接/发现事件 sink（结构化落库 mcp_server_log；null = 未接线，仅记日志） */
+    private final java.util.function.Consumer<McpServerLog> serverEventSink;
     /** 后台预热线程：应用就绪后逐 server 先行连接/发现，避免请求线程为 MCP 握手超时买单 */
     private final ExecutorService warmupExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "mcp-warmup");
@@ -76,11 +81,29 @@ public class McpToolProvider {
         return t;
     });
 
+    /** Spring 装配入口：McpServerRecorder 适配为事件 sink（recorder 为 null 时仅记日志） */
+    @Autowired
     public McpToolProvider(
             @Value("${spring.ai.mcp.client.transport:http}") String transport,
             @Value("${spring.ai.mcp.client.server-url:}") String serverUrl,
             @Value("${spring.ai.mcp.client.stdio-command:}") String stdioCommand,
-            @Value("${spring.ai.mcp.client.stdio-config-file:mcp-config.json}") String configFile) {
+            @Value("${spring.ai.mcp.client.stdio-config-file:mcp-config.json}") String configFile,
+            McpServerRecorder recorder) {
+        this(transport, serverUrl, stdioCommand, configFile, adapt(recorder));
+    }
+
+    private static java.util.function.Consumer<McpServerLog> adapt(McpServerRecorder recorder) {
+        return recorder == null ? null : recorder::record;
+    }
+
+    /** 既有测试直连入口：无观测 sink（仅记日志） */
+    McpToolProvider(String transport, String serverUrl, String stdioCommand, String configFile) {
+        this(transport, serverUrl, stdioCommand, configFile,
+                (java.util.function.Consumer<McpServerLog>) null);
+    }
+
+    McpToolProvider(String transport, String serverUrl, String stdioCommand, String configFile,
+            java.util.function.Consumer<McpServerLog> serverEventSink) {
         String normalizedTransport = transport == null ? "http" : transport.trim().toLowerCase();
         Path configPath = Path.of(configFile == null || configFile.isBlank()
                 ? "mcp-config.json" : configFile.trim());
@@ -98,6 +121,7 @@ public class McpToolProvider {
             }
         }
         this.specs = loaded;
+        this.serverEventSink = serverEventSink;
         log.info("[mcp] 已加载 {} 个 MCP server 配置: {}", specs.size(),
                 specs.stream().map(s -> s.name() + "(" + s.transport() + ")").toList());
     }
@@ -162,17 +186,44 @@ public class McpToolProvider {
                     .clientInfo(new McpSchema.Implementation("javaHarness", "1.0"))
                     .build();
             ToolCallback[] callbacks = new SyncMcpToolCallbackProvider(client).getToolCallbacks();
-            if (callbacks == null || callbacks.length == 0) {
+            int count = callbacks == null ? 0 : callbacks.length;
+            if (count == 0) {
                 log.info("[mcp] 已连接 server '{}'，但无可用工具", spec.name());
+                recordServerEvent(spec, "CONNECTED", 0, null);
                 return new ServerState(client, List.of());
             }
+            // 来源标注包装：观测层（tool_call_log.server_name）据此填充工具归属 server
+            List<ToolCallback> tagged = java.util.Arrays.stream(callbacks)
+                    .map(cb -> (ToolCallback) new ServerTaggedCallback(spec.name(), cb))
+                    .toList();
             log.info("[mcp] server '{}' 注册 {} 个工具（transport={}）",
-                    spec.name(), callbacks.length, spec.transport());
-            return new ServerState(client, List.of(callbacks));
+                    spec.name(), count, spec.transport());
+            recordServerEvent(spec, "CONNECTED", count, null);
+            return new ServerState(client, List.copyOf(tagged));
         } catch (Throwable t) {
             log.warn("[mcp] server '{}' 连接/发现失败，该 server 工具面为空: {}", spec.name(), t.toString());
+            recordServerEvent(spec, "FAILED", null, errMsg(t));
             return new ServerState(null, List.of());
         }
+    }
+
+    /** 连接事件结构化落库（mcp_server_log）；sink 未接线或落库异常不影响主链路 */
+    private void recordServerEvent(ServerSpec spec, String event, Integer toolCount, String error) {
+        if (serverEventSink == null) {
+            return;
+        }
+        try {
+            serverEventSink.accept(new McpServerLog(spec.name(), spec.transport(), event,
+                    toolCount, error));
+        } catch (RuntimeException e) {
+            log.warn("[mcp] 连接事件落库失败（不影响主链路）：{}", e.getMessage());
+        }
+    }
+
+    /** 错误摘要：message 优先，空则兜底类名（超长由 Recorder 截断） */
+    private static String errMsg(Throwable t) {
+        String msg = t.getMessage();
+        return msg == null || msg.isBlank() ? t.getClass().getSimpleName() : msg;
     }
 
     private static McpClientTransport clientTransport(ServerSpec spec) {

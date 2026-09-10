@@ -1,6 +1,7 @@
 package com.dark.javaHarness.tool;
 
 import com.dark.javaHarness.agent.ProgressLine;
+import com.dark.javaHarness.domain.ToolCallLog;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.ArrayList;
@@ -49,12 +50,25 @@ public final class ToolCallTracer {
      * 装饰回调列表为追踪版本；emitter 为 null 时原样返回（零开销直通）。
      */
     public static List<ToolCallback> trace(List<ToolCallback> callbacks, Consumer<String> emitter) {
-        if (emitter == null || callbacks.isEmpty()) {
+        return trace(callbacks, emitter, null, null, null);
+    }
+
+    /**
+     * 装饰回调列表为追踪 + 落库版本：emitter 为 null 但 sink 非空时仍装饰（持久化-only 模式，
+     * 补齐 QQ 渠道/API 直调等无 SSE 链路的观测盲区），两者皆空才零开销直通。
+     *
+     * <p>sink 由调用方接线（AgentRequestSpecFactory 传 {@code LlmCallRecorder::recordToolCall}），
+     * 每次真实执行结束后投递一条 {@link ToolCallLog}；MCP 工具经 {@link ServerTaggedCallback}
+     * 包装时自动填充 serverName。
+     */
+    public static List<ToolCallback> trace(List<ToolCallback> callbacks, Consumer<String> emitter,
+            String agentName, String sessionId, java.util.function.Consumer<ToolCallLog> sink) {
+        if (callbacks.isEmpty() || (emitter == null && sink == null)) {
             return callbacks;
         }
         List<ToolCallback> out = new ArrayList<>(callbacks.size());
         for (ToolCallback cb : callbacks) {
-            out.add(new TracedToolCallback(cb, emitter));
+            out.add(new TracedToolCallback(cb, emitter, agentName, sessionId, sink));
         }
         return out;
     }
@@ -159,8 +173,9 @@ public final class ToolCallTracer {
     // 装饰器
     // ================================================================
 
-    /** 透明装饰：schema/元数据原样透传，仅 call 前后发事件；失败原样抛出 */
-    private record TracedToolCallback(ToolCallback delegate, Consumer<String> emitter)
+    /** 透明装饰：schema/元数据原样透传，执行前后发事件 + 落观测记录；失败原样抛出 */
+    private record TracedToolCallback(ToolCallback delegate, Consumer<String> emitter,
+            String agentName, String sessionId, java.util.function.Consumer<ToolCallLog> sink)
             implements ToolCallback {
 
         @Override
@@ -170,36 +185,65 @@ public final class ToolCallTracer {
 
         @Override
         public String call(String toolInput) {
+            emitterStart(toolInput);
             long start = System.currentTimeMillis();
-            String name = delegate.getToolDefinition().name();
-            emitter.accept(ProgressLine.encode(STAGE_TOOL, startDetail(name, toolInput)));
             try {
                 String result = delegate.call(toolInput);
-                emitter.accept(ProgressLine.encode(STAGE_TOOL_DONE,
-                        doneDetail(name, toolInput, true, System.currentTimeMillis() - start)));
-                return result;
+                return emitterDoneAndRecord(toolInput, true, System.currentTimeMillis() - start, null,
+                        result);
             } catch (RuntimeException e) {
-                emitter.accept(ProgressLine.encode(STAGE_TOOL_DONE,
-                        doneDetail(name, toolInput, false, System.currentTimeMillis() - start)));
+                emitterDoneAndRecord(toolInput, false, System.currentTimeMillis() - start,
+                        errMsg(e), null);
                 throw e;
             }
         }
 
         @Override
         public String call(String toolInput, ToolContext toolContext) {
+            emitterStart(toolInput);
             long start = System.currentTimeMillis();
-            String name = delegate.getToolDefinition().name();
-            emitter.accept(ProgressLine.encode(STAGE_TOOL, startDetail(name, toolInput)));
             try {
                 String result = delegate.call(toolInput, toolContext);
-                emitter.accept(ProgressLine.encode(STAGE_TOOL_DONE,
-                        doneDetail(name, toolInput, true, System.currentTimeMillis() - start)));
-                return result;
+                return emitterDoneAndRecord(toolInput, true, System.currentTimeMillis() - start, null,
+                        result);
             } catch (RuntimeException e) {
-                emitter.accept(ProgressLine.encode(STAGE_TOOL_DONE,
-                        doneDetail(name, toolInput, false, System.currentTimeMillis() - start)));
+                emitterDoneAndRecord(toolInput, false, System.currentTimeMillis() - start,
+                        errMsg(e), null);
                 throw e;
             }
         }
+
+        private void emitterStart(String toolInput) {
+            if (emitter == null) {
+                return;
+            }
+            String name = delegate.getToolDefinition().name();
+            emitter.accept(ProgressLine.encode(STAGE_TOOL, startDetail(name, toolInput)));
+        }
+
+        private String emitterDoneAndRecord(String toolInput, boolean ok, long costMillis,
+                String error, String result) {
+            String name = delegate.getToolDefinition().name();
+            if (emitter != null) {
+                emitter.accept(ProgressLine.encode(STAGE_TOOL_DONE,
+                        doneDetail(name, toolInput, ok, costMillis)));
+            }
+            if (sink != null) {
+                sink.accept(new ToolCallLog(sessionId, agentName, name, serverOf(delegate),
+                        argSummary(toolInput), ok, costMillis, error));
+            }
+            return result;
+        }
+
+        /** 错误摘要：message 优先，空则兜底类名（超长由 Recorder 截断） */
+        private static String errMsg(RuntimeException e) {
+            String msg = e.getMessage();
+            return msg == null || msg.isBlank() ? e.getClass().getSimpleName() : msg;
+        }
+    }
+
+    /** MCP 来源标注提取：ServerTaggedCallback 包装的回调取其 server 名，其余为 null */
+    private static String serverOf(ToolCallback cb) {
+        return cb instanceof ServerTaggedCallback tagged ? tagged.serverName() : null;
     }
 }
