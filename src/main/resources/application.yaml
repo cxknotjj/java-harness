@@ -139,7 +139,7 @@ napcat:
   api-base-url: http://127.0.0.1:3000    # NapCat HTTP API（跨机调试用 ssh -L 3000 隧道）
   api-token: ${NAPCAT_API_TOKEN:napcat123}        # 与 onebot11 httpServers.token 一致
   self-id: "3896564418"                  # 机器人 QQ 号（自消息过滤 + 群聊 @ 判据）
-  agent-id:                              # 空 = 默认 Agent；填 agent 表主键后该 agent 的 knowledge 绑定自动生效
+  agent-id: 10                             # 空 = 默认 Agent；填 agent 表主键后该 agent 的 knowledge 绑定自动生效
   event-secret: ${NAPCAT_EVENT_SECRET:}  # 与 onebot11 httpClients.token 一致；空 = 不校验上报签名
   group-trigger:
     mode: at            # at=仅@机器人 | prefix=命令前缀 | all=全部响应

@@ -218,6 +218,53 @@ class ChatServiceImplTest {
     }
 
     @Test
+    void chat_withAgentId_shouldRouteByAgentId() {
+        // QQ 渠道等显式指定 agentId 的同步调用：直连该 Agent，不走路由分流
+        ChatRequest req = new ChatRequest("hi", "50", 2L);
+        when(agentService.findAgentNameById(2L)).thenReturn(Optional.of("writer"));
+        when(agentService.executeSync("writer", "hi", "50"))
+                .thenReturn(succeededGoal("50", "writer 的回答"));
+
+        ChatResponse resp = chatService.chat(req);
+
+        assertEquals("SUCCEEDED", resp.status());
+        verify(agentService).executeSync(eq("writer"), eq("hi"), eq("50"));
+        // 请求携带 agentId 即视为会话内切换：session 表 agent_id 需同步
+        verify(sessionService).switchAgent("50", 2L);
+        // 显式指定 agentId 时不得再走路由判断：分流结果用不上，白付一次同步 LLM 调用的延时与风险
+        verify(routeJudge, never()).judge(anyString());
+    }
+
+    @Test
+    void chat_withAgentId_nameMissing_shouldFallbackToGeneral() {
+        // agent 行已删等未命中场景：回退默认 general，不让请求失败
+        ChatRequest req = new ChatRequest("hi", "50", 99L);
+        when(agentService.findAgentNameById(99L)).thenReturn(Optional.empty());
+        when(agentService.executeSync(eq("general"), eq("hi"), eq("50")))
+                .thenReturn(succeededGoal("50", "general 的回答"));
+
+        ChatResponse resp = chatService.chat(req);
+
+        assertEquals("SUCCEEDED", resp.status());
+        verify(agentService).executeSync(eq("general"), eq("hi"), eq("50"));
+    }
+
+    @Test
+    void chat_withAgentId_switchSyncFails_shouldNotBreakChat() {
+        // 会话 Agent 同步失败（如 agentId 非法）只告警不中断：本次聊天按解析结果继续
+        ChatRequest req = new ChatRequest("hi", "50", 2L);
+        doThrow(new IllegalArgumentException("agent 不存在: 2"))
+                .when(sessionService).switchAgent("50", 2L);
+        when(agentService.findAgentNameById(2L)).thenReturn(Optional.of("writer"));
+        when(agentService.executeSync("writer", "hi", "50"))
+                .thenReturn(succeededGoal("50", "writer 的回答"));
+
+        ChatResponse resp = chatService.chat(req);
+
+        assertEquals("SUCCEEDED", resp.status(), "会话同步失败不得影响本次聊天");
+    }
+
+    @Test
     void streamReactive_shouldInvokeMainAgentRouteJudge() {
         ChatRequest req = new ChatRequest("调研竞品", null, null);
         when(sessionService.createSession("anonymous", "调研竞品")).thenReturn("50");

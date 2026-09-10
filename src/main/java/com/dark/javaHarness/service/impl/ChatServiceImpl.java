@@ -79,8 +79,11 @@ public class ChatServiceImpl implements ChatService {
             newSession = true;
         }
 
-        // 主 Agent 前置判断：分流「场景A简单(会话绑定 Agent) / 场景B复杂(multi-agent)」
-        String resolvedAgent = resolveAgent(request.message(), sessionId);
+        // Agent 解析：显式 agentId（QQ 渠道等）直连指定 Agent 并跳过路由分流；
+        // 未指定时走主 Agent 前置判断：分流「场景A简单(会话绑定 Agent) / 场景B复杂(multi-agent)」
+        String resolvedAgent = request.agentId() != null
+                ? resolveExplicitAgent(request, sessionId)
+                : resolveAgent(request.message(), sessionId);
 
         Goal goal = agentService.executeSync(resolvedAgent, request.message(), sessionId);
         writeBackContext(sessionId, request.message(), goal);
@@ -287,6 +290,22 @@ public class ChatServiceImpl implements ChatService {
             log.warn("[route] 主 Agent 判断异常，回退会话 Agent：{}", safeMessage(e));
             return sessionAgentName(sessionId);
         }
+    }
+
+    /**
+     * 显式 agentId 的同步路径解析（与 {@code streamReactive} 的 agentId 分支同口径）：
+     * 先把会话档案同步到指定 Agent（失败仅告警不中断），再解析 agent 名执行；
+     * agent 行未命中回退默认 general——与 {@code sessionAgentName} 回退语义一致。
+     */
+    private String resolveExplicitAgent(ChatRequest request, String sessionId) {
+        try {
+            sessionService.switchAgent(sessionId, request.agentId());
+        } catch (Exception e) {
+            log.warn("[chat] 会话 Agent 同步失败（不影响本次路由）sid={} agentId={}: {}",
+                    sessionId, request.agentId(), safeMessage(e));
+        }
+        return agentService.findAgentNameById(request.agentId())
+                .orElse(AgentConstants.DEFAULT_AGENT);
     }
 
     /**
