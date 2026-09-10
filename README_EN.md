@@ -182,9 +182,84 @@ The CLI is a pure HTTP client (**listens on no port**) and talks to the main ser
 | `POST` | `/api/harness/submit?agent=general&objective=...` | 📤 Submit an async goal |
 | `POST` | `/api/harness/sessions` | 🆕 Create a session (optional `name`), returns sessionId/name |
 | `GET` | `/api/llm-calls?sessionId=&limit=` | 🧮 LLM call observability: latency / tokens / outcome (default 50) |
+| `POST` | `/api/knowledge/sync` | 📚 Incremental ingestion: scan `knowledge/`, re-embed mtime-changed docs |
+| `GET` | `/api/knowledge/documents?page=&size=` | 📚 Paged ingestion ledger |
+| `GET` | `/api/knowledge/search?q=` | 📚 Debug retrieval: hit chunks & scores (not injected into prompts) |
+| `DELETE` | `/api/knowledge/documents/{name}` | 📚 Delete a knowledge document (vector chunks + ledger) |
 
 > [!NOTE]
 > `agentId` is optional (primary key of the `agent` table): when absent, the default agent (general) handles the request.
+>
+> Knowledge endpoints require `app.knowledge.enabled=true` (default) plus pgvector / embedding config; they return 503 when disabled.
+
+### 📚 Knowledge Base QA (RAG)
+
+Drop documents into the `knowledge/` directory (`.md` / `.txt`, optional front-matter `title:`); after ingestion both paths automatically retrieve & inject before answering:
+
+```bash
+mkdir -p knowledge && cp your-doc.md knowledge/
+curl -X POST http://localhost:8080/api/knowledge/sync          # incremental ingestion (only mtime-changed docs re-embedded)
+curl 'http://localhost:8080/api/knowledge/search?q=deploy'     # debug retrieval hit view
+```
+
+Answers carry `【Source N】` inline citations, the CLI prints a "Sources:" footer, and `meta.sources` / `ChatResponse.sources` expose structured provenance (doc name / title / score). Configuration (top-k / min score / injection budget) lives under `app.knowledge.*` in `application.yaml`.
+
+#### 🔍 RAG Trigger Logic
+
+RAG is never triggered by explicit commands — it is a **bypass check before every prompt assembly**; unmet conditions degrade silently with zero side effects on the main flow.
+
+Trigger decision flow:
+
+```mermaid
+flowchart TD
+    A[User request<br/>Path A direct answer / Path B orchestration node] --> B["AgentRequestSpecFactory<br/>before assembling system prompt"]
+    B --> C{"app.knowledge.enabled?"}
+    C -->|false| X[Silent skip<br/>zero side effects]
+    C -->|true| D{"Agent role in skip list?<br/>aggregator: its material is subtask results"}
+    D -->|yes| X
+    D -->|no| E{"User text length ≥<br/>min-query-chars (8)?"}
+    E -->|no| X
+    E -->|yes| F["Vector search: user text → DashScope embedding<br/>→ pgvector cosine top-k (4)"]
+    F --> G{"Hits with score ≥<br/>min-score (0.5)?"}
+    G -->|no| X
+    G -->|yes| H["Accumulate tokens per hit:<br/>hits beyond context-budget (3000) are truncated"]
+    H --> I["Render knowledge block with 【Source N】<br/>append to system prompt"]
+    I --> J["Answer: inline 【Source N】 citations<br/>+ meta.sources + CLI source footer"]
+```
+
+Retrieval injection sequence:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant F as AgentRequestSpecFactory
+    participant R as KnowledgeRetriever
+    participant S as KnowledgeService
+    participant E as DashScope Embedding
+    participant V as pgvector
+    participant L as LLM
+    U->>F: Request (Path A / Path B node)
+    F->>R: buildKnowledgeBlock(agent, sessionId, user)
+    R->>R: enabled / role / query-length short-circuits
+    R->>S: search(query)
+    S->>E: Embed query
+    S->>V: cosine similarity top-k
+    V-->>S: Hit chunks
+    S-->>R: List<KnowledgeHit>
+    R-->>F: Knowledge block (【Source N】 within budget) or null
+    F->>L: system prompt (+ knowledge block)
+    L-->>U: Answer with inline citations + meta.sources
+```
+
+Trigger conditions (fully config-driven, tune via `application.yaml`):
+
+| Trigger condition | Config key | Current value | When unmet |
+|---|---|---|---|
+| Knowledge base enabled | `enabled` | true | silent skip |
+| Role not in skip list | — (aggregator skipped by policy) | aggregator | silent skip |
+| Query length threshold | `min-query-chars` | 8 | silent skip |
+| Hit score threshold | `min-score` | 0.5 | drop the hit |
+| Within injection budget | `context-budget` | 3000 | truncate budget-exceeding hits |
 
 ## 📡 SSE Streaming Protocol
 

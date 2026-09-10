@@ -205,6 +205,63 @@ curl 'http://localhost:8080/api/knowledge/search?q=部署步骤'     # 调试检
 
 回答中出现 `【出处N】` 内联引用时，CLI 回合末尾会打印「来源:」尾注；`meta.sources` / `ChatResponse.sources` 携带结构化出处（文档名/标题/相关度）。配置（top-k / 相似度阈值 / 注入预算等）见 `application.yaml` 的 `app.knowledge.*`。
 
+#### 🔍 RAG 触发逻辑
+
+RAG 不是显式指令触发，而是**每次组装 prompt 前的旁路检查**——条件不满足全部静默降级，主链路零感知。
+
+触发决策流程：
+
+```mermaid
+flowchart TD
+    A[用户请求<br/>路径 A 直接答 / 路径 B 编排节点] --> B["AgentRequestSpecFactory<br/>组装 system prompt 前"]
+    B --> C{"app.knowledge.enabled?"}
+    C -->|false| X[静默跳过<br/>零副作用]
+    C -->|true| D{"agent 角色 ∈ 跳过名单?<br/>aggregator：材料是子任务结果"}
+    D -->|是| X
+    D -->|否| E{"user 文本长度 ≥<br/>min-query-chars（8）?"}
+    E -->|否| X
+    E -->|是| F["向量检索：user 文本 → DashScope 嵌入<br/>→ pgvector cosine top-k（4）"]
+    F --> G{"有命中且相关度 ≥<br/>min-score（0.5）?"}
+    G -->|否| X
+    G -->|是| H["逐条累加 token：<br/>超过 context-budget（3000）的命中截留"]
+    H --> I["渲染【出处N】知识块<br/>追加到 system prompt"]
+    I --> J["模型回答：句末内联【出处N】<br/>+ meta.sources + CLI 来源尾注"]
+```
+
+检索注入时序：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant F as AgentRequestSpecFactory
+    participant R as KnowledgeRetriever
+    participant S as KnowledgeService
+    participant E as DashScope 嵌入
+    participant V as pgvector 向量库
+    participant L as LLM
+    U->>F: 请求（路径 A / 路径 B 各节点）
+    F->>R: buildKnowledgeBlock(agent, sessionId, user)
+    R->>R: enabled / 角色 / 查询长度 逐层短路
+    R->>S: search(query)
+    S->>E: query 嵌入
+    S->>V: cosine 相似度 top-k
+    V-->>S: 命中片段
+    S-->>R: List<KnowledgeHit>
+    R-->>F: 知识块（预算内渲染【出处N】）或 null
+    F->>L: system prompt（含知识块）
+    L-->>U: 回答内联【出处N】+ meta.sources
+```
+
+触发条件一览（全配置驱动，改 `application.yaml` 即调）：
+
+| 触发条件 | 配置项 | 当前值 | 不满足时 |
+|---|---|---|---|
+| 知识库总开关 | `enabled` | true | 静默跳过 |
+| 角色不在跳过名单 | ——（aggregator 策略跳过） | aggregator | 静默跳过 |
+| 查询长度达标 | `min-query-chars` | 8 | 静默跳过 |
+| 命中相关度达标 | `min-score` | 0.5 | 丢弃该命中 |
+| 注入预算内 | `context-budget` | 3000 | 截留超预算命中 |
+
 ## 📡 SSE 流式协议
 
 响应 `Content-Type: text/plain`（SSE 风格行协议，每个 Flux 元素独占一行，`event:` + `data:` 成对），事件流示例：
