@@ -21,6 +21,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.ai.tool.definition.ToolDefinition;
+import org.springframework.ai.tool.execution.ToolExecutionException;
 import org.springframework.stereotype.Component;
 
 /**
@@ -104,10 +106,16 @@ public class WebTools {
                     query == null ? "-" : query, result.length(), System.currentTimeMillis() - start);
             return result;
         } catch (Exception e) {
-            // 失败不入缓存：允许模型换姿势重试
+            // 失败不入缓存：允许模型换姿势重试。
+            // 抛 ToolExecutionException 让观测层（tool_call_log）如实记 ERROR；框架
+            // DefaultToolExecutionExceptionProcessor（默认不重抛）会把消息转文本回给模型，
+            // 模型侧收到的引导文本与原返回文本一致（"工具执行失败: 分类提示"）
             String message = "工具执行失败: " + classifyError(e);
             log.warn("[tool] fetchUrl ({}) 失败: {}", url, message);
-            return message;
+            throw new ToolExecutionException(
+                    ToolDefinition.builder().name("fetchUrl").description("抓取指定 URL 网页")
+                            .inputSchema("{\"type\":\"object\"}").build(),
+                    new WebFetchException(message));
         }
     }
 

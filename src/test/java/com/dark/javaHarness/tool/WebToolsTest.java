@@ -2,6 +2,7 @@ package com.dark.javaHarness.tool;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.sun.net.httpserver.HttpExchange;
@@ -14,6 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.springframework.ai.tool.execution.ToolExecutionException;
 
 /**
  * WebTools 单测：本地 JDK HttpServer 承载 fixture 页面（不走外网），走真实 Jsoup.connect
@@ -186,11 +188,13 @@ class WebToolsTest {
     void fetchUrl_failedFetch_notCached_canRetry() {
         WebTools tools = new WebTools();
 
-        String first = tools.fetchUrl(base + "/notfound", null);
-        String second = tools.fetchUrl(base + "/notfound", null);
+        String first = assertThrows(ToolExecutionException.class,
+                () -> tools.fetchUrl(base + "/notfound", null)).getMessage();
+        String second = assertThrows(ToolExecutionException.class,
+                () -> tools.fetchUrl(base + "/notfound", null)).getMessage();
 
-        assertTrue(first.startsWith("工具执行失败"), "失败返回错误文本: " + first);
-        assertTrue(second.startsWith("工具执行失败"), "失败不入缓存，允许重试: " + second);
+        assertTrue(first.startsWith("工具执行失败: "), "失败抛异常且消息带前缀（模型侧文本不变）: " + first);
+        assertTrue(second.startsWith("工具执行失败: "), "失败不入缓存，重试仍抛（允许换姿势）: " + second);
     }
 
     /* ---------------- 错误分类（模型可读、可自愈） ---------------- */
@@ -198,42 +202,51 @@ class WebToolsTest {
     @Test
     void fetchUrl_rejectsNonHttpProtocols() {
         WebTools tools = new WebTools();
-        assertTrue(tools.fetchUrl("file:///etc/passwd", null).contains("仅支持 http/https"));
-        assertTrue(tools.fetchUrl("ftp://example.com/x", null).contains("仅支持 http/https"));
+        assertTrue(assertThrows(ToolExecutionException.class,
+                () -> tools.fetchUrl("file:///etc/passwd", null)).getMessage().contains("仅支持 http/https"));
+        assertTrue(assertThrows(ToolExecutionException.class,
+                () -> tools.fetchUrl("ftp://example.com/x", null)).getMessage().contains("仅支持 http/https"));
     }
 
     @Test
     void fetchUrl_httpErrors_classifiedWithStatusCode() {
         WebTools tools = new WebTools();
-        assertTrue(tools.fetchUrl(base + "/notfound", null).contains("HTTP 404"), "404 分类: ");
-        assertTrue(tools.fetchUrl(base + "/forbidden", null).contains("HTTP 403"), "403 分类: ");
+        assertTrue(assertThrows(ToolExecutionException.class,
+                () -> tools.fetchUrl(base + "/notfound", null)).getMessage().contains("HTTP 404"), "404 分类");
+        assertTrue(assertThrows(ToolExecutionException.class,
+                () -> tools.fetchUrl(base + "/forbidden", null)).getMessage().contains("HTTP 403"), "403 分类");
     }
 
     @Test
     void fetchUrl_nonHtmlContent_classifiedAsUnsupported() {
-        String out = new WebTools().fetchUrl(base + "/pdf", null);
+        String msg = assertThrows(ToolExecutionException.class,
+                () -> new WebTools().fetchUrl(base + "/pdf", null)).getMessage();
 
-        assertTrue(out.contains("非网页内容"), "PDF 应拒绝并提示: " + out);
-        assertTrue(out.contains("application/pdf"), "错误含 Content-Type: " + out);
+        assertTrue(msg.contains("非网页内容"), "PDF 应拒绝并提示: " + msg);
+        assertTrue(msg.contains("application/pdf"), "错误含 Content-Type: " + msg);
     }
 
     @Test
     void fetchUrl_connectionRefused_classified() {
-        String out = new WebTools().fetchUrl("http://127.0.0.1:1/refused", null);
+        String msg = assertThrows(ToolExecutionException.class,
+                () -> new WebTools().fetchUrl("http://127.0.0.1:1/refused", null)).getMessage();
 
-        assertTrue(out.contains("连接被拒绝"), "连接拒绝分类: " + out);
+        assertTrue(msg.contains("连接被拒绝"), "连接拒绝分类: " + msg);
     }
 
     @Test
     void fetchUrl_unknownHost_classified() {
-        String out = new WebTools().fetchUrl("http://this-host-definitely-does-not-exist.invalid/", null);
+        String msg = assertThrows(ToolExecutionException.class,
+                () -> new WebTools().fetchUrl("http://this-host-definitely-does-not-exist.invalid/", null)).getMessage();
 
-        assertTrue(out.contains("域名无法解析"), "DNS 失败分类: " + out);
+        assertTrue(msg.contains("域名无法解析"), "DNS 失败分类: " + msg);
     }
 
     @Test
     void fetchUrl_invalidUrl_classified() {
-        assertTrue(new WebTools().fetchUrl("not-a-url", null).contains("仅支持 http/https"), "非法 URL 分类");
+        String msg = assertThrows(ToolExecutionException.class,
+                () -> new WebTools().fetchUrl("not-a-url", null)).getMessage();
+        assertTrue(msg.contains("仅支持 http/https"), "非法 URL 分类: " + msg);
     }
 
     /* ---------------- 截断 ---------------- */
