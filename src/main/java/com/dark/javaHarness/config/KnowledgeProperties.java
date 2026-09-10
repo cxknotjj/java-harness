@@ -162,6 +162,9 @@ public class KnowledgeProperties {
 
         private String password;
 
+        /** 向量表名（PgVectorStore initializeSchema 按此自建，与库内其他项目向量表隔离） */
+        private String tableName;
+
         public String getUrl() {
             return url;
         }
@@ -184,6 +187,14 @@ public class KnowledgeProperties {
 
         public void setPassword(String password) {
             this.password = password;
+        }
+
+        public String getTableName() {
+            return tableName;
+        }
+
+        public void setTableName(String tableName) {
+            this.tableName = tableName;
         }
     }
 }

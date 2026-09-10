@@ -16,6 +16,7 @@ import org.springframework.ai.openai.api.OpenAiApi;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.pgvector.PgVectorStore;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -67,9 +68,15 @@ public class KnowledgeConfig {
         return new HikariDataSource(cfg);
     }
 
+    /**
+     * 向量库专用 JdbcTemplate：必须 {@code @Qualifier} 显式指向 vectorDataSource——
+     * 主库（MySQL）DataSource 标了 {@code @Primary}，byType 多候选时 @Primary 优先于
+     * 「参数名 = bean 名」的兜底匹配，不加 Qualifier 会错拿 MySQL（建表 DDL 打到主库报
+     * MySQL 语法错误）；@Lazy 保持首次 getConnection 才真实连接。
+     */
     @Bean
     @Lazy
-    public JdbcTemplate vectorJdbcTemplate(@Lazy DataSource vectorDataSource) {
+    public JdbcTemplate vectorJdbcTemplate(@Lazy @Qualifier("vectorDataSource") DataSource vectorDataSource) {
         return new JdbcTemplate(vectorDataSource);
     }
 
@@ -103,7 +110,7 @@ public class KnowledgeConfig {
     }
 
     /**
-     * pgvector 向量库（vector_store 表按 dimensions 自建，CREATE IF NOT EXISTS）：
+     * pgvector 向量库（向量表按 yaml table-name 自建，CREATE IF NOT EXISTS）：
      * TEXT 主键便于确定性 chunk id（docName#idx，增量摄取先删旧行后写入）。
      */
     @Bean
@@ -112,6 +119,7 @@ public class KnowledgeConfig {
                                    @Lazy EmbeddingModel knowledgeEmbeddingModel,
                                    KnowledgeProperties props) {
         return PgVectorStore.builder(vectorJdbcTemplate, knowledgeEmbeddingModel)
+                .vectorTableName(props.getPgvector().getTableName())
                 .dimensions(props.getEmbedding().getDimensions())
                 .idType(PgVectorStore.PgIdType.TEXT)
                 .initializeSchema(true)

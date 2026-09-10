@@ -117,14 +117,16 @@ app:
       # 空则回退环境变量 QWEN_API_KEY）
       base-url: ${DASHSCOPE_BASE_URL:https://dashscope.aliyuncs.com/compatible-mode}
       model: text-embedding-v4
-      # 建库维度：PgVectorStore 按此建 vector 列；更换嵌入模型/维度需重建 vector_store 表
+      # 建库维度：PgVectorStore 按此建 vector 列；更换嵌入模型/维度需删除向量表重建
       dimensions: 1024
     pgvector:
       # 知识库专用 PostgreSQL（与业务主库 MySQL 相互独立）；库需预先创建并启用 vector 扩展
       # （超级用户执行 CREATE EXTENSION vector；initializeSchema 只建表不建扩展）
-      url: jdbc:postgresql://localhost:5432/harness_kb
-      username: harness
-      password: ""
+      url: jdbc:postgresql://localhost:5432/postgres
+      username: postgres
+      password: "postgresql"
+      # 向量表名（initializeSchema 按此自建；与库内其他项目的向量表隔离）
+      table-name: vector_store_harness
 
 logging:
   level:
