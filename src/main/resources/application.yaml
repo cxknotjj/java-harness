@@ -112,6 +112,9 @@ app:
     min-query-chars: 8
     # 启动时自动增量摄取（默认关：摄取要调嵌入 API，离线启动不应报错）
     auto-sync-on-startup: false
+    # 单次嵌入请求 chunk 数上限（DashScope 兼容模式单请求硬上限 10 条文本，8 留余量；
+    # 0 = 不分批一次性提交——大文档切出大量 chunk 时会撞批次上限 400）
+    embed-batch-size: 8
     embedding:
       # OpenAI 兼容嵌入端点；key 解析同 ChatClientFactory（下方 api-key 优先，
       # 空则回退环境变量 QWEN_API_KEY）

@@ -34,6 +34,9 @@ public class KnowledgeProperties {
     /** 触发检索的最短 user 文本长度（字符）；0 = 不设下限 */
     private int minQueryChars;
 
+    /** 单次嵌入请求的 chunk 数上限（DashScope 兼容模式批次硬上限 10 条）；0 = 不分批一次提交 */
+    private int embedBatchSize;
+
     /** 启动时自动增量摄取（需嵌入端点可达，默认关：离线启动不应报错） */
     private boolean autoSyncOnStartup;
 
@@ -86,6 +89,14 @@ public class KnowledgeProperties {
 
     public void setMinQueryChars(int minQueryChars) {
         this.minQueryChars = minQueryChars;
+    }
+
+    public int getEmbedBatchSize() {
+        return embedBatchSize;
+    }
+
+    public void setEmbedBatchSize(int embedBatchSize) {
+        this.embedBatchSize = embedBatchSize;
     }
 
     public boolean isAutoSyncOnStartup() {

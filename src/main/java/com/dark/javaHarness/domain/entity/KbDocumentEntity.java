@@ -33,7 +33,7 @@ public class KbDocumentEntity {
     /** 向量库 chunk 数（旧向量删除依据：docName#0..count-1） */
     private Integer chunkCount;
 
-    /** 状态：1-已摄取有效 / 0-下线（保留扩展） */
+    /** 状态：1-已摄取有效 / 0-下线或摄取失败（失败行下次 sync 强制重试补齐向量） */
     private Integer status;
 
     /** 首次摄取时间 */

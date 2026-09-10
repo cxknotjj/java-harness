@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -30,7 +31,8 @@ import org.springframework.beans.factory.ObjectProvider;
 
 /**
  * KnowledgeServiceImpl 单测（Mockito 边界 mock）：增量摄取比对（mtime + kb）、旧 chunk
- * 删除、向量库不可用的降级/报错语义、kb 过滤表达式与检索请求组装。
+ * 删除、分批嵌入（embed-batch-size）、写入失败台账置 0 待重试、向量库不可用的
+ * 降级/报错语义、kb 过滤表达式与检索请求组装。
  */
 @ExtendWith(MockitoExtension.class)
 class KnowledgeServiceImplTest {
@@ -159,6 +161,43 @@ class KnowledgeServiceImplTest {
 
         IllegalStateException ex = assertThrows(IllegalStateException.class, service::sync);
         assertTrue(ex.getMessage().contains("向量库写入失败"));
+        verify(mapper, never()).insert(any(KbDocumentEntity.class));
+    }
+
+    @Test
+    void sync_largeDoc_batchesEmbedRequests() {
+        // embed-batch-size=2：5 chunk → 3 次 add（2+2+1），规避 DashScope 单请求 10 条硬上限
+        KnowledgeProperties props = new KnowledgeProperties();
+        props.setEmbedBatchSize(2);
+        KnowledgeServiceImpl batched = new KnowledgeServiceImpl(storeProvider, scanner, mapper, props);
+        when(storeProvider.getIfAvailable()).thenReturn(store);
+        when(scanner.scan()).thenReturn(List.of(file("a.md", "default", 100L, "字".repeat(2400))));
+        when(mapper.selectOne(any())).thenReturn(null);
+        ArgumentCaptor<List<Document>> docsCaptor = ArgumentCaptor.forClass(List.class);
+
+        KnowledgeSyncView view = batched.sync();
+
+        assertEquals(new KnowledgeSyncView(1, 1, 0, 5), view);
+        verify(store, times(3)).add(docsCaptor.capture());
+        List<List<Document>> batches = docsCaptor.getAllValues();
+        assertEquals(List.of(2, 2, 1), batches.stream().map(List::size).toList(), "按上限分批，末批余量");
+        assertEquals("a.md#4", batches.get(2).get(0).getId(), "批次按 chunk 序切分，确定性 id 不变");
+    }
+
+    @Test
+    void sync_existingRowWriteFailure_marksRowFailedForRetry() {
+        // 「先删后写」中断窗口兜底：旧 chunk 已删、写入失败 → 台账行置 0，
+        // 下次 sync 不再被「status=1 + mtime 未变」判据跳过，强制重摄取补齐向量
+        when(storeProvider.getIfAvailable()).thenReturn(store);
+        when(scanner.scan()).thenReturn(List.of(file("a.md", "default", 200L, "新正文")));
+        when(mapper.selectOne(any())).thenReturn(row("a.md", "default", 100L, 1, 1));
+        org.mockito.Mockito.doThrow(new RuntimeException("pg down")).when(store).add(anyList());
+        ArgumentCaptor<KbDocumentEntity> rowCaptor = ArgumentCaptor.forClass(KbDocumentEntity.class);
+
+        assertThrows(IllegalStateException.class, () -> service.sync());
+
+        verify(mapper).updateById(rowCaptor.capture());
+        assertEquals(0, rowCaptor.getValue().getStatus(), "写入失败应置 0（失败待重试）");
         verify(mapper, never()).insert(any(KbDocumentEntity.class));
     }
 

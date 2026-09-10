@@ -87,9 +87,16 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
                             "kb", file.kb())));
                 }
                 if (!docs.isEmpty()) {
-                    store.add(docs);
+                    addInBatches(store, docs);
                 }
             } catch (Exception e) {
+                // 写入失败兜底：旧 chunk 已删、新 chunk 未写全——台账行置 0（失败待重试），
+                // 下次 sync 不再被「status=1 + mtime 未变」增量判据跳过，强制重摄取补齐向量；
+                // 新文件（无台账行）天然重扫，无需置位
+                if (row != null) {
+                    row.setStatus(0);
+                    mapper.updateById(row);
+                }
                 throw new IllegalStateException("向量库写入失败（" + file.name() + "）: " + rootMessage(e), e);
             }
             upsertRow(row, file, pieces.size());
@@ -213,6 +220,23 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
             store.delete(ids);
         } catch (Exception e) {
             throw new IllegalStateException("向量库旧 chunk 删除失败（" + docName + "）: " + rootMessage(e), e);
+        }
+    }
+
+    /**
+     * 分批写入向量库（app.knowledge.embed-batch-size，0 = 不分批一次提交）：
+     * DashScope 兼容模式单请求硬上限 10 条文本，默认 8 留余量——Spring AI 默认
+     * BatchingStrategy 只按总 token 打包不管条数，大文档切出大量 chunk 时不分批
+     * 会整批 400 失败。
+     */
+    private void addInBatches(VectorStore store, List<Document> docs) {
+        int batchSize = props.getEmbedBatchSize();
+        if (batchSize <= 0 || docs.size() <= batchSize) {
+            store.add(docs);
+            return;
+        }
+        for (int from = 0; from < docs.size(); from += batchSize) {
+            store.add(docs.subList(from, Math.min(from + batchSize, docs.size())));
         }
     }
 
