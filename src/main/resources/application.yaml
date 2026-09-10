@@ -131,6 +131,24 @@ app:
       # 向量表名（initializeSchema 按此自建；与库内其他项目的向量表隔离）
       table-name: vector_store_harness
 
+# QQ 渠道接入（NapCat / OneBot 11，channel/qq 垂直包）：enabled=false 时整链不装配
+# （无 /onebot/event 端点、无线程池、无出站客户端）。token/secret 支持环境变量覆盖
+# （NAPCAT_API_TOKEN / NAPCAT_EVENT_SECRET）；api-token 默认值为联调 token，生产请注入环境变量。
+napcat:
+  enabled: true
+  api-base-url: http://127.0.0.1:3000    # NapCat HTTP API（跨机调试用 ssh -L 3000 隧道）
+  api-token: ${NAPCAT_API_TOKEN:napcat123}        # 与 onebot11 httpServers.token 一致
+  self-id: "3896564418"                  # 机器人 QQ 号（自消息过滤 + 群聊 @ 判据）
+  agent-id:                              # 空 = 默认 Agent；填 agent 表主键后该 agent 的 knowledge 绑定自动生效
+  event-secret: ${NAPCAT_EVENT_SECRET:}  # 与 onebot11 httpClients.token 一致；空 = 不校验上报签名
+  group-trigger:
+    mode: at            # at=仅@机器人 | prefix=命令前缀 | all=全部响应
+    prefix: "/ai"
+  rate-limit:
+    per-user-seconds: 10  # 群聊同用户回复最小间隔（防风控）；0 = 不限制
+  reply:
+    max-length: 3000      # 超长按段落边界分段；0 = 不分段
+
 logging:
   level:
     root: info
