@@ -10,6 +10,7 @@ import javax.crypto.spec.SecretKeySpec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -28,6 +29,13 @@ import org.springframework.web.bind.annotation.RestController;
 public class OneBotEventController {
 
     private static final Logger log = LoggerFactory.getLogger(OneBotEventController.class);
+
+    /**
+     * ACK 响应体：OneBot 11 HTTP 上报的响应体会被 NapCat 当「快速操作」JSON 解析，
+     * 必须是 JSON 对象（{} = 无快速操作）；纯文本会让 NapCat 报 JSON5 解析错误并连带
+     * 触发「回复消息缺少 id 或 seq」等怪异行为。
+     */
+    private static final String EMPTY_QUICK_OP = "{}";
 
     private final ObjectMapper objectMapper;
     private final OneBotEventService eventService;
@@ -56,11 +64,11 @@ public class OneBotEventController {
             OneBotEvent event = objectMapper.readValue(body, OneBotEvent.class);
             // 非 message 事件（meta/notice/request）与上报链路无关，静默 ACK
             if (!"message".equals(event.postType())) {
-                return ResponseEntity.ok("ok");
+                return ack();
             }
             if (!dedup.tryAcquire(event.messageId() == null ? null : String.valueOf(event.messageId()))) {
                 log.debug("[napcat] 重复上报丢弃 messageId={}", event.messageId());
-                return ResponseEntity.ok("ok");
+                return ack();
             }
             try {
                 onebotExecutor.execute(() -> eventService.handle(event));
@@ -71,7 +79,12 @@ public class OneBotEventController {
         } catch (Exception e) {
             log.warn("[napcat] 上报处理异常（恒 200，避免 NapCat 重发风暴）：{}", e.getMessage());
         }
-        return ResponseEntity.ok("ok");
+        return ack();
+    }
+
+    /** 200 ACK：响应体为空快速操作对象（NapCat 按 JSON 解析，见 EMPTY_QUICK_OP 注释） */
+    private static ResponseEntity<String> ack() {
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).body(EMPTY_QUICK_OP);
     }
 
     /** 上报验签：X-Signature: sha1=HMAC-SHA1(secret, rawBody)；secret 未配置时跳过 */
