@@ -182,7 +182,7 @@ The CLI is a pure HTTP client (**listens on no port**) and talks to the main ser
 | `POST` | `/api/harness/submit?agent=general&objective=...` | 📤 Submit an async goal |
 | `POST` | `/api/harness/sessions` | 🆕 Create a session (optional `name`), returns sessionId/name |
 | `GET` | `/api/llm-calls?sessionId=&limit=` | 🧮 LLM call observability: latency / tokens / outcome (default 50) |
-| `POST` | `/api/knowledge/sync` | 📚 Incremental ingestion: scan `knowledge/`, re-embed mtime-changed docs |
+| `POST` | `/api/knowledge/sync` | 📚 Incremental ingestion: scan `knowledge/`, re-embed mtime-changed docs, and purge orphan vectors of deleted files |
 | `GET` | `/api/knowledge/documents?page=&size=` | 📚 Paged ingestion ledger |
 | `GET` | `/api/knowledge/search?q=` | 📚 Debug retrieval: hit chunks & scores (not injected into prompts) |
 | `DELETE` | `/api/knowledge/documents/{name}` | 📚 Delete a knowledge document (vector chunks + ledger) |

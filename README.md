@@ -184,7 +184,7 @@ CLI 是纯 HTTP 客户端（**不监听任何端口**），通过 REST 调用主
 | `POST` | `/api/harness/submit?agent=general&objective=...` | 📤 提交一个异步目标 |
 | `POST` | `/api/harness/sessions` | 🆕 新建会话（可选 `name`），返回 sessionId/name |
 | `GET` | `/api/llm-calls?sessionId=&limit=` | 🧮 LLM 调用观测：耗时 / token / 成败（默认 50 条） |
-| `POST` | `/api/knowledge/sync` | 📚 知识库增量摄取：扫描 knowledge/ 目录，mtime 变更文档重嵌入 |
+| `POST` | `/api/knowledge/sync` | 📚 知识库增量摄取：扫描 knowledge/ 目录，mtime 变更文档重嵌入，并清理磁盘已删文档的孤儿向量 |
 | `GET` | `/api/knowledge/documents?page=&size=` | 📚 知识库摄取台账分页 |
 | `GET` | `/api/knowledge/search?q=` | 📚 调试检索：向量检索命中片段与相关度（不注入 prompt） |
 | `DELETE` | `/api/knowledge/documents/{name}` | 📚 删除指定知识文档（向量 chunk + 台账） |

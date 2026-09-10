@@ -108,14 +108,15 @@ public class KnowledgeRetriever {
     /**
      * 解析 agent 表 knowledge 列原文（逗号分隔 kb 标识）→ 去空去重的库列表；
      * 空白/全空段返回 null（= 不限，检索全部知识，兼容未绑定行为）。
-     * 仿 ToolAssignments 的 CSV 解析口径，单引号剔除（filter 表达式字面量分隔符）。
+     * 仿 ToolAssignments 的 CSV 解析口径；单引号等表达式清洗统一由
+     * {@code KnowledgeServiceImpl.kbFilterExpression} 在过滤表达式生成处收口。
      */
     public static List<String> parseBinding(String binding) {
         if (binding == null || binding.isBlank()) {
             return null;
         }
         List<String> kbs = java.util.Arrays.stream(binding.split(","))
-                .map(kb -> kb.replace("'", "").trim())
+                .map(String::trim)
                 .filter(kb -> !kb.isEmpty())
                 .distinct()
                 .toList();

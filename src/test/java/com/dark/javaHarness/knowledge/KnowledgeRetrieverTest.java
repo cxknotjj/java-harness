@@ -156,10 +156,11 @@ class KnowledgeRetrieverTest {
     }
 
     @Test
-    void parseBinding_csv_trimsDedupsAndStripsQuotes() {
+    void parseBinding_csv_trimsAndDedups() {
         assertEquals(List.of("java", "frontend"),
                 KnowledgeRetriever.parseBinding("java, frontend ,java"));
-        assertEquals(List.of("java"), KnowledgeRetriever.parseBinding("'java'"));
         assertEquals(List.of("a b"), KnowledgeRetriever.parseBinding(" a b "));
+        // 表达式清洗（单引号剔除）统一由 kbFilterExpression 收口，此处不再处理
+        assertEquals(List.of("'java'"), KnowledgeRetriever.parseBinding("'java'"));
     }
 }

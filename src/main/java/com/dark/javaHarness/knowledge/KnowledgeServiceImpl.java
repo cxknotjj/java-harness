@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -104,7 +105,35 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
             chunks += pieces.size();
             log.info("[knowledge] 已摄取 '{}'：{} chunk（旧 {} chunk 已删）", file.name(), pieces.size(), oldChunkCount);
         }
+        cleanupOrphans(store, files);
         return new KnowledgeSyncView(files.size(), updated, skipped, chunks);
+    }
+
+    /**
+     * 孤儿清理：台账有、本轮扫描结果中没有的行 = 文档已从磁盘删除——删除其向量
+     * chunk 与台账行，避免绑定 agent 继续检索到已删内容。
+     *
+     * <p>安全阀：扫描结果为空时跳过清理（目录缺失/整体不可读时 scanner 返回空表，
+     * 此时全量清理会误删整个库）。
+     */
+    private void cleanupOrphans(VectorStore store, List<KnowledgeDocumentScanner.KbFile> files) {
+        if (files.isEmpty()) {
+            return;
+        }
+        Set<String> scannedNames = files.stream()
+                .map(KnowledgeDocumentScanner.KbFile::name)
+                .collect(Collectors.toSet());
+        List<KbDocumentEntity> rows = mapper.selectList(new QueryWrapper<KbDocumentEntity>()
+                .select("id", "doc_name", "chunk_count"));
+        for (KbDocumentEntity row : rows) {
+            if (scannedNames.contains(row.getDocName())) {
+                continue;
+            }
+            deleteChunks(store, row.getDocName(), row.getChunkCount() == null ? 0 : row.getChunkCount());
+            mapper.deleteById(row.getId());
+            log.info("[knowledge] 已清理孤儿文档 '{}'（磁盘已删除，台账 {} chunk）",
+                    row.getDocName(), row.getChunkCount());
+        }
     }
 
     @Override
@@ -133,11 +162,17 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
 
     @Override
     public List<KnowledgeHit> search(String query, List<String> kbs) {
-        VectorStore store = storeProvider.getIfAvailable();
-        if (query == null || query.isBlank() || store == null) {
+        if (query == null || query.isBlank()) {
             return List.of();
         }
         try {
+            // getIfAvailable 触发 vectorStore 首次懒创建（含 initializeSchema 建表 DDL）：
+            // PG 未就绪时此处抛 BeanCreationException——必须与检索失败同样降级空表，
+            // 否则首次 chat 即被 bean 创建异常打断（降级口径：检索是增强信息不阻断主链路）
+            VectorStore store = storeProvider.getIfAvailable();
+            if (store == null) {
+                return List.of();
+            }
             return store.similaritySearch(searchRequest(query, kbs)).stream()
                     .map(doc -> new KnowledgeHit(
                             String.valueOf(doc.getMetadata().getOrDefault("source", "")),

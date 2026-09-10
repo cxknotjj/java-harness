@@ -27,6 +27,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.beans.factory.BeanCreationException;
 import org.springframework.beans.factory.ObjectProvider;
 
 /**
@@ -202,6 +203,33 @@ class KnowledgeServiceImplTest {
     }
 
     @Test
+    void sync_ledgerRowMissingOnDisk_orphanCleanedUp() {
+        // 孤儿清理：台账有、磁盘没有 → 删该文档 chunk + 台账行，绑定 agent 不再检索到已删内容
+        when(storeProvider.getIfAvailable()).thenReturn(store);
+        when(scanner.scan()).thenReturn(List.of(file("a.md", "default", 100L, "短正文")));
+        when(mapper.selectOne(any())).thenReturn(row("a.md", "default", 100L, 1, 1));
+        when(mapper.selectList(any()))
+                .thenReturn(List.of(row("ghost.md", "default", 50L, 2, 1)));
+
+        service.sync();
+
+        verify(store).delete(List.of("ghost.md#0", "ghost.md#1"));
+        verify(mapper).deleteById(1L);
+    }
+
+    @Test
+    void sync_emptyScan_skipsOrphanCleanup() {
+        // 安全阀：目录缺失/整体不可读时 scanner 返回空表，跳过清理防全量误删
+        when(storeProvider.getIfAvailable()).thenReturn(store);
+        when(scanner.scan()).thenReturn(List.of());
+
+        service.sync();
+
+        verify(mapper, never()).selectList(any());
+        verify(store, never()).delete(anyList());
+    }
+
+    @Test
     void delete_missingDoc_returnsFalse() {
         when(mapper.selectOne(any())).thenReturn(null);
         assertFalse(service.delete("ghost.md"));
@@ -228,6 +256,16 @@ class KnowledgeServiceImplTest {
     void search_storeUnavailable_degradesToEmpty() {
         when(storeProvider.getIfAvailable()).thenReturn(null);
         assertTrue(service.search("问题", null).isEmpty());
+    }
+
+    @Test
+    void search_storeLazyInitFailure_degradesToEmpty() {
+        // chat 路径首次检索会触发 vectorStore 懒创建：PG 未就绪时 getIfAvailable 抛
+        // BeanCreationException——必须降级空表，不得把整个 chat 打成 FAILED（降级口径）
+        when(storeProvider.getIfAvailable())
+                .thenThrow(new BeanCreationException("vectorStore", "Failed to obtain JDBC Connection"));
+
+        assertTrue(service.search("问题", null).isEmpty(), "懒创建失败应降级空表，不阻断主链路");
     }
 
     @Test
