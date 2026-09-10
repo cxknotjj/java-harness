@@ -262,9 +262,9 @@ class MultiAgentGraphAgentTest {
         stubChat(leadJson); // 默认客户端：lead + 聚合（get(any()) 兜底）
         // 专家行有配置 → 子任务按专家部署模型 id 取对应客户端
         when(agentService.getAgentConfig(eq("researcher")))
-                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig(101L, "qwen-plus", "调研提示词")));
+                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig(101L, "qwen-plus", "调研提示词", null)));
         when(agentService.getAgentConfig(eq("analyst")))
-                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig(102L, "deepseek-chat", "分析提示词")));
+                .thenReturn(java.util.Optional.of(new com.dark.javaHarness.domain.AgentConfig(102L, "deepseek-chat", "分析提示词", null)));
         // 先建好独立 stub 的专家客户端，再注册（避免在 when() 求值内嵌套 stubbing）
         ChatClient researcherClient = newStubbedClient("调研结果");
         ChatClient analystClient = newStubbedClient("分析结果");

@@ -63,8 +63,10 @@ public class KnowledgeRetriever {
      * @param agentName 角色名（aggregator 策略跳过）
      * @param sessionId 会话 ID（来源记录键；路由判定等无会话场景不记录）
      * @param user      当前 user 文本（检索 query）
+     * @param kbs       该 agent 绑定的知识库列表（{@link #parseBinding} 解析 agent 表
+     *                  knowledge 列；null = 不限，检索全部知识）
      */
-    public String buildKnowledgeBlock(String agentName, String sessionId, String user) {
+    public String buildKnowledgeBlock(String agentName, String sessionId, String user, List<String> kbs) {
         if (agentName != null && SKIP_ROLES.contains(agentName)) {
             return null;
         }
@@ -75,7 +77,7 @@ public class KnowledgeRetriever {
         if (props.getMinQueryChars() > 0 && query.length() < props.getMinQueryChars()) {
             return null;
         }
-        List<KnowledgeService.KnowledgeHit> hits = knowledgeService.search(query);
+        List<KnowledgeService.KnowledgeHit> hits = knowledgeService.search(query, kbs);
         if (hits == null || hits.isEmpty()) {
             return null;
         }
@@ -101,6 +103,23 @@ public class KnowledgeRetriever {
         }
         remember(sessionId, hits.subList(0, cited));
         return BLOCK_HEADER + body + BLOCK_FOOTER;
+    }
+
+    /**
+     * 解析 agent 表 knowledge 列原文（逗号分隔 kb 标识）→ 去空去重的库列表；
+     * 空白/全空段返回 null（= 不限，检索全部知识，兼容未绑定行为）。
+     * 仿 ToolAssignments 的 CSV 解析口径，单引号剔除（filter 表达式字面量分隔符）。
+     */
+    public static List<String> parseBinding(String binding) {
+        if (binding == null || binding.isBlank()) {
+            return null;
+        }
+        List<String> kbs = java.util.Arrays.stream(binding.split(","))
+                .map(kb -> kb.replace("'", "").trim())
+                .filter(kb -> !kb.isEmpty())
+                .distinct()
+                .toList();
+        return kbs.isEmpty() ? null : kbs;
     }
 
     /** 该会话最近一次知识命中的来源（保序；无记录返回空列表）——meta.sources 组装用 */

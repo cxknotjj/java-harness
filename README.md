@@ -205,6 +205,18 @@ curl 'http://localhost:8080/api/knowledge/search?q=部署步骤'     # 调试检
 
 回答中出现 `【出处N】` 内联引用时，CLI 回合末尾会打印「来源:」尾注；`meta.sources` / `ChatResponse.sources` 携带结构化出处（文档名/标题/相关度）。配置（top-k / 相似度阈值 / 注入预算等）见 `application.yaml` 的 `app.knowledge.*`。
 
+#### 🗂️ 多知识库与 agent 绑定
+
+`knowledge/` 的一级子目录即独立知识库（kb 标识），根目录散文档归公共库 `default`：
+
+```bash
+mkdir -p knowledge/java knowledge/frontend        # 一级子目录 = 知识库
+cp spring.md knowledge/java/ && cp vue.md knowledge/frontend/
+curl -X POST http://localhost:8080/api/knowledge/sync
+```
+
+在 `agent` 表 `knowledge` 列填写逗号分隔的 kb 标识（如 `java,frontend`）即可把 agent 绑定到指定知识库——检索时按向量 metadata 的 `kb` 字段过滤（`kb in [...]`），agent 只读绑定的库，防止读串；列留空/NULL 检索全部知识。文档在子目录间移动（kb 变更）会在下次 sync 自动重摄取补齐。
+
 #### 🔍 RAG 触发逻辑
 
 RAG 不是显式指令触发，而是**每次组装 prompt 前的旁路检查**——条件不满足全部静默降级，主链路零感知。

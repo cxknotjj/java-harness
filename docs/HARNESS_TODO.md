@@ -122,7 +122,7 @@
 
 - [ ] **Web Search 接入**：注册搜索服务商 API（博查/Tavily/SerpAPI 等任一），新增 `search` 工具归入 `WebTools`，分配给 researcher/general——补「调研」第一步空缺，浏览器组退居 JS 渲染兜底
   - 验收：researcher 对「近期事件」类问题能返回带来源的检索结果
-- [x] **RAG 知识库**（2026-09 完成）：pgvector 向量库 + DashScope text-embedding-v4 嵌入（1024 维）；knowledge/ 目录 .md/.txt 增量摄取（mtime 比对→MarkdownChunker 切分→嵌入入向量库，`POST /api/knowledge/sync`）；路径 A/B 检索增强（AgentRequestSpecFactory 唯一汇合点注入【出处N】知识段，aggregator 角色策略跳过）；出处透出（meta.sources + CLI 来源尾注）；管理端点 /api/knowledge（sync/documents/search/delete）；PG 不可用静默降级不影响启动
+- [x] **RAG 知识库**（2026-09 完成）：pgvector 向量库 + DashScope text-embedding-v4 嵌入（1024 维）；knowledge/ 目录 .md/.txt 增量摄取（mtime 比对→MarkdownChunker 切分→嵌入入向量库，`POST /api/knowledge/sync`）；路径 A/B 检索增强（AgentRequestSpecFactory 唯一汇合点注入【出处N】知识段，aggregator 角色策略跳过）；出处透出（meta.sources + CLI 来源尾注）；管理端点 /api/knowledge（sync/documents/search/delete）；PG 不可用静默降级不影响启动；多知识库隔离（knowledge/ 一级子目录=kb，agent 表 knowledge 列 CSV 绑定，检索按向量 metadata.kb filterExpression 过滤防读串，kb 变更重摄取自愈）
   - 验收：knowledge/ 放本地文档 → sync 摄取 → 知识库问答，回答带【出处N】内联引用 + meta.sources + CLI 尾注 ✓
   - 待办余项：目录文件监听（WatchService）、BM25 混合检索与重排、web 管理页
 - [x] **MCP 工具接入**：让 Agent 通过 MCP 连接外部工具/服务，扩展工具生态（不再逐个自研）

@@ -22,6 +22,10 @@ import org.springframework.stereotype.Component;
  * 坏文件 warn 跳过不抛），但不在本层缓存——增量判据（name + mtime）在 kb_document 表，
  * 服务层按表比对决定是否重新摄取，文件级缓存无意义。
  *
+ * <p>多库模型：knowledge/ 一级子目录 = 知识库（kb 标识），根目录散文件归公共库
+ * default——文件放对目录即完成归库；子目录文档 name 带子目录前缀（java/spring.md）
+ * 保证唯一摄取键，kb 由路径首段解析。仅扫两层（根 + 一级子目录），更深层目录不递归。
+ *
  * <p>文件格式（Markdown / 纯文本 + 可选 front-matter）：
  * <pre>
  * ---
@@ -35,8 +39,11 @@ public class KnowledgeDocumentScanner {
 
     private static final Logger log = LoggerFactory.getLogger(KnowledgeDocumentScanner.class);
 
-    /** 单个待摄取文档：name 为唯一摄取键（文件名），title 用于出处展示 */
-    public record KbFile(String name, String title, long mtime, String text) {
+    /** 根目录散文件归属的公共知识库标识 */
+    public static final String DEFAULT_KB = "default";
+
+    /** 单个待摄取文档：name 为唯一摄取键（相对知识目录路径），kb 为所属知识库标识 */
+    public record KbFile(String name, String kb, String title, long mtime, String text) {
     }
 
     private final Path dir;
@@ -49,14 +56,15 @@ public class KnowledgeDocumentScanner {
         }
     }
 
-    /** 扫描知识目录全部有效文档（按名称排序）；目录缺失/为空返回空表 */
+    /** 扫描知识目录全部有效文档（根目录 + 一级子目录，按名称排序）；目录缺失/为空返回空表 */
     public List<KbFile> scan() {
         if (!Files.isDirectory(dir)) {
             return List.of();
         }
         List<KbFile> out = new ArrayList<>();
-        try (Stream<Path> files = Files.list(dir)) {
-            files.filter(p -> Files.isRegularFile(p))
+        try (Stream<Path> files = Files.walk(dir, 2)) {
+            files.filter(p -> !p.equals(dir))
+                    .filter(Files::isRegularFile)
                     .filter(p -> {
                         String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
                         return n.endsWith(".md") || n.endsWith(".txt");
@@ -76,13 +84,16 @@ public class KnowledgeDocumentScanner {
 
     /** 单文件加载：失败 warn 跳过返回 null（对齐 SkillRepository 容错口径） */
     private KbFile load(Path file) {
+        String rel = dir.relativize(file).toString().replace('\\', '/');
+        int slash = rel.indexOf('/');
+        String kb = slash > 0 ? rel.substring(0, slash) : DEFAULT_KB;
         String name = file.getFileName().toString();
         try {
             long mtime = Files.getLastModifiedTime(file).toMillis();
             Parsed parsed = parse(Files.readString(file), name);
-            return new KbFile(name, parsed.title(), mtime, parsed.text());
+            return new KbFile(rel, kb, parsed.title(), mtime, parsed.text());
         } catch (Exception e) {
-            log.warn("[knowledge] 解析知识文件失败（{}）: {}", name, e.toString());
+            log.warn("[knowledge] 解析知识文件失败（{}）: {}", rel, e.toString());
             return null;
         }
     }

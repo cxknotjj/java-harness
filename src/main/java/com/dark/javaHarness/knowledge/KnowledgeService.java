@@ -28,8 +28,13 @@ public interface KnowledgeService {
     /** 摄取记录分页列表（doc_name 升序） */
     PageResult<KbDocumentEntity> list(long page, long size);
 
-    /** 调试检索：不走注入管线，直接返回命中（含文本与相似度），供 /api/knowledge/search 验证索引 */
-    List<KnowledgeHit> search(String query);
+    /**
+     * 检索：向量相似度 top-k（含调试与注入管线共用）。
+     *
+     * @param kbs 知识库过滤（agent 绑定的 kb 标识列表，对应 chunk metadata.kb）；
+     *            null/空 = 不限，检索全部知识（兼容多库化之前行为）
+     */
+    List<KnowledgeHit> search(String query, List<String> kbs);
 
     /** 调试检索命中：出处 + 相似度 + chunk 原文 */
     record KnowledgeHit(String docName, String title, double score, String text) {

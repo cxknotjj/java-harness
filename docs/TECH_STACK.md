@@ -83,7 +83,7 @@ controller（REST + SSE 流式 + 全局异常处理 + LlmCallController 观测�
 | ------------- | ------------------------------------------------------------------------------- |
 | 更多模型接入        | 官方 DeepSeek starter、本地 Ollama、Qwen 官方 DashScope starter，按 Agent 路由不同模型          |
 | 多模态           | 图片/语音输入（DashScope 兼容模式逐步支持）                                                     |
-| **RAG（向量检索）** | **已实现**：pgvector + DashScope 嵌入，knowledge/ 目录增量摄取 + 路径 A/B 检索增强（见「关键设计」RAG 段）；待扩展：BM25 混合检索与重排、目录文件监听 |
+| **RAG（向量检索）** | **已实现**：pgvector + DashScope 嵌入，knowledge/ 目录增量摄取 + 路径 A/B 检索增强，一级子目录多知识库 + agent 表 knowledge 列绑定（向量 metadata.kb 过滤隔离）；待扩展：BM25 混合检索与重排、目录文件监听 |
 | **MCP 接入**    | 让 Agent 通过 MCP 连接外部工具/服务，扩展工具生态                                                 |
 | Agent 编排框架    | LangGraph4j / AutoGen 风格的多 Agent 协作、任务规划、反思循环                                   |
 

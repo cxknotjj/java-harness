@@ -65,7 +65,7 @@ public class AgentConfigProvider {
         }
     }
 
-    /** 从 agent 表读取指定 Agent 的运行配置（部署模型 + 系统提示词；模型名经 model_provider 表解析） */
+    /** 从 agent 表读取指定 Agent 的运行配置（部署模型 + 系统提示词 + 知识库绑定；模型名经 model_provider 表解析） */
     public Optional<AgentConfig> getAgentConfig(String agentName) {
         try {
             AgentEntity row = agentMapper.selectOne(new LambdaQueryWrapper<AgentEntity>()
@@ -76,9 +76,10 @@ public class AgentConfigProvider {
                 AgentConfig cfg = new AgentConfig(
                         row.getModelProviderId(),
                         modelName,
-                        blankToNull(row.getPrompt()));
-                log.info("[agent配置] agentName='{}' -> modelProviderId={}, model={}, prompt={}",
-                        agentName, cfg.modelProviderId(), cfg.model(), cfg.prompt());
+                        blankToNull(row.getPrompt()),
+                        blankToNull(row.getKnowledge()));
+                log.info("[agent配置] agentName='{}' -> modelProviderId={}, model={}, prompt={}, knowledge={}",
+                        agentName, cfg.modelProviderId(), cfg.model(), cfg.prompt(), cfg.knowledge());
                 return Optional.of(cfg);
             }
             log.warn("[agent配置] agent 表无 agentName='{}' 记录，将使用默认配置", agentName);

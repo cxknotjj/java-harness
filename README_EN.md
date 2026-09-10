@@ -204,6 +204,18 @@ curl 'http://localhost:8080/api/knowledge/search?q=deploy'     # debug retrieval
 
 Answers carry `【Source N】` inline citations, the CLI prints a "Sources:" footer, and `meta.sources` / `ChatResponse.sources` expose structured provenance (doc name / title / score). Configuration (top-k / min score / injection budget) lives under `app.knowledge.*` in `application.yaml`.
 
+#### 🗂️ Multiple Knowledge Bases & Agent Binding
+
+Each first-level subdirectory of `knowledge/` is a standalone knowledge base (kb id); loose files at the root belong to the shared `default` base:
+
+```bash
+mkdir -p knowledge/java knowledge/frontend        # subdirectory = knowledge base
+cp spring.md knowledge/java/ && cp vue.md knowledge/frontend/
+curl -X POST http://localhost:8080/api/knowledge/sync
+```
+
+Set the `agent` table's `knowledge` column to a comma-separated list of kb ids (e.g. `java,frontend`) to bind an agent to specific bases — retrieval filters on the vector metadata `kb` field (`kb in [...]`), so an agent only reads its bound bases; leave it empty/NULL to search all knowledge. Moving a document across subdirectories (kb change) triggers automatic re-ingestion on the next sync.
+
 #### 🔍 RAG Trigger Logic
 
 RAG is never triggered by explicit commands — it is a **bypass check before every prompt assembly**; unmet conditions degrade silently with zero side effects on the main flow.

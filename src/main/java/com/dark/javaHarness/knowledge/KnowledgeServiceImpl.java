@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
@@ -22,7 +23,9 @@ import org.springframework.boot.ApplicationRunner;
 /**
  * RAG 知识库服务实现：增量摄取 / 删除 / 分页 / 调试检索。
  *
- * <p>增量判据：kb_document 行的 (doc_name, mtime) 与文件现状比对——mtime 未变跳过，
+ * <p>增量判据：kb_document 行的 (doc_name, mtime, kb) 与文件现状比对——mtime 与 kb
+ * 均未变跳过（kb 变更即重摄取：存量行 kb 为 NULL 时借下次 sync 自愈补齐 chunk
+ * metadata.kb），
  * 变更文档先删旧 chunk（确定性 id = {@code docName#idx}，重摄取可精确覆盖）再重新
  * 切分嵌入入库，最后 upsert 摄取记录。
  *
@@ -65,7 +68,8 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
         for (KnowledgeDocumentScanner.KbFile file : files) {
             KbDocumentEntity row = rowOf(file.name());
             if (row != null && row.getStatus() != null && row.getStatus() == 1
-                    && Objects.equals(row.getMtime(), file.mtime())) {
+                    && Objects.equals(row.getMtime(), file.mtime())
+                    && Objects.equals(row.getKb(), file.kb())) {
                 skipped++;
                 continue;
             }
@@ -79,7 +83,8 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
                     docs.add(new Document(chunkId(file.name(), i), pieces.get(i), Map.of(
                             "source", file.name(),
                             "title", file.title(),
-                            "chunkIndex", i)));
+                            "chunkIndex", i,
+                            "kb", file.kb())));
                 }
                 if (!docs.isEmpty()) {
                     store.add(docs);
@@ -120,13 +125,13 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
     }
 
     @Override
-    public List<KnowledgeHit> search(String query) {
+    public List<KnowledgeHit> search(String query, List<String> kbs) {
         VectorStore store = storeProvider.getIfAvailable();
         if (query == null || query.isBlank() || store == null) {
             return List.of();
         }
         try {
-            return store.similaritySearch(searchRequest(query)).stream()
+            return store.similaritySearch(searchRequest(query, kbs)).stream()
                     .map(doc -> new KnowledgeHit(
                             String.valueOf(doc.getMetadata().getOrDefault("source", "")),
                             String.valueOf(doc.getMetadata().getOrDefault("title", "")),
@@ -165,14 +170,35 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
         return store;
     }
 
-    /** 相似度检索请求（top-k 0 = 不限条数；min-score 直接映射相似度阈值） */
-    SearchRequest searchRequest(String query) {
+    /** 相似度检索请求（top-k 0 = 不限条数；min-score 直接映射相似度阈值；kbs 非空时按 metadata.kb 过滤） */
+    SearchRequest searchRequest(String query, List<String> kbs) {
         SearchRequest.Builder builder = SearchRequest.builder().query(query);
         if (props.getTopK() > 0) {
             builder.topK(props.getTopK());
         }
         builder.similarityThreshold(props.getMinScore());
+        String kbFilter = kbFilterExpression(kbs);
+        if (kbFilter != null) {
+            builder.filterExpression(kbFilter);
+        }
         return builder.build();
+    }
+
+    /**
+     * kb 过滤表达式（如 {@code kb in ['java','frontend']}）；kbs 空/全空白返回 null（不过滤）。
+     * kb 取自目录名，单引号属病态输入直接剔除（filter 表达式字符串字面量分隔符）。
+     */
+    static String kbFilterExpression(List<String> kbs) {
+        if (kbs == null || kbs.isEmpty()) {
+            return null;
+        }
+        String tokens = kbs.stream()
+                .map(kb -> kb == null ? "" : kb.replace("'", "").trim())
+                .filter(kb -> !kb.isEmpty())
+                .distinct()
+                .map(kb -> "'" + kb + "'")
+                .collect(Collectors.joining(","));
+        return tokens.isEmpty() ? null : "kb in [" + tokens + "]";
     }
 
     private void deleteChunks(VectorStore store, String docName, int oldChunkCount) {
@@ -202,6 +228,7 @@ public class KnowledgeServiceImpl implements KnowledgeService, ApplicationRunner
     private void upsertRow(KbDocumentEntity existing, KnowledgeDocumentScanner.KbFile file, int chunkCount) {
         KbDocumentEntity row = existing != null ? existing : new KbDocumentEntity();
         row.setDocName(file.name());
+        row.setKb(file.kb());
         row.setTitle(file.title());
         row.setMtime(file.mtime());
         row.setChunkCount(chunkCount);

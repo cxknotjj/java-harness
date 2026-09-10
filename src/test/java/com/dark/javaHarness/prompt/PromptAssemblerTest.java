@@ -72,7 +72,7 @@ class PromptAssemblerTest {
     @Test
     void assemble_sectionsInFixedOrder() {
         when(agentService.getAgentConfig("general"))
-                .thenReturn(Optional.of(new AgentConfig(1L, "m", "角色提示词")));
+                .thenReturn(Optional.of(new AgentConfig(1L, "m", "角色提示词", null)));
         // 回调 mock 先建好再注入 stub（避免在 when() 求值内嵌套 stubbing）
         ToolCallback readOnlyCb = callbackNamed("fs_read_file");
         when(sandbox.readOnlyFileTools()).thenReturn(List.of(readOnlyCb));
@@ -114,7 +114,7 @@ class PromptAssemblerTest {
     void assemble_rolePromptPriority() {
         // 表 prompt 存在 → 用表
         when(agentService.getAgentConfig("researcher"))
-                .thenReturn(Optional.of(new AgentConfig(1L, "m", "表配置角色")));
+                .thenReturn(Optional.of(new AgentConfig(1L, "m", "表配置角色", null)));
         String withTable = assembler.assemble("researcher", "兜底角色");
         assertTrue(withTable.startsWith("表配置角色"), "表 prompt 优先");
         assertFalse(withTable.contains("兜底角色"), "表 prompt 存在时不再使用兜底");
@@ -125,7 +125,7 @@ class PromptAssemblerTest {
 
         // 表 prompt 为空白 → 视同无
         when(agentService.getAgentConfig("analyst"))
-                .thenReturn(Optional.of(new AgentConfig(2L, "m", "  ")));
+                .thenReturn(Optional.of(new AgentConfig(2L, "m", "  ", null)));
         assertTrue(assembler.assemble("analyst", "兜底角色").startsWith("兜底角色"), "空白表 prompt 视同无");
 
         // 表无记录且无兜底 → 默认 system prompt

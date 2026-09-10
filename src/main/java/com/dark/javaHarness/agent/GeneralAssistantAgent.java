@@ -339,7 +339,7 @@ public class GeneralAssistantAgent implements Agent {
     private ChatClient.ChatClientRequestSpec buildChatRequestSpec(String sessionId, String objective,
                                                                   Consumer<String> toolEmitter) {
         AgentConfig config = agentService.getAgentConfig(agentName)
-                .orElse(new AgentConfig(null, null, null));
+                .orElse(new AgentConfig(null, null, null, null));
         String model = config.model();
         // Registry 模式：凭部署模型 id 取对应厂商的 ChatClient（未绑定/未命中回退默认 DashScope）
         ChatClient client = clientRegistry.get(config.modelProviderId());

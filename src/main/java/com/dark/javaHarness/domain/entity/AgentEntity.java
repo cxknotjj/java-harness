@@ -33,6 +33,9 @@ public class AgentEntity {
     /** 分配的工具（逗号分隔：组名 web/demo/sandbox.* 或精确工具名；NULL/空白回退代码内置分配） */
     private String tools;
 
+    /** 绑定的知识库（逗号分隔 kb 标识=knowledge/ 一级子目录名；NULL/空白不限，检索全部知识） */
+    private String knowledge;
+
     /** 状态：1-启用 0-禁用 */
     private Integer status;
 

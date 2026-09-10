@@ -50,10 +50,11 @@ public class KnowledgeAdminController {
         return requireService().list(page, size);
     }
 
-    /** 调试检索：直接向量检索（不走 prompt 注入），观察 top-k 命中与相关度 */
+    /** 调试检索：直接向量检索（不走 prompt 注入），观察 top-k 命中与相关度；可选按 kb 过滤（重复参数） */
     @GetMapping("/search")
-    public List<KnowledgeSource> search(@RequestParam("q") String query) {
-        return requireService().search(query).stream()
+    public List<KnowledgeSource> search(@RequestParam("q") String query,
+                                        @RequestParam(value = "kb", required = false) List<String> kb) {
+        return requireService().search(query, kb).stream()
                 .map(KnowledgeService.KnowledgeHit::toSource)
                 .toList();
     }

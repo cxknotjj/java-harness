@@ -18,8 +18,11 @@ public class KbDocumentEntity {
     @TableId(type = IdType.AUTO)
     private Long id;
 
-    /** 文档名（知识目录文件名，唯一摄取键） */
+    /** 文档名（相对知识目录路径，子目录文档带 kb 前缀如 java/spring.md，唯一摄取键） */
     private String docName;
+
+    /** 所属知识库（knowledge/ 一级子目录名，根目录文档为 default；与向量 chunk metadata.kb 一致） */
+    private String kb;
 
     /** 标题（front-matter title 或首个 # 标题行 / 文件名），出处展示用 */
     private String title;

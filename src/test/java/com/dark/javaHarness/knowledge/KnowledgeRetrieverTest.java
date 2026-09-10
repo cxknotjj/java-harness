@@ -18,7 +18,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 /**
- * KnowledgeRetriever 单测：角色策略跳过、查询长度下限、命中渲染与出处记录、预算截断。
+ * KnowledgeRetriever 单测：角色策略跳过、查询长度下限、命中渲染与出处记录、预算截断、
+ * agent 知识库绑定（kbs 透传与解析）。
  */
 @ExtendWith(MockitoExtension.class)
 class KnowledgeRetrieverTest {
@@ -45,34 +46,34 @@ class KnowledgeRetrieverTest {
 
     @Test
     void aggregatorRole_skippedWithoutSearch() {
-        assertNull(retriever.buildKnowledgeBlock("aggregator", "s1", "这是一个足够长的问题"));
+        assertNull(retriever.buildKnowledgeBlock("aggregator", "s1", "这是一个足够长的问题", null));
         verifyNoInteractions(knowledgeService);
     }
 
     @Test
     void blankUser_skipped() {
-        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "   "));
+        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "   ", null));
         verifyNoInteractions(knowledgeService);
     }
 
     @Test
     void shortQuery_belowMinChars_skipped() {
         props.setMinQueryChars(10);
-        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "短问题"));
+        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "短问题", null));
         verifyNoInteractions(knowledgeService);
     }
 
     @Test
     void noHits_returnsNull() {
-        when(knowledgeService.search("这个问题需要知识吗")).thenReturn(List.of());
-        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "这个问题需要知识吗"));
+        when(knowledgeService.search("这个问题需要知识吗", null)).thenReturn(List.of());
+        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "这个问题需要知识吗", null));
     }
 
     @Test
     void hit_rendersCitationsAndRecordsSources() {
-        when(knowledgeService.search("如何部署")).thenReturn(List.of(hit("a.md", 0.92)));
+        when(knowledgeService.search("如何部署", null)).thenReturn(List.of(hit("a.md", 0.92)));
 
-        String block = retriever.buildKnowledgeBlock("lead", "s1", "如何部署");
+        String block = retriever.buildKnowledgeBlock("lead", "s1", "如何部署", null);
 
         assertNotNull(block);
         assertTrue(block.contains("【知识库检索结果】"));
@@ -88,13 +89,21 @@ class KnowledgeRetrieverTest {
     }
 
     @Test
+    void boundKbs_passedThroughToSearch() {
+        List<String> kbs = List.of("java", "frontend");
+        when(knowledgeService.search("如何部署", kbs)).thenReturn(List.of(hit("a.md", 0.92)));
+
+        assertNotNull(retriever.buildKnowledgeBlock("lead", "s1", "如何部署", kbs));
+    }
+
+    @Test
     void budgetExhausted_dropsLowScoreHits() {
         // 低分命中正文 1 万中文字符（≈1 万 token，远超 3000 预算）→ 累加到该条时 break 丢弃
         KnowledgeService.KnowledgeHit huge =
                 new KnowledgeService.KnowledgeHit("big-b.md", "标题-big-b.md", 0.6, "长".repeat(10_000));
-        when(knowledgeService.search("预算截断问题")).thenReturn(List.of(hit("a.md", 0.9), huge));
+        when(knowledgeService.search("预算截断问题", null)).thenReturn(List.of(hit("a.md", 0.9), huge));
 
-        String block = retriever.buildKnowledgeBlock("lead", "s1", "预算截断问题");
+        String block = retriever.buildKnowledgeBlock("lead", "s1", "预算截断问题", null);
 
         assertNotNull(block);
         assertTrue(block.contains("a.md"), "高分命中应保留");
@@ -106,10 +115,10 @@ class KnowledgeRetrieverTest {
     @Test
     void budgetZero_meansUnlimited() {
         props.setContextBudget(0);
-        when(knowledgeService.search("不设预算")).thenReturn(
+        when(knowledgeService.search("不设预算", null)).thenReturn(
                 List.of(hit("a.md", 0.9), hit("b.md", 0.8)));
 
-        String block = retriever.buildKnowledgeBlock("lead", "s1", "不设预算");
+        String block = retriever.buildKnowledgeBlock("lead", "s1", "不设预算", null);
 
         assertNotNull(block);
         assertTrue(block.contains("【出处2】"), "context-budget 0 = 不截断，全部命中注入");
@@ -118,9 +127,9 @@ class KnowledgeRetrieverTest {
     @Test
     void budgetSmallerThanHeader_returnsNull() {
         props.setContextBudget(1); // 头尾固定开销即超限 → 一条都放不下
-        when(knowledgeService.search("放不下")).thenReturn(List.of(hit("a.md", 0.9)));
+        when(knowledgeService.search("放不下", null)).thenReturn(List.of(hit("a.md", 0.9)));
 
-        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "放不下"),
+        assertNull(retriever.buildKnowledgeBlock("lead", "s1", "放不下", null),
                 "连一条都放不下时应返回 null（不注入空块）");
         assertTrue(retriever.recentSources("s1").isEmpty());
     }
@@ -133,9 +142,24 @@ class KnowledgeRetrieverTest {
 
     @Test
     void hit_withoutSessionId_notRecorded() {
-        when(knowledgeService.search("无会话场景")).thenReturn(List.of(hit("a.md", 0.9)));
+        when(knowledgeService.search("无会话场景", null)).thenReturn(List.of(hit("a.md", 0.9)));
 
-        assertNotNull(retriever.buildKnowledgeBlock("lead", null, "无会话场景"));
+        assertNotNull(retriever.buildKnowledgeBlock("lead", null, "无会话场景", null));
         assertTrue(retriever.recentSources(null).isEmpty());
+    }
+
+    @Test
+    void parseBinding_blank_returnsNull() {
+        assertNull(KnowledgeRetriever.parseBinding(null));
+        assertNull(KnowledgeRetriever.parseBinding(""));
+        assertNull(KnowledgeRetriever.parseBinding("  , ,"));
+    }
+
+    @Test
+    void parseBinding_csv_trimsDedupsAndStripsQuotes() {
+        assertEquals(List.of("java", "frontend"),
+                KnowledgeRetriever.parseBinding("java, frontend ,java"));
+        assertEquals(List.of("java"), KnowledgeRetriever.parseBinding("'java'"));
+        assertEquals(List.of("a b"), KnowledgeRetriever.parseBinding(" a b "));
     }
 }

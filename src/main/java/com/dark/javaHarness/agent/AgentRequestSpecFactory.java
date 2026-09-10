@@ -104,10 +104,12 @@ final class AgentRequestSpecFactory {
         // system 经 PromptAssembler 按段组装：角色段（表 prompt > 兜底指令 > 默认）+ 索引/纪律/约定等段；
         // 兜底角色指令收敛为角色段兜底，不再拼进 user。
         // 知识检索（RAG）：按当前 user 文本检索知识库，命中则追加【出处N】知识段——
-        // retriever 为 null（禁用/单测）或无命中时原样，退化现状；aggregator 角色策略跳过
+        // retriever 为 null（禁用/单测）或无命中时原样，退化现状；aggregator 角色策略跳过；
+        // 多库隔离：agent 表 knowledge 列（config 携带）解析为绑定库列表，null = 不限
         String system = promptAssembler.assemble(forAgent, fallbackSystem);
         if (knowledgeRetriever != null) {
-            String knowledgeBlock = knowledgeRetriever.buildKnowledgeBlock(forAgent, sessionId, user);
+            String knowledgeBlock = knowledgeRetriever.buildKnowledgeBlock(forAgent, sessionId, user,
+                    KnowledgeRetriever.parseBinding(config != null ? config.knowledge() : null));
             if (knowledgeBlock != null && !knowledgeBlock.isBlank()) {
                 system = system + "\n\n" + knowledgeBlock;
             }

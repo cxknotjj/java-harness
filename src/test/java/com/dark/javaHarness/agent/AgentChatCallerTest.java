@@ -117,7 +117,7 @@ class AgentChatCallerTest {
         caller = new AgentChatCaller(clientRegistry, agentService, null, null);
         // lenient：invokeOnce_disableTools 用例直接调 invokeAndRecord，不查表
         org.mockito.Mockito.lenient().when(agentService.getAgentConfig("researcher"))
-                .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词")));
+                .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词", null)));
         when(clientRegistry.get(1L)).thenReturn(client);
         when(client.prompt()).thenReturn(spec);
         when(spec.system(anyString())).thenReturn(spec);
@@ -153,7 +153,7 @@ class AgentChatCallerTest {
         when(streamSpec.chatResponse()).thenReturn(fluxOf("ok"));
 
         String out = caller.invokeAndRecord(
-                new AgentConfig(1L, "m1", "系统提示词"), "s1", "researcher",
+                new AgentConfig(1L, "m1", "系统提示词", null), "s1", "researcher",
                 "兜底提示", "任务内容", null, true, "m1", System.currentTimeMillis());
 
         assertEquals("ok", out);
@@ -245,9 +245,9 @@ class AgentChatCallerTest {
         AgentChatCaller tiered = new AgentChatCaller(clientRegistry, agentService, null, null,
                 new LlmRetry(), budgets);
         when(agentService.getAgentConfig("lead"))
-                .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词")));
+                .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词", null)));
         when(agentService.getAgentConfig("aggregator"))
-                .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词")));
+                .thenReturn(Optional.of(new AgentConfig(1L, "m1", "系统提示词", null)));
         when(streamSpec.chatResponse()).thenReturn(fluxOf("ok"));
 
         tiered.call("s1", "lead", "兜底", "任务", null);
