@@ -1,6 +1,7 @@
 package com.dark.javaHarness.agent;
 
 import com.dark.javaHarness.advisor.ContextAssemblingAdvisor;
+import com.dark.javaHarness.advisor.LlmRequestLogAdvisor;
 import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
@@ -176,6 +177,10 @@ final class AgentRequestSpecFactory {
         for (Advisor advisor : extraAdvisors) {
             spec.advisors(advisor);
         }
+        // 请求发起观测（innermost，见类注释）：每次真实模型请求（含重试）记一条
+        // 专家类型/模型/上下文条数与字符量——llm_call_log 只在结束时落行，在途请求
+        // 此前无任何痕迹可查
+        spec.advisors(new LlmRequestLogAdvisor(forAgent, sessionId));
         // 请求级选项：streamUsage(true) 流式末帧回传真实 usage（OpenAI stream_options.include_usage，
         // DashScope 兼容模式与 DeepSeek 均支持）——llm_call_log 据此记真实 token。
         // model 非空时必须请求级显式指定（Registry 构建的客户端 defaultOptions 为空，否则厂商端 400），
