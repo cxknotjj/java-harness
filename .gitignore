@@ -44,3 +44,7 @@ build/
 
 # 本地密钥(.bashrc 指向此文件,run.sh/run-wsl.bat 非交互启动时加载;勿提交)
 .env.local
+
+# doc
+.trae/specs/
+.zcode/
