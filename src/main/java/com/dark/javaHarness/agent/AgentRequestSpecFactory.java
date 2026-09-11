@@ -10,11 +10,13 @@ import com.dark.javaHarness.prompt.SkillManager;
 import com.dark.javaHarness.prompt.ToolLazyManager;
 import com.dark.javaHarness.service.SessionService;
 import com.dark.javaHarness.service.impl.LlmCallRecorder;
+import com.dark.javaHarness.tool.DefaultToolDecorators;
 import com.dark.javaHarness.tool.ToolAssignments;
-import com.dark.javaHarness.tool.ToolCallBudget;
-import com.dark.javaHarness.tool.ToolCallTracer;
+import com.dark.javaHarness.tool.ToolCallbackDecorator;
+import com.dark.javaHarness.tool.ToolDecorationContext;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Consumer;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
@@ -26,8 +28,8 @@ import org.springframework.ai.tool.ToolCallback;
 /**
  * ChatClient 请求规格组装工厂：路径 A（{@link GeneralAssistantAgent}）与路径 B
  * （{@link AgentChatCaller}）共用的请求组装链——system 按段组装、会话记忆只读注入、
- * 请求级选项（model / streamUsage / maxTokens 档位）与工具注入装饰
- * （tracer → 工具预算 → 延迟加载 → load_skill）。
+ * 请求级选项（model / streamUsage / maxTokens 档位）与工具注入装饰（可插拔装饰链，
+ * 默认 观测→预算→懒加载→元工具，见 {@link DefaultToolDecorators}）。
  *
  * <p>两条路径的差异点经 {@link Assembly} 显式声明（频率惩罚与工具次数预算仅编排路径
  * 启用、记忆注入条件由调用方策略判定、maxTokens 档位由调用方解析），工厂本身不感知
@@ -38,12 +40,16 @@ final class AgentRequestSpecFactory {
     /**
      * 单次请求的组装差异项（两条路径各自声明）：
      * <ul>
-     *   <li>{@code toolEmitter}：非 null 时注入追踪版工具（执行起止经其发进度行）</li>
-     *   <li>{@code disableTools}：true 跳过全部工具注入（幻觉工具调用的降级重试路径）</li>
+     *   <li>{@code toolEmitter}：SSE 进度行发射器，经 ToolDecorationContext 传入装饰链——
+     *       观测装饰器（emitter/recorder 任一非空即装饰）用其发工具执行起止进度行，
+     *       本字段本身不再决定是否装饰工具</li>
+     *   <li>{@code disableTools}：true 跳过全部工具注入（幻觉工具调用的降级重试路径，
+     *       在装饰链之前直接返回）</li>
      *   <li>{@code injectMemory}：是否只读注入会话历史（编排路径按 MemoryPolicy 判定仅 lead；
      *       路径 A 恒注入）</li>
      *   <li>{@code frequencyPenalty}：频率惩罚（长报告聚合复读抑制，仅编排路径启用）</li>
-     *   <li>{@code toolCallBudget}：工具次数/结果硬预算（仅编排路径启用）</li>
+     *   <li>{@code toolCallBudget}：工具次数/结果硬预算（仅编排路径启用；经 Context 传给
+     *       ToolBudgetDecorator 判定，不再依赖 emitter 非空）</li>
      *   <li>{@code maxTokens}：输出封顶档位（0 = 不限制，不写入保持模型默认）</li>
      * </ul>
      */
@@ -58,14 +64,12 @@ final class AgentRequestSpecFactory {
     private final ChatClientRegistry clientRegistry;
     private final ToolAssignments toolAssignments;
     private final PromptAssembler promptAssembler;
-    private final ToolLazyManager lazyTools;
-    private final SkillManager skillManager;
     private final SessionService memoryStore;
     private final ContextBudgetProperties budgets;
     /** 知识检索器（RAG 注入面）；null 时零行为变化（知识库禁用/单测场景，沿用 skillManager==null 约定） */
     private final KnowledgeRetriever knowledgeRetriever;
-    /** 工具调用观测记录器（tool_call_log 落库面）；null 时不落库（单测场景） */
-    private final LlmCallRecorder recorder;
+    /** 可插拔工具装饰链（按 Order 升序应用；默认链见 {@link DefaultToolDecorators#defaults}） */
+    private final List<ToolCallbackDecorator> decorators;
 
     AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
                             PromptAssembler promptAssembler,
@@ -75,7 +79,8 @@ final class AgentRequestSpecFactory {
                             SessionService memoryStore,
                             ContextBudgetProperties budgets) {
         this(clientRegistry, promptAssembler, toolAssignments, lazyTools, skillManager,
-                memoryStore, budgets, null, null);
+                memoryStore, budgets, null, null,
+                DefaultToolDecorators.defaults(lazyTools, skillManager, budgets, null));
     }
 
     AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
@@ -87,10 +92,11 @@ final class AgentRequestSpecFactory {
                             ContextBudgetProperties budgets,
                             KnowledgeRetriever knowledgeRetriever) {
         this(clientRegistry, promptAssembler, toolAssignments, lazyTools, skillManager,
-                memoryStore, budgets, knowledgeRetriever, null);
+                memoryStore, budgets, knowledgeRetriever, null,
+                DefaultToolDecorators.defaults(lazyTools, skillManager, budgets, null));
     }
 
-    /** 全参构造：recorder 为工具调用观测记录器（tool_call_log 落库面），null 时不落库（单测场景） */
+    /** recorder 为工具调用观测记录器（tool_call_log 落库面），null 时不落库（单测场景） */
     AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
                             PromptAssembler promptAssembler,
                             ToolAssignments toolAssignments,
@@ -100,15 +106,32 @@ final class AgentRequestSpecFactory {
                             ContextBudgetProperties budgets,
                             KnowledgeRetriever knowledgeRetriever,
                             LlmCallRecorder recorder) {
+        this(clientRegistry, promptAssembler, toolAssignments, lazyTools, skillManager,
+                memoryStore, budgets, knowledgeRetriever, recorder,
+                DefaultToolDecorators.defaults(lazyTools, skillManager, budgets, recorder));
+    }
+
+    /**
+     * 全参构造：decorators 为可插拔工具装饰链（按 Order 升序应用，
+     * 默认链见 {@link DefaultToolDecorators#defaults}）
+     */
+    AgentRequestSpecFactory(ChatClientRegistry clientRegistry,
+                            PromptAssembler promptAssembler,
+                            ToolAssignments toolAssignments,
+                            ToolLazyManager lazyTools,
+                            SkillManager skillManager,
+                            SessionService memoryStore,
+                            ContextBudgetProperties budgets,
+                            KnowledgeRetriever knowledgeRetriever,
+                            LlmCallRecorder recorder,
+                            List<ToolCallbackDecorator> decorators) {
         this.clientRegistry = clientRegistry;
         this.promptAssembler = promptAssembler;
         this.toolAssignments = toolAssignments;
-        this.lazyTools = lazyTools;
-        this.skillManager = skillManager;
         this.memoryStore = memoryStore;
         this.budgets = budgets;
         this.knowledgeRetriever = knowledgeRetriever;
-        this.recorder = recorder;
+        this.decorators = decorators;
     }
 
     /** 组装请求（取客户端 → system 按段组装 → 记忆只读注入 → 请求级 advisor → 选项 → 工具注入） */
@@ -172,7 +195,7 @@ final class AgentRequestSpecFactory {
         // 专家工具分配：按 agent 名注入请求级工具（与客户端 defaultTools 合并）；
         // disableTools=true 跳过（幻觉工具调用的降级重试路径）。
         // 双通道统一为 ToolCallback 单通道（@Tool 注解对象经 ToolCallbacks.from 转回调，与
-        // .tools 注入等价），便于 tracer/预算/延迟加载统一装饰
+        // .tools 注入等价），便于装饰链统一装饰
         if (assembly.disableTools()) {
             return spec;
         }
@@ -183,31 +206,13 @@ final class AgentRequestSpecFactory {
         if (!toolSet.annotated().isEmpty()) {
             tools.addAll(List.of(ToolCallbacks.from(toolSet.annotated().toArray())));
         }
-        if (assembly.toolEmitter() != null || recorder != null) {
-            // 追踪模式：tracer 装饰真实工具——emitter 非空发进度行（CLI 工具调用行），
-            // recorder 非空执行后落库 tool_call_log（QQ 渠道/API 直调等无 SSE 链路的观测盲区由此补齐）
-            tools = ToolCallTracer.trace(tools, assembly.toolEmitter(), forAgent, sessionId,
-                    recorder == null ? null : recorder::recordToolCall);
-        }
-        if (assembly.toolEmitter() != null && assembly.toolCallBudget() && !tools.isEmpty()) {
-            // 硬预算：单次调用内工具执行次数超限不再真执行；工具结果总量 ≤5k token，
-            // 超出的截断、耗尽后返回引导文本收束循环（防止 token 按轮数平方级膨胀）。
-            // 预算只约束真实工具执行——轻量引导与 expand_tool 元工具不计入
-            tools = ToolCallBudget.limit(tools,
-                    budgets.getToolCallLimit(), budgets.getToolResultBudget());
-        }
-        // 延迟加载加工（最外层，包 tracer/预算装饰后的 callback）：未展开→轻量包装、
-        // 已展开→透传完整 schema，末尾追加 expand_tool 元工具（不经 tracer/预算——
-        // 元工具不产生工具行噪声、不占真实执行额度）；开关关闭/无会话 ID 时全量透传现状
-        tools = lazyTools.process(sessionId, tools);
-        // load_skill 元工具（skill 索引段配套）：该 agent 有可见技能时注册——同 expand_tool 口径
-        // 不经 tracer/次数额度；skill 全文自身在 SkillManager 内按 tool-result-budget 截断
-        List<ToolCallback> loadSkill = skillManager == null ? List.of()
-                : skillManager.loadSkillTool(forAgent).map(List::of).orElse(List.of());
-        if (!loadSkill.isEmpty()) {
-            List<ToolCallback> merged = new ArrayList<>(tools);
-            merged.addAll(loadSkill);
-            tools = merged;
+        // 装饰链应用（可插拔）：按 Order 升序逐层装饰——观测(100)→预算(200)→懒加载(300)→
+        // 元工具(400)；各装饰器自判适用条件（不适用原样直通）。顺序契约见 ToolCallbackDecorator。
+        ToolDecorationContext ctx = new ToolDecorationContext(
+                forAgent, sessionId, assembly.toolEmitter(), assembly.toolCallBudget());
+        for (ToolCallbackDecorator decorator : decorators) {
+            tools = Objects.requireNonNull(decorator.decorate(ctx, tools),
+                    decorator.getClass().getSimpleName() + " 返回 null（禁止，组装期编程错误）");
         }
         if (!tools.isEmpty()) {
             spec.toolCallbacks(tools.toArray(new ToolCallback[0]));

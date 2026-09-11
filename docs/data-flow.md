@@ -244,16 +244,19 @@ CLI 解析到 `event: progress` 按阶段分派渲染：`编排/聚合` 转 spin
 ```
 专家子任务执行（coder / analyst / general / researcher）
 │
-① 工具注入（请求组装期，三层装饰链：tracer → 预算 → 延迟加载）
+① 工具注入（请求组装期，可插拔装饰链，默认链见 DefaultToolDecorators）
    AgentChatCaller.buildSpec()（两路径统一出口）
    → ToolAssignments.forAgent(专家名) → ToolSet{annotated(@Tool), callbacks(ToolCallback)}
-   → 第一层 ToolCallTracer（toolEmitter 非空时）：装饰为「调用前发 tool / 调用后发 tool-done
-     进度行」的追踪版（schema 原样透传，模型不可见差异）
-   → 第二层 ToolCallBudget（有追踪即同挂）：单次调用内执行次数硬上限（tool-call-limit=8）+
+   → AgentRequestSpecFactory 按 Order 升序应用装饰链（装饰器自判适用条件，不适用原样直通）：
+   → 观测层 ToolObservationDecorator(100)：emitter/recorder 任一非空即装饰——调用前发 tool /
+     调用后发 tool-done 进度行 + 异步落库 tool_call_log（无 SSE 链路的观测盲区由此覆盖；
+     schema 原样透传，模型不可见差异）
+   → 预算层 ToolBudgetDecorator(200)：单次调用内执行次数硬上限（tool-call-limit=8）+
      工具结果总量 token 预算（tool-result-budget=5000）——超限不再真执行，返回引导文本收束循环
-   → 第三层 ToolLazyManager（最外层，会话级两段式）：未展开工具包轻量态（schema 置空、
-     仅名称在 PromptAssembler 工具索引段可见）+ 追加 expand_tool 元工具（不经 tracer/预算——
+   → 懒加载层 ToolLazyLoadDecorator(300)（最外层，会话级两段式）：未展开工具包轻量态（schema 置空、
+     仅名称在 PromptAssembler 工具索引段可见）+ 追加 expand_tool 元工具（不经观测/预算——
      元工具不产生工具行噪声、不占真实执行额度）；模型先 expand 再正式调用
+   → 元工具层 SkillMetaToolDecorator(400)：该 agent 有可见技能时追加 load_skill 元工具（同 expand_tool 口径）
    → spec.toolCallbacks(装饰后回调)
    ⚠️ 服务端硬边界：未分配的工具 schema 不出服务端，模型不可见也无执行注册
 │
