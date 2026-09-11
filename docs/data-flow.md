@@ -56,10 +56,10 @@ ChatService.chat(request)
   2. resolveAgent(message)                    ← 主 Agent 前置分流
        └─ routeJudge.judge(message) → COMPLEX → "multi-agent" / 否则 "general"
   3. agentService.executeSync(selectedAgent, message, sessionId)
-       ├─ general（A）→ GeneralAssistantAgent.execute(goal)
-       │     → buildChatRequestSpec()：按 agent 表 model 取 ChatClient（Registry）
+       ├─ general（A）→ GeneralAssistantAgent.execute(goal)（薄适配）
+       │     → AgentChatCaller.callWithAssembly()：按 agent 表 model 取 ChatClient（Registry）
        │       + MessageChatMemoryAdvisor 注入历史 + ContextAssemblingAdvisor 裁剪
-       │       + 单次 chatClient.call() → 完整回复
+       │       + 流式信道收集完整回复（唯一可中止通道）
        └─ multi-agent（B）→ MultiAgentGraphAgent.execute(goal)
              → StateGraph：lead 拆解 → 并行子任务 → 聚合 → 最终回答
   4. writeBackContext(sessionId, message, goal)
@@ -132,7 +132,11 @@ RouteJudge.judge(message)（接口）
 > 三层 token 控制分工（历史裁剪 / user 侧预算 / 工具结果预算）见 5f 节。
 
 ```
-GeneralAssistantAgent.buildChatRequestSpec(sessionId, objective)
+GeneralAssistantAgent.execute*(goal)
+│  声明路径 A 装配差异 Assembly（恒记忆 / 无频率惩罚 / 无工具次数预算 / final 档输出封顶）
+▼
+AgentChatCaller.callWithAssembly / streamWithAssembly（执行层单一来源，路径 B 同引擎）
+├─ AgentRequestSpecFactory.build（统一组装链）
 ├─ .advisors(MessageChatMemoryAdvisor.builder(memoryStore).build())
 │       → 加载历史：memoryStore.get(conversationId=sessionId)
 ├─ .advisors(new ContextAssemblingAdvisor())
@@ -140,9 +144,9 @@ GeneralAssistantAgent.buildChatRequestSpec(sessionId, objective)
 │        ② normalizeRoles()  system 置前；user/assistant 交替（连续同类保最后）
 │        ③ trimToBudget()   token 估算，最旧丢弃（保 system），默认 ≤ 4000
 ├─ .system(prompt).user(objective)
-│  触发 call()/stream() → 重建 Prompt（保留 options/model）
+│  请求 spec → 流式信道（唯一可中止通道）
 ▼
-③ 调 LLM：同步 call() / 流式 stream()
+③ 调 LLM：阻塞收集（call） / 逐 token 发射（executeStreamReactive，管道核 tokenStream 同源）
 ```
 
 **关键点**：① 职责解耦（加载 vs 整理）；②纯函数可单测；③保留 system + 最近；④ 同步/流式都覆盖。
@@ -309,7 +313,8 @@ LLM 调用出口（五类调用点统一收敛）
 │  ② MultiAgentGraphAgent.lead()    lead 拆解（经 AgentChatCaller.call）
 │  ③ MultiAgentGraphAgent 子任务     专家执行（经 AgentChatCaller.call，工具调用不单独记账）
 │  ④ MultiAgentGraphAgent 聚合      AgentChatCaller.stream（逐 token 收集后估算）
-│  ⑤ GeneralAssistantAgent          路径 A 同步 call() / 流式 stream()（均经流式背书）
+│  ⑤ GeneralAssistantAgent          路径 A（经 callWithAssembly/streamWithAssembly；
+│                                    响应式链 executeStreamReactive 自挂终结钩子记录）
 │
 ▼ AgentChatCaller / GeneralAssistantAgent / LlmRouteJudge 埋点
    调用前记 start；成功解析 Usage（真实 token）/ 失败取异常消息
@@ -560,9 +565,9 @@ AgentChatCaller.buildSpec()（统一出口）
 | Agent 注册/路由 | `AgentRegistry`（表驱动自动注册 + 惰性热注册）+ `AgentConfigProvider`（`is_internal` 过滤） |
 | Prompt 组装  | `PromptAssembler`（五段式）+ `MemoryPolicy`（角色记忆矩阵）+ `SkillSectionProvider`（扩展点） |
 | 思考开关       | `ThinkingSwitchChatModel`（按 `model_provider.disable_thinking` 注入 `enable_thinking`） |
-| 路径 A（简单）   | `GeneralAssistantAgent`                              |
+| 路径 A（简单）   | `GeneralAssistantAgent`（薄适配：装配差异声明 + 响应式流终结钩子，执行委托 `AgentChatCaller`） |
 | 路径 B（复杂）   | `MultiAgentGraphAgent`（StateGraph：lead→并行→aggregate） |
-| 统一调用出口     | `AgentChatCaller`（流式背书 + 取消令牌 + 重试/配额映射 + 三层工具装饰）     |
+| 统一调用出口     | `AgentChatCaller`（路径 A/B 执行层单一来源：流式背书 + 取消令牌 + 重试/配额映射 + 工具装饰链）     |
 | 统一出口       | `ChatController` 同步 + SSE                            |
 | 兜底         | `AgentService` → general                             |
 | 工具治理       | `ToolCallTracer`（进度行）+ `ToolCallBudget`（次数/结果 token 预算）+ `ToolLazyManager`（两段式延迟加载）+ `ToolAssignments`（专家分配硬边界） |

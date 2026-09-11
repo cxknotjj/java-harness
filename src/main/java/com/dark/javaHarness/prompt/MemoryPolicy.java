@@ -37,8 +37,8 @@ public class MemoryPolicy {
      * 可注入性判断（编排调用器 AgentChatCaller 的挂载依据）：仅 lead 且会话 ID 有效时注入。
      *
      * <p>编排内 {@code forAgent=general} 属子任务兜底专家身份（非路径 A 的会话主角色），
-     * 子任务上下文由 lead 在子任务描述中传递，不注入；路径 A general 的记忆由
-     * GeneralAssistantAgent 自行装配（现状），不经编排调用器。
+     * 子任务上下文由 lead 在子任务描述中传递，不注入；路径 A general 的记忆注入为
+     * 恒定声明（Assembly 直传 injectMemory=true），不经本策略判定。
      */
     public boolean shouldInject(String agentName, String sessionId) {
         return ROLE_LEAD.equals(agentName) && sessionId != null && !sessionId.isBlank();

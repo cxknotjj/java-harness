@@ -20,30 +20,16 @@ import java.util.function.Consumer;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
 import org.springframework.ai.chat.metadata.Usage;
+import reactor.core.publisher.Flux;
 
 /**
- * 编排环节的 LLM 单次调用器：查 agent 表配置 → 取注册客户端 → 组装请求 → 调用。
+ * 路径 A/B 统一 LLM 调用器（执行层单一来源）：查 agent 表配置 → 取注册客户端 → 组装请求 → 调用。
  *
- * <p>供 {@link MultiAgentGraphAgent} 各环节（lead 拆解 / 专家子任务 / 聚合）复用；
- * 每次调用按传入的 agent 名独立查表，同一编排内不同环节可各用各的模型与提示词。
- *
- * <p>提示词经 {@link PromptAssembler} 按段组装：角色段优先级为 agent 表该角色行的
- * prompt &gt; 调用方传入的兜底角色指令 &gt; 内置默认系统提示词；工具索引/工具纪律/
- * 输出约定等段随后按固定次序追加。兜底角色指令不再拼进 user（原双段拼接由
- * 组装管线收敛为 system 段）。
- *
- * <p>记忆注入（spec 子项 5）：经 {@link MemoryPolicy} 按策略只读注入会话历史——仅 lead 拆解
- * 节点注入（手动 loadContext 拼进请求消息 + ContextAssemblingAdvisor 预算裁剪，不挂
- * MessageChatMemoryAdvisor 以避免其自动写回污染会话），aggregator 与子任务专家不注入；
- * 无会话 ID 或未提供记忆源（单测场景）时跳过。
- *
- * <p>观测：每次调用结束（成功/失败）经 {@link LlmCallRecorder} 异步记录耗时与 token
- * 消耗——call/stream 统一走流式通道后无 usage 回包，token 按输出文本近似估算
- * （tokensEstimated=true）。观测失败不影响调用本身。
- *
- * <p>取消（客户端断连防 token 浪费）：call/stream 均接受可空 {@link BooleanSupplier}
- * 取消令牌——置位后在下一个 token 边界中止在途请求（取消向上传播关闭 HTTP 连接，
- * 厂商端停止生成），抛 {@link CancellationException}；不重试、部分输出不按成功返回。
+ * <p>供 {@link MultiAgentGraphAgent} 各环节（lead 拆解 / 专家子任务 / 聚合）与
+ * {@link GeneralAssistantAgent}（路径 A，薄适配）复用；每次调用按传入的 agent 名独立查表，
+ * 同一编排内不同环节可各用各的模型与提示词。装配差异两入口：角色策略入口
+ * （assemblyForRole，仅 lead 注入记忆等编排语义）与 Assembly 直传入口（路径 A 声明
+ * 恒记忆/final 档等差异）。流式管道核 {@link #tokenStream} 亦为路径 A 响应式链共用。
  */
 final class AgentChatCaller {
 
@@ -279,10 +265,30 @@ final class AgentChatCaller {
     /**
      * 带取消令牌与预算账本的单次调用（编排节点传账本句柄：发起前与每轮 roundtrip 的
      * usage 帧上熔断判定；按 roundtrip 增量同步累计消耗）。ledger 可为 null（无账本场景）。
+     * 角色策略入口：装配经 {@link #assemblyForRole} 按角色生成（与历史内联版等价）。
      */
     String call(String sessionId, String forAgent, String fallbackSystem, String user,
                 Consumer<String> toolEmitter, Advisor[] extraAdvisors, BooleanSupplier cancelled,
                 BudgetLedger ledger) {
+        return callWithAssembly(sessionId, forAgent, fallbackSystem, user,
+                assemblyForRole(forAgent, sessionId, toolEmitter, false), extraAdvisors, cancelled, ledger);
+    }
+
+    /**
+     * Assembly 直传入口（路径 A 薄适配用：装配差异由调用方声明，不经角色策略）。
+     * 独立方法名（callWithAssembly/streamWithAssembly）避免与角色策略入口在 null 实参下重载歧义。
+     *
+     * <p>实现说明：底层统一走流式通道收集完整内容返回——RestClient 阻塞调用不可中断
+     * （JDK HttpClient 不响应线程中断），流式是 Spring AI 1.1.4 + JDK 连接器下唯一
+     * 能中止在途 HTTP 请求的通道；代价是 token 用量从响应 usage 真实值变为估算
+     * （streamUsage 回传真实值时仍记真实 token）。
+     *
+     * <p>取消语义：cancelled 已置位时直接抛 {@link CancellationException}（零 HTTP 请求）；
+     * 执行中置位时在下一个 token 边界中止并抛出——不重试、部分输出不按成功返回。
+     */
+    String callWithAssembly(String sessionId, String forAgent, String fallbackSystem, String user,
+                            AgentRequestSpecFactory.Assembly assembly, Advisor[] extraAdvisors,
+                            BooleanSupplier cancelled, BudgetLedger ledger) {
         AgentConfig config = configOf(forAgent);
         String model = config != null ? config.model() : null;
         // 模型调用失败自动重试（最多 3 次、指数退避）；单次调用含观测埋点
@@ -292,7 +298,7 @@ final class AgentChatCaller {
                 java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
                         new java.util.concurrent.atomic.AtomicReference<>();
                 String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                        toolEmitter, false, extraAdvisors, null, cancelled, usageRef, ledger);
+                        assembly, extraAdvisors, null, cancelled, usageRef, ledger);
                 recordOkStream(sessionId, forAgent, model, start, content, usageRef.get());
                 recordEstimatedIfNoUsage(ledger, content, usageRef.get());
                 return content;
@@ -328,7 +334,7 @@ final class AgentChatCaller {
                         java.util.concurrent.atomic.AtomicReference<Usage> usageRef2 =
                                 new java.util.concurrent.atomic.AtomicReference<>();
                         String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                                null, true, extraAdvisors, null, cancelled, usageRef2, ledger);
+                                noToolsVariant(assembly), extraAdvisors, null, cancelled, usageRef2, ledger);
                         recordOkStream(sessionId, forAgent, model, start2, content, usageRef2.get());
                         recordEstimatedIfNoUsage(ledger, content, usageRef2.get());
                         return content;
@@ -350,7 +356,8 @@ final class AgentChatCaller {
         java.util.concurrent.atomic.AtomicReference<Usage> usageRef =
                 new java.util.concurrent.atomic.AtomicReference<>();
         String content = streamAttempt(config, sessionId, forAgent, fallbackSystem, user,
-                toolEmitter, disableTools, extraAdvisors, null, null, usageRef, null);
+                assemblyForRole(forAgent, sessionId, toolEmitter, disableTools),
+                extraAdvisors, null, null, usageRef, null);
         recordOkStream(sessionId, forAgent, model, start, content, usageRef.get());
         return content;
     }
@@ -382,7 +389,7 @@ final class AgentChatCaller {
      * 单次 call 内部工具循环的下一轮在超限后不再发起（断流阻止后续消耗）。
      */
     private String streamAttempt(AgentConfig config, String sessionId, String forAgent, String fallbackSystem,
-                                 String user, Consumer<String> toolEmitter, boolean disableTools,
+                                 String user, AgentRequestSpecFactory.Assembly assembly,
                                  Advisor[] extraAdvisors, Consumer<String> onToken, BooleanSupplier cancelled,
                                  java.util.concurrent.atomic.AtomicReference<Usage> usageRef,
                                  BudgetLedger ledger) {
@@ -397,7 +404,7 @@ final class AgentChatCaller {
         // 与上一轮差值即本轮新增消耗（各轮 prompt 单调递增，差值非负、求和=末轮 total，不重复计数）
         java.util.concurrent.atomic.AtomicLong prevTotal = new java.util.concurrent.atomic.AtomicLong();
         try {
-            return streamCore(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, disableTools,
+            return streamCore(config, sessionId, forAgent, fallbackSystem, user, assembly,
                     extraAdvisors, collected, onToken, cancelled, usageRef, prevTotal, ledger);
         } catch (RuntimeException e) {
             // 取消置位时一律按取消归因（流取消竞态下 blockLast 可能抛出其他形态异常）
@@ -409,31 +416,18 @@ final class AgentChatCaller {
     }
 
     /**
-     * 流式管道共用体（{@link #streamAttempt} 与 {@link #stream} 的重试循环体同构，抽此共用）：
-     * 组装请求 → stream → usage 捕获/预算增量记账 → 空帧跳过 → 空闲超时 → 取消拦截 → 收集返回。
+     * 流式管道共用核（{@link #tokenStream} 之上的路径 B 段：空闲超时/取消拦截/阻塞收集）。
      * 取消语义：takeUntil 在下一个 token 边界中止订阅（取消向上传播关闭 HTTP 连接），
      * doOnNext 拦截 takeUntil 放行的终止前元素；流结束后取消竞态复检（不按成功返回）。
      */
     private String streamCore(AgentConfig config, String sessionId, String forAgent, String fallbackSystem,
-                              String user, Consumer<String> toolEmitter, boolean disableTools,
+                              String user, AgentRequestSpecFactory.Assembly assembly,
                               Advisor[] extraAdvisors, StringBuilder collected, Consumer<String> onToken,
                               BooleanSupplier cancelled,
                               java.util.concurrent.atomic.AtomicReference<Usage> usageRef,
                               java.util.concurrent.atomic.AtomicLong prevTotal, BudgetLedger ledger) {
-        buildSpec(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, disableTools, extraAdvisors)
-                .stream()
-                .chatResponse()
-                .doOnNext(resp -> captureUsageAndAccount(resp, usageRef, ledger, prevTotal))
-                // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
-                // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
-                // filter 根本不会执行——必须用 handle 跳过空帧
-                .handle((org.springframework.ai.chat.model.ChatResponse resp,
-                         reactor.core.publisher.SynchronousSink<String> sink) -> {
-                    String token = AgentChatCaller.contentOf(resp);
-                    if (token != null) {
-                        sink.next(token);
-                    }
-                })
+        tokenStream(buildSpec(config, sessionId, forAgent, fallbackSystem, user, assembly, extraAdvisors),
+                        usageRef, ledger, prevTotal)
                 // 端点无响应兜底：JDK 连接器无读超时，流空闲超时由此处兜住（防永久挂起）
                 .timeout(STREAM_IDLE_TIMEOUT)
                 .takeUntil(__ -> cancelled != null && cancelled.getAsBoolean())
@@ -453,6 +447,32 @@ final class AgentChatCaller {
             throw cancelException();
         }
         return collected.toString();
+    }
+
+    /**
+     * 流式管道共用核（路径 A {@link GeneralAssistantAgent#executeStreamReactive} 与路径 B 同源）：
+     * 请求 spec → chatResponse 流 → usage 捕获/预算增量记账（ledger null 直通）→ 空帧跳过。
+     * 后续算子（超时/取消/收集 or 合并工具进度行）由调用方接续——错误通道保持原样向上传播，
+     * 观测归因由各调用方的终结钩子负责。
+     */
+    static Flux<String> tokenStream(ChatClient.ChatClientRequestSpec spec,
+                                    java.util.concurrent.atomic.AtomicReference<Usage> usageRef,
+                                    BudgetLedger ledger,
+                                    java.util.concurrent.atomic.AtomicLong prevTotal) {
+        return spec
+                .stream()
+                .chatResponse()
+                .doOnNext(resp -> captureUsageAndAccount(resp, usageRef, ledger, prevTotal))
+                // streamUsage 末帧是只含 usage 的空帧（contentOf 为 null）：Reactor 的 map
+                // 不允许 null 返回（直接抛「The mapper returned a null value」），后面的
+                // filter 根本不会执行——必须用 handle 跳过空帧
+                .handle((org.springframework.ai.chat.model.ChatResponse resp,
+                         reactor.core.publisher.SynchronousSink<String> sink) -> {
+                    String token = AgentChatCaller.contentOf(resp);
+                    if (token != null) {
+                        sink.next(token);
+                    }
+                });
     }
 
     /** 模型空响应防御：逐层取 assistant 文本，任一层缺失返回 null（call/stream 记录与展示共用） */
@@ -551,10 +571,22 @@ final class AgentChatCaller {
     /**
      * 带取消令牌与预算账本的流式调用（编排节点传账本句柄：发起前熔断判定 + 成功结束后
      * 估算兜底入账/真实增量入账）。ledger 可为 null（无账本场景）。
+     * 角色策略入口：装配经 {@link #assemblyForRole} 按角色生成（与历史内联版等价）。
      */
     String stream(String sessionId, String forAgent, String fallbackSystem, String user,
                   Consumer<String> onToken, Consumer<String> toolEmitter, Advisor[] extraAdvisors,
                   BooleanSupplier cancelled, BudgetLedger ledger) {
+        return streamWithAssembly(sessionId, forAgent, fallbackSystem, user, onToken,
+                assemblyForRole(forAgent, sessionId, toolEmitter, false), extraAdvisors, cancelled, ledger);
+    }
+
+    /**
+     * Assembly 直传入口（路径 A 薄适配用：装配差异由调用方声明，不经角色策略）。
+     * 带取消令牌与预算账本的流式调用（发起前熔断判定 + 成功结束后估算兜底入账/真实增量入账）。
+     */
+    String streamWithAssembly(String sessionId, String forAgent, String fallbackSystem, String user,
+                              Consumer<String> onToken, AgentRequestSpecFactory.Assembly assembly,
+                              Advisor[] extraAdvisors, BooleanSupplier cancelled, BudgetLedger ledger) {
         if (cancelled != null && cancelled.getAsBoolean()) {
             recordError(sessionId, forAgent, null, true, System.currentTimeMillis(),
                     cancelException());
@@ -577,7 +609,7 @@ final class AgentChatCaller {
             // roundtrip 增量记账游标（口径同 streamAttempt，见其注释）
             java.util.concurrent.atomic.AtomicLong prevTotal = new java.util.concurrent.atomic.AtomicLong();
             try {
-                String out = streamCore(config, sessionId, forAgent, fallbackSystem, user, toolEmitter, false,
+                String out = streamCore(config, sessionId, forAgent, fallbackSystem, user, assembly,
                         extraAdvisors, collected, onToken, cancelled, usageRef, prevTotal, ledger);
                 // streamUsage 回传真实 usage 时记真实值，无则按已收输出文本近似估算（原口径兜底）；
                 // 账本兜底入账：无真实 usage 帧时按输出估算补记（有则增量已在流帧上记账，不重复）
@@ -615,19 +647,31 @@ final class AgentChatCaller {
     }
 
     /**
-     * 组装请求：委托 {@link AgentRequestSpecFactory} 共用组装链（与路径 A GeneralAssistantAgent
-     * 合并），编排路径差异在此声明——频率惩罚与工具硬预算启用、记忆按 {@link MemoryPolicy}
-     * 判定（仅 lead 注入）、maxTokens 按角色档位；config 由调用方查好传入（避免重复查表）。
+     * 组装请求（包级：路径 A executeStreamReactive 经此复用统一组装链）：委托
+     * {@link AgentRequestSpecFactory#build}，装配差异由调用方传入的 {@code assembly} 声明。
      */
-    private ChatClient.ChatClientRequestSpec buildSpec(AgentConfig config, String sessionId, String forAgent,
-                                                       String fallbackSystem, String user,
-                                                       Consumer<String> toolEmitter,
-                                                       boolean disableTools, Advisor... extraAdvisors) {
-        return specFactory.build(config, sessionId, forAgent, fallbackSystem, user,
-                new AgentRequestSpecFactory.Assembly(toolEmitter, disableTools,
-                        memoryStore != null && memoryPolicy.shouldInject(forAgent, sessionId),
-                        true, true, maxTokensForRole(forAgent)),
-                extraAdvisors);
+    ChatClient.ChatClientRequestSpec buildSpec(AgentConfig config, String sessionId, String forAgent,
+                                               String fallbackSystem, String user,
+                                               AgentRequestSpecFactory.Assembly assembly,
+                                               Advisor... extraAdvisors) {
+        return specFactory.build(config, sessionId, forAgent, fallbackSystem, user, assembly, extraAdvisors);
+    }
+
+    /**
+     * 角色策略装配（路径 B 三节点现状语义，与历史 buildSpec 内联版逐字段等价）：
+     * 记忆按 {@link MemoryPolicy} 判定（仅 lead）、频率惩罚与工具硬预算启用、maxTokens 按角色档位。
+     */
+    private AgentRequestSpecFactory.Assembly assemblyForRole(String forAgent, String sessionId,
+                                                             Consumer<String> toolEmitter, boolean disableTools) {
+        return new AgentRequestSpecFactory.Assembly(toolEmitter, disableTools,
+                memoryStore != null && memoryPolicy.shouldInject(forAgent, sessionId),
+                true, true, maxTokensForRole(forAgent));
+    }
+
+    /** 幻觉工具名降级（去工具重试）的装配变体：去 emitter、disableTools=true，其余档位原样保留 */
+    private static AgentRequestSpecFactory.Assembly noToolsVariant(AgentRequestSpecFactory.Assembly assembly) {
+        return new AgentRequestSpecFactory.Assembly(null, true, assembly.injectMemory(),
+                assembly.toolCallBudget(), assembly.frequencyPenalty(), assembly.maxTokens());
     }
 
     /** 查 agent 表配置（每次 LLM 调用仅查一次，观测记录与请求组装共用） */
