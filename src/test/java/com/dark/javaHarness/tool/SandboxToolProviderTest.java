@@ -83,4 +83,21 @@ class SandboxToolProviderTest {
 
         assertTrue(provider.baseTools().isEmpty(), "初始化失败应返回空工具面而非抛出");
     }
+
+    /** Docker 探测不可达：不触碰 SandboxService，直接降级空工具面（防「假就绪」） */
+    @Test
+    void dockerUnreachable_degradesToEmptyFaceWithoutSandboxService() {
+        SandboxToolProvider provider = new SandboxToolProvider() {
+            @Override
+            protected boolean dockerReachable() {
+                return false;
+            }
+        };
+        provider.initTimeoutMs = 2_000;
+
+        assertTrue(provider.baseTools().isEmpty(), "Docker 不可达时沙箱工具面应为空");
+        assertTrue(provider.readOnlyFileTools().isEmpty());
+        assertTrue(provider.writeTools().isEmpty());
+        assertTrue(provider.browserTools().isEmpty(), "浏览器组同属沙箱工具，也应为空");
+    }
 }

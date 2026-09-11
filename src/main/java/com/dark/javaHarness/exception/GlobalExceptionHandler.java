@@ -85,6 +85,28 @@ public class GlobalExceptionHandler {
         return ErrorResponse.of(HttpStatus.BAD_GATEWAY.value(), e.getMessage());
     }
 
+    /** 502：模型供应商鉴权失败（401/invalid key）——message 已含「配哪个 key、怎么改」的可执行指引 */
+    @ExceptionHandler(ModelAuthException.class)
+    @ResponseStatus(HttpStatus.BAD_GATEWAY)
+    public ErrorResponse handleModelAuth(ModelAuthException e) {
+        log.warn("[auth] 模型供应商鉴权失败：{}", e.getMessage());
+        return ErrorResponse.of(HttpStatus.BAD_GATEWAY.value(), e.getMessage());
+    }
+
+    /**
+     * 503：服务自身未就绪/未装配（如知识库向量库未配置、依赖缺失）。
+     * 这类 {@link IllegalStateException} 的 message 设计为可读指引（如
+     * 「知识库向量库未装配（检查 app.knowledge.* 配置与 pgvector 依赖）」），
+     * 直接透出——不再被兜底处理器吞成「服务器内部错误」。
+     */
+    @ExceptionHandler(IllegalStateException.class)
+    @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+    public ErrorResponse handleIllegalState(IllegalStateException e) {
+        log.warn("[illegal-state] 服务未就绪：{}", e.getMessage());
+        String message = e.getMessage() == null || e.getMessage().isBlank() ? "服务未就绪" : e.getMessage();
+        return ErrorResponse.of(HttpStatus.SERVICE_UNAVAILABLE.value(), message);
+    }
+
     /** 409：唯一键冲突（如 model_provider.model 大小写不敏感撞键，并发 add 场景兜底） */
     @ExceptionHandler(org.springframework.dao.DuplicateKeyException.class)
     @ResponseStatus(HttpStatus.CONFLICT)

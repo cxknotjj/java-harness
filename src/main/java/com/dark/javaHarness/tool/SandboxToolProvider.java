@@ -208,6 +208,15 @@ public class SandboxToolProvider {
     }
 
     protected void init() throws Exception {
+        // Docker 可达性前置探测：agentscope 的 SandboxService.start() 内部 connect 失败只记
+        // ERROR 不中断，照常返回工具句柄——无 Docker 机器上会「假就绪」（工具面注册成功、
+        // 调用必败，模型反复撞墙）。此处先做一次真实 dial（docker info，无容器/镜像副作用），
+        // 不可达直接降级空沙箱工具面并给出口提示。
+        if (!dockerReachable()) {
+            log.warn("[sandbox] 未检测到 Docker，沙箱类工具未启用"
+                    + "（安装并启动 Docker 后重启应用恢复；其余功能不受影响）");
+            return;
+        }
         SandboxService svc = new SandboxService(ManagerConfig.builder().build());
         svc.start();
         Sandbox sandbox = new BaseSandbox(svc, SANDBOX_USER, SANDBOX_SESSION);
@@ -230,6 +239,30 @@ public class SandboxToolProvider {
         this.service = svc;
         log.info("[sandbox] 容器级沙箱就绪: 执行类={} 只读={} 写入={}",
                 base.size(), readOnly.size(), write.size());
+    }
+
+    /**
+     * Docker 可达性探测：执行一次真实 dial（docker info）。
+     *
+     * <p>复用 agentscope 同源的 docker-java 客户端（{@code DockerClient} 无参构造走
+     * {@code DefaultDockerClientConfig.createDefaultConfigBuilder()} 的标准发现——
+     * DOCKER_HOST 环境变量 / Linux 默认 unix socket / Windows 默认命名管道），与
+     * SandboxService 内部连接语义一致；无容器创建、无镜像操作，仅 daemon 级探活。
+     * agentscope 的 {@code connect()} 失败只记日志返回 false、不抛异常。
+     */
+    protected boolean dockerReachable() {
+        try {
+            io.agentscope.runtime.sandbox.manager.client.container.docker.DockerClient probe =
+                    new io.agentscope.runtime.sandbox.manager.client.container.docker.DockerClient();
+            boolean ok = probe.connect();
+            if (!ok) {
+                log.info("[sandbox] Docker 探测不可达（connect=false）");
+            }
+            return ok;
+        } catch (Throwable t) {
+            log.info("[sandbox] Docker 探测异常: {}", t.toString());
+            return false;
+        }
     }
 
     /** 应用退出时释放沙箱服务与全部容器（base + browser），并关闭初始化线程池 */

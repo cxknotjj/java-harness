@@ -4,6 +4,7 @@ import com.dark.javaHarness.config.ContextBudgetProperties;
 import com.dark.javaHarness.config.agent.ChatClientRegistry;
 import com.dark.javaHarness.domain.AgentConfig;
 import com.dark.javaHarness.domain.LlmCallLog;
+import com.dark.javaHarness.exception.ModelAuthException;
 import com.dark.javaHarness.exception.ModelQuotaException;
 import com.dark.javaHarness.prompt.MemoryPolicy;
 import com.dark.javaHarness.prompt.PromptAssembler;
@@ -312,6 +313,11 @@ final class AgentChatCaller {
                     recordError(sessionId, forAgent, model, true, start, e);
                     throw ModelQuotaException.from(e, model);
                 }
+                // 鉴权失败（401/invalid key）：重试无意义，立即转可执行指引异常向上传播
+                if (ModelAuthException.matches(e)) {
+                    recordError(sessionId, forAgent, model, true, start, e);
+                    throw ModelAuthException.from(e, model);
+                }
                 // 模型可能把提示词里的专家名（researcher 等）误当工具发起调用——
                 // 工具列表里没有该名字，Spring AI 执行时抛「No ToolCallback found」。
                 // 此时去掉工具列表重试一次：模型纯文本作答仍可产出结果，不炸整个编排。
@@ -590,6 +596,10 @@ final class AgentChatCaller {
                 // 账户级硬错误：与阻塞（call）路径同口径转换，不重试直接抛人话异常
                 if (ModelQuotaException.matches(e)) {
                     throw ModelQuotaException.from(e, model);
+                }
+                // 鉴权失败：与阻塞（call）路径同口径转换，不重试直接抛可执行指引异常
+                if (ModelAuthException.matches(e)) {
+                    throw ModelAuthException.from(e, model);
                 }
                 boolean partialOutput = collected.length() > 0;
                 boolean canRetry = !partialOutput && LlmRetry.isRetryable(e) && attempt < retry.maxAttempts();

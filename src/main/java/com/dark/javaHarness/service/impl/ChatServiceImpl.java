@@ -89,10 +89,10 @@ public class ChatServiceImpl implements ChatService {
         writeBackContext(sessionId, request.message(), goal);
 
         if (goal.status() == GoalStatus.FAILED) {
-            return ChatResponse.failure(sessionId, newSession, goal.id(), goal.summary());
+            return ChatResponse.failure(sessionId, newSession, goal.id(), goal.summary(), resolvedAgent);
         }
         return ChatResponse.success(sessionId, newSession, goal.id(), goal.summary(),
-                recentKnowledgeSources(sessionId));
+                recentKnowledgeSources(sessionId), resolvedAgent);
     }
 
     /** 同步执行成功后写回会话记忆 */

@@ -154,6 +154,23 @@ setx WSLENV "QWEN_API_KEY/u:DEEPSEEK_API_KEY/u"   # 透传进 WSL（Linux 侧运
 $env:QWEN_API_KEY = "sk-你的key"    # Windows PowerShell；WSL 用 export QWEN_API_KEY=...
 ```
 
+> [!IMPORTANT]
+> **首次对话前核对 agent 绑定的服务商**：种子迁移链可能把默认 agent（general/researcher）绑到
+> DeepSeek 端点——只配 `QWEN_API_KEY` 时首次对话会 401。用下面 SQL 核对，若 `provider` 不是你
+> 已配 key 的服务商，二选一：补配该服务商的 key，或把 agent 改绑到已配 key 的部署模型行：
+>
+> ```sql
+> SELECT a.agent_name AS agent, p.provider, p.model, p.id AS provider_id
+> FROM agent a LEFT JOIN model_provider p ON a.model_provider_id = p.id
+> WHERE a.agent_name IN ('general', 'researcher');
+>
+> -- 改绑示例（provider_id 换成上一步查出的已配 key 的行）：
+> UPDATE agent SET model_provider_id = <provider_id> WHERE agent_name = 'general';
+> ```
+
+> [!NOTE]
+> 不接入 QQ 渠道？在 `application.yaml` 设 `napcat.enabled: false`（QQ 渠道为可选组件，但当前默认开启——关闭后不再有 NapCat 连接告警，其余功能不受影响）。
+
 ## 🎮 CLI 使用
 
 CLI 是纯 HTTP 客户端（**不监听任何端口**），通过 REST 调用主服务：
