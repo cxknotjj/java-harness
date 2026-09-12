@@ -15,7 +15,7 @@
 [![Spring AI](https://img.shields.io/badge/Spring%20AI-1.1.x-6DB33F?logo=spring&logoColor=white)](https://spring.io/projects/spring-ai)
 [![Graph](https://img.shields.io/badge/graph--core-1.1.2.2-orange)](https://github.com/alibaba/spring-ai-alibaba)
 [![MySQL](https://img.shields.io/badge/MySQL-Flyway%20Managed-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com/)
-[![Tests](https://img.shields.io/badge/tests-262%20passing-brightgreen?logo=junit5&logoColor=white)](#-运行测试)
+[![Tests](https://img.shields.io/badge/tests-JUnit%205%20passing-brightgreen?logo=junit5&logoColor=white)](#-运行测试)
 [![Docker](https://img.shields.io/badge/sandbox-Docker%20Isolated-2496ED?logo=docker&logoColor=white)](#-环境要求)
 
 *简单问题直接答 · 复杂任务多 Agent 编排 · 全程流式可视化*
@@ -105,6 +105,14 @@ flowchart TD
 | 🐳 Docker Desktop | ⚠️ 沙箱必需 | Python/Shell/浏览器工具的容器隔离；无 Docker 时仅沙箱类工具不可用，其余功能正常（需预拉取镜像，见 `docs/TECH_STACK.md`） |
 | 🐘 PostgreSQL（pgvector） | 🔄 可选 | 仅 RAG 知识库使用：需启用 vector 扩展；未安装/未配置时应用照常启动，知识面为空 |
 | 🔑 API Key | 🔄 可选 | DashScope（通义千问）/ DeepSeek；不配置可启动，调用模型会返回 `invalid_api_key` |
+
+### 🗄️ 数据库准备
+
+MySQL 只需建库一次（表结构由 Flyway 启动时自动创建，无需手动执行脚本）。连接信息在 `src/main/resources/application.yaml` 的 `spring.datasource`（默认 `localhost:3306/harness`、账号 `root`、空密码，按需修改）：
+
+```sql
+CREATE DATABASE IF NOT EXISTS harness DEFAULT CHARACTER SET utf8mb4;
+```
 
 ### ⚡ 一键启动
 
@@ -212,7 +220,7 @@ CLI 是纯 HTTP 客户端（**不监听任何端口**），通过 REST 调用主
 
 ### 📚 知识库问答（RAG）
 
-把文档放进 `knowledge/` 目录（`.md` / `.txt`，支持 front-matter `title:`），摄取后路径 A/B 回答自动检索注入：
+把文档放进 `knowledge/` 目录（`.md` / `.txt`，支持 front-matter `title:`），摄取后路径 A/B 回答自动检索注入。触发是**每次组装 prompt 前的旁路检查**：总开关、角色名单、查询长度、相关度、注入预算五层条件全部满足才注入，任一不满足静默降级、主链路零感知——全部配置驱动（`application.yaml` 的 `app.knowledge.*`），决策流程与时序图见 [`docs/data-flow.md` 5i 节](./docs/data-flow.md#5i-rag-知识检索注入数据流prompt-组装前旁路)。
 
 ```bash
 mkdir -p knowledge && cp 你的文档.md knowledge/
@@ -220,7 +228,7 @@ curl -X POST http://localhost:8080/api/knowledge/sync          # 增量摄取（
 curl 'http://localhost:8080/api/knowledge/search?q=部署步骤'     # 调试检索看命中
 ```
 
-回答中出现 `【出处N】` 内联引用时，CLI 回合末尾会打印「来源:」尾注；`meta.sources` / `ChatResponse.sources` 携带结构化出处（文档名/标题/相关度）。配置（top-k / 相似度阈值 / 注入预算等）见 `application.yaml` 的 `app.knowledge.*`。
+回答中出现 `【出处N】` 内联引用时，CLI 回合末尾会打印「来源:」尾注；`meta.sources` / `ChatResponse.sources` 携带结构化出处（文档名/标题/相关度）。
 
 #### 🗂️ 多知识库与 agent 绑定
 
@@ -232,64 +240,7 @@ cp spring.md knowledge/java/ && cp vue.md knowledge/frontend/
 curl -X POST http://localhost:8080/api/knowledge/sync
 ```
 
-在 `agent` 表 `knowledge` 列填写逗号分隔的 kb 标识（如 `java,frontend`）即可把 agent 绑定到指定知识库——检索时按向量 metadata 的 `kb` 字段过滤（`kb in [...]`），agent 只读绑定的库，防止读串；列留空/NULL 检索全部知识。文档在子目录间移动（kb 变更）会在下次 sync 自动重摄取补齐。
-
-#### 🔍 RAG 触发逻辑
-
-RAG 不是显式指令触发，而是**每次组装 prompt 前的旁路检查**——条件不满足全部静默降级，主链路零感知。
-
-触发决策流程：
-
-```mermaid
-flowchart TD
-    A[用户请求<br/>路径 A 直接答 / 路径 B 编排节点] --> B["AgentRequestSpecFactory<br/>组装 system prompt 前"]
-    B --> C{"app.knowledge.enabled?"}
-    C -->|false| X[静默跳过<br/>零副作用]
-    C -->|true| D{"agent 角色 ∈ 跳过名单?<br/>aggregator：材料是子任务结果"}
-    D -->|是| X
-    D -->|否| E{"user 文本长度 ≥<br/>min-query-chars（8）?"}
-    E -->|否| X
-    E -->|是| F["向量检索：user 文本 → DashScope 嵌入<br/>→ pgvector cosine top-k（4）"]
-    F --> G{"有命中且相关度 ≥<br/>min-score（0.5）?"}
-    G -->|否| X
-    G -->|是| H["逐条累加 token：<br/>超过 context-budget（3000）的命中截留"]
-    H --> I["渲染【出处N】知识块<br/>追加到 system prompt"]
-    I --> J["模型回答：句末内联【出处N】<br/>+ meta.sources + CLI 来源尾注"]
-```
-
-检索注入时序：
-
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant F as AgentRequestSpecFactory
-    participant R as KnowledgeRetriever
-    participant S as KnowledgeService
-    participant E as DashScope 嵌入
-    participant V as pgvector 向量库
-    participant L as LLM
-    U->>F: 请求（路径 A / 路径 B 各节点）
-    F->>R: buildKnowledgeBlock(agent, sessionId, user)
-    R->>R: enabled / 角色 / 查询长度 逐层短路
-    R->>S: search(query)
-    S->>E: query 嵌入
-    S->>V: cosine 相似度 top-k
-    V-->>S: 命中片段
-    S-->>R: List<KnowledgeHit>
-    R-->>F: 知识块（预算内渲染【出处N】）或 null
-    F->>L: system prompt（含知识块）
-    L-->>U: 回答内联【出处N】+ meta.sources
-```
-
-触发条件一览（全配置驱动，改 `application.yaml` 即调）：
-
-| 触发条件 | 配置项 | 当前值 | 不满足时 |
-|---|---|---|---|
-| 知识库总开关 | `enabled` | true | 静默跳过 |
-| 角色不在跳过名单 | ——（aggregator 策略跳过） | aggregator | 静默跳过 |
-| 查询长度达标 | `min-query-chars` | 8 | 静默跳过 |
-| 命中相关度达标 | `min-score` | 0.5 | 丢弃该命中 |
-| 注入预算内 | `context-budget` | 3000 | 截留超预算命中 |
+在 `agent` 表 `knowledge` 列填写逗号分隔的 kb 标识（如 `java,frontend`）即可把 agent 绑定到指定知识库——检索时按向量 metadata 的 `kb` 字段过滤，agent 只读绑定的库，防止读串；列留空/NULL 检索全部知识。文档在子目录间移动（kb 变更）会在下次 sync 自动重摄取补齐。
 
 ## 📡 SSE 流式协议
 
@@ -473,30 +424,14 @@ src/main/java/com/dark/javaHarness/
 
 ## 🧪 运行测试
 
-单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**（当前 327 个用例全绿）：
+单元测试基于 JUnit 5 + Mockito，**不依赖真实数据库 / 网络 / API Key**：
 
 ```bash
 mvn -s .mvn/settings.xml test
 ```
 
-<details>
-<summary><b>🔍 点击展开测试覆盖清单</b></summary>
-
-| 分组 | 测试 | 验证点 |
-|---|---|---|
-| 🧭 路由与会话 | `LlmRouteJudgeTest` `AgentServiceImplTest` `AgentConfigProviderTest` `SessionServiceImplTest` `GoalServiceImplTest` | SIMPLE/COMPLEX 分流与异常 JSON 兜底、多 Agent 路由与回退、会话与目标生命周期 |
-| 🤖 Agent 调用 | `AgentChatCallerTest` `AgentChatCallerRetryTest` `LlmRetryTest` `GeneralAssistantAgentTest` | 工具循环与预算熔断记账、未知工具幻觉容错重试、重试策略、逐 token 渐进发射（防伪流式回归） |
-| 🕸️ 编排 | `MultiAgentGraphAgentTest` `ProgressLineTest` | 编排闭环、进度时序（防死锁/丢事件）、专家派遣白名单、断点续跑（缺口补跑/回放）、**预算部分熔断降级**（剩余子任务跳过、聚合保留前序结果） |
-| 🧩 Prompt 装配 | `PromptAssemblerTest` `MemoryPolicyTest` `SkillManagerTest` `SkillRepositoryTest` `ToolLazyManagerTest` | 五段式组装、记忆按角色注入矩阵、skill 动态装配、工具 Schema 两段式延迟加载 |
-| 🎚️ 预算与观测 | `ContextBudgetPropertiesTest` `ContextAssemblingAdvisorTest` `PromptBudgetAdvisorTest` `ToolCallBudgetTest` `ToolCallTracerTest` `LlmCallRecorderTest` | yaml 绑定与 0=不限制口径、上下文/分段裁剪、工具次数与结果预算、调用起止进度行、落库观测 |
-| 🔌 工具与 MCP | `WebToolsTest` `SandboxToolProviderTest` `McpToolProviderTest` `ToolAssignmentsTest` | HTML→Markdown 提取与协议白名单、沙箱懒初始化降级、MCP 多 server 配置解析、工具分配最小权限与去重 |
-| 📚 知识库 RAG | `MarkdownChunkerTest` `KnowledgeDocumentScannerTest` `KnowledgeServiceImplTest` `KnowledgeRetrieverTest` | 段落感知切分与重叠续接、front-matter 解析与坏文件跳过、增量摄取/删除/分页/检索（mock VectorStore+Mapper）、角色跳过/预算截断/【出处N】渲染 |
-| 🖥️ CLI | `TerminalRendererTest` `TerminalInputTest` `ResumeStateStoreTest` | Markdown 行级着色与流式增量直出（防整段重影回归）、无 TTY 降级输入、续跑状态读写往返 |
-| 🌐 接口与基建 | `ChatControllerTest` `HarnessControllerTest` `ChatServiceImplTest` `GlobalExceptionHandlerTest` `ChatClientRegistryTest` `ChatClientFactoryTest` `ThinkingSwitchChatModelTest` `ProviderAdminServiceImplTest` `AgentRegistryTest` `ClientAbortLogFilterTest` `ModelQuotaExceptionTest` | REST 契约（流式逐元素/换行）、SSE 契约与 resume 校验（400/409）、异常统一 {code,message}、多服务商注册表与热刷新、思考开关 |
-
-</details>
-
-> [!WARNING]
+> [!NOTE]
+> 测试全景（分组清单、功能 ↔ 测试覆盖矩阵、关键防回归点）见 [`docs/functional-testing.md`](./docs/functional-testing.md)。
 > `JavaHarnessApplicationTests` 是 `@SpringBootTest`，会尝试连接本机 MySQL；无数据库环境下单独运行该类可能因连接失败报错（其余业务测试不受影响）。
 
 ## 🙏 参考与致谢
@@ -517,7 +452,4 @@ mvn -s .mvn/settings.xml test
 
  Made with ☕ and ❤️ by javaHarness contributors
 
-</div>
-
-</div>
 </div>
