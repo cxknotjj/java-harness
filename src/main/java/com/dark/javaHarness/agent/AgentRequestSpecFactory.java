@@ -147,7 +147,7 @@ final class AgentRequestSpecFactory {
         // 兜底角色指令收敛为角色段兜底，不再拼进 user。
         // 知识检索（RAG）：按当前 user 文本检索知识库，命中则追加【出处N】知识段——
         // retriever 为 null（禁用/单测）或无命中时原样，退化现状；aggregator 角色策略跳过；
-        // 多库隔离：agent 表 knowledge 列（config 携带）解析为绑定库列表，null = 不限
+        // 多库隔离：agent 表 knowledge 列（config 携带）解析为绑定库列表，null/空 = 未绑定不检索
         // config 已由调用方查好传入：经三参 assemble 复载下传，角色段不再重复查表
         String system = promptAssembler.assemble(forAgent, fallbackSystem, config);
         if (knowledgeRetriever != null) {

@@ -35,6 +35,7 @@
 - [📡 SSE 流式协议](#-sse-流式协议)
 - [🔁 断点续跑](#-断点续跑)
 - [🔌 多模型与多服务商](#-多模型与多服务商)
+- [🔌 MCP 工具接入](#-mcp-工具接入)
 - [📁 项目结构](#-项目结构)
 - [🧪 运行测试](#-运行测试)
 - [🙏 参考与致谢](#-参考与致谢)
@@ -240,7 +241,7 @@ cp spring.md knowledge/java/ && cp vue.md knowledge/frontend/
 curl -X POST http://localhost:8080/api/knowledge/sync
 ```
 
-在 `agent` 表 `knowledge` 列填写逗号分隔的 kb 标识（如 `java,frontend`）即可把 agent 绑定到指定知识库——检索时按向量 metadata 的 `kb` 字段过滤，agent 只读绑定的库，防止读串；列留空/NULL 检索全部知识。文档在子目录间移动（kb 变更）会在下次 sync 自动重摄取补齐。
+在 `agent` 表 `knowledge` 列填写逗号分隔的 kb 标识（如 `java,frontend`）即可把 agent 绑定到指定知识库——检索时按向量 metadata 的 `kb` 字段过滤，agent 只读绑定的库，防止读串；列留空/NULL = 未绑定，不触发知识库检索。文档在子目录间移动（kb 变更）会在下次 sync 自动重摄取补齐。
 
 ## 📡 SSE 流式协议
 
@@ -323,6 +324,33 @@ flowchart LR
 > 2. `<PROVIDER大写>_API_KEY` 环境变量（约定式回退，如 `QWEN_API_KEY`、`DEEPSEEK_API_KEY`）
 >
 > Key 的**装载通道**：系统级环境变量（Windows 侧 + `WSLENV` 透传进 WSL）> 仓库根 `.env.local`（启动脚本自动 source，gitignored）> 当前会话 `export`；解析优先级不受通道影响。
+
+## 🔌 MCP 工具接入
+
+工具生态经 MCP 扩展：client 支持 stdio（本地进程）与 Streamable HTTP（远程 server），懒连接 + 按 server 失败隔离（外部 server 挂了不影响主链路），连接事件落库 `mcp_server_log`。
+
+连接配置在项目根 `mcp-config.json`（Claude/Cursor 同款 `mcpServers` 结构）。**该文件含 API Key，属本地配置不入库**（已在 `.gitignore`，clone 后需自建），模板：
+
+```json
+{
+  "mcpServers": {
+    "tavily": { "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=<你的Tavily key>" }
+  }
+}
+```
+
+- 远程 server 填 `url`，本地进程填 `command`(±`args`)；`enabled: false` 跳过条目；**改配置需重启**
+- **按 agent 分配**：`agent` 表 `tools` 列按精确工具名授予（改库免重启）。如把 Tavily 搜索分给 general/researcher：
+
+```sql
+UPDATE agent SET tools = CONCAT(tools, ', tavily_search')
+WHERE agent_name IN ('general', 'researcher') AND tools NOT LIKE '%tavily_search%';
+```
+
+- 未声明的工具模型不可见；声明时 server 未连接则该 token 跳过（warn），不影响其余工具
+
+> [!NOTE]
+> MCP 工具返回内容不经过项目的内容裁剪链（缓存/相关段落过滤），超长由工具结果硬预算统一截断。
 
 ## 📁 项目结构
 

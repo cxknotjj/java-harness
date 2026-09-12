@@ -70,8 +70,11 @@
 
 - [ ] **Web Search 接入**：注册搜索服务商 API（博查/Tavily/SerpAPI 等任一），新增 `search` 工具归入 `WebTools`，分配给 researcher/general——补「调研」第一步空缺，浏览器组退居 JS 渲染兜底
   - 验收：researcher 对「近期事件」类问题能返回带来源的检索结果
+  - 进度（2026-09-12）：改走 MCP hosted 路线——Tavily 远程 MCP（Streamable HTTP）经 `mcp-config.json` 接入（该文件含 key 转本地不入库，模板见 README「MCP 工具接入」），general/researcher 的 agent 表 `tools` 列追加 `tavily_search`（数据路径分配；注意真实注册名是下划线 `tavily_search` 而非文档宣传的 `tavily-search`，另有 SDK baseUri.resolve 丢 query 的坑已修，见 spec）；待端到端验收后勾选
 - [ ] **知识库增强余项**（拆自 RAG 条目遗留）：目录文件监听（WatchService 免手动 sync）、BM25 混合检索与重排、web 管理页
   - 验收：knowledge/ 目录增删文件自动增量摄取；混合检索召回优于纯向量
+- [ ] **RAG 旁路超时治理**（2026-09-12 tavily e2e 时发现）：嵌入调用/pgvector 查询无显式超时——外部依赖挂起时（实测 DashScope 无响应 + 本环境 PG 不可达），请求线程在「工具分配后、LLM 发起前」被拖最长 16 分钟才走到超时失败，多请求还会在同一释放点扎堆。给嵌入与向量检索加独立短超时（秒级），超时按既有语义静默降级
+  - 验收：模拟嵌入接口挂起时，请求在秒级超时后正常降级回答（而非分钟级阻塞）
 - [ ] **聚合前子任务结果预算分摊裁剪**（拆自 Token 预算条目遗留）：子任务结果喂聚合前按预算分摊裁剪，前移聚合侧 sections 兜底——避免输出都长时靠后子任务整段被剪
   - 验收：多子任务结果超预算时各结果按分摊裁剪而非靠后者整段丢失
 

@@ -519,7 +519,9 @@ flowchart TD
     C -->|false| X[静默跳过<br/>零副作用]
     C -->|true| D{"agent 角色 ∈ 跳过名单?<br/>aggregator：材料是子任务结果"}
     D -->|是| X
-    D -->|否| E{"user 文本长度 ≥<br/>min-query-chars（8）?"}
+    D -->|否| D2{"agent 绑定知识库?<br/>knowledge 列非空（NULL/空白 = 不检索）"}
+    D2 -->|否| X
+    D2 -->|是| E{"user 文本长度 ≥<br/>min-query-chars（8）?"}
     E -->|否| X
     E -->|是| F["向量检索：user 文本 → DashScope 嵌入<br/>→ pgvector cosine top-k（4）"]
     F --> G{"有命中且相关度 ≥<br/>min-score（0.5）?"}
