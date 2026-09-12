@@ -11,6 +11,7 @@ import io.modelcontextprotocol.json.McpJsonMapper;
 import io.modelcontextprotocol.spec.McpClientTransport;
 import io.modelcontextprotocol.spec.McpSchema;
 import jakarta.annotation.PreDestroy;
+import java.net.URI;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -233,7 +234,27 @@ public class McpToolProvider {
     }
 
     private static McpClientTransport httpTransport(String url) {
-        return HttpClientStreamableHttpTransport.builder(url).build();
+        String[] split = splitEndpointUrl(url);
+        return split == null
+                ? HttpClientStreamableHttpTransport.builder(url).build()
+                : HttpClientStreamableHttpTransport.builder(split[0]).endpoint(split[1]).build();
+    }
+
+    /**
+     * 拆分带 query 的 url 为 (origin baseUri, 「路径?query」endpoint)；无 query 返回 null（走原 builder 行为）。
+     * 必要性：SDK 对每个请求做 {@code baseUri.resolve(endpoint)}（endpoint 默认 "/mcp"，绝对路径引用），
+     * RFC 解析会用引用的路径覆盖 base 的路径并<b>丢弃 query</b>——Tavily 等把 key 放 query 的 url 因此
+     * 变成无 key 请求（401 → initialize 失败）。拆分后 resolve 完整还原原 url（round-trip 由单测锁定）。
+     */
+    static String[] splitEndpointUrl(String url) {
+        URI uri = URI.create(url);
+        if (uri.getRawQuery() == null) {
+            return null;
+        }
+        String path = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+        return new String[]{
+                uri.getScheme() + "://" + uri.getRawAuthority(),
+                path + "?" + uri.getRawQuery()};
     }
 
     /** stdio 传输：spawn 外部 MCP 进程，经其 stdin/stdout 管道通信 */

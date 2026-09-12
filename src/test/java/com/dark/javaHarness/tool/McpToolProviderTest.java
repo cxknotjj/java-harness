@@ -58,6 +58,38 @@ class McpToolProviderTest {
                 "server 不可达应降级为空工具面而非抛异常");
     }
 
+    @Test
+    void splitEndpointUrl_noQuery_returnsNull_keepsLegacyBuilderPath() {
+        // 无 query 的 url（自建 server / legacy server-url）不走拆分，保持原 builder 行为
+        assertNull(McpToolProvider.splitEndpointUrl("http://localhost:8080/mcp"),
+                "无 query 的 url 应返回 null（原路径）");
+    }
+
+    @Test
+    void splitEndpointUrl_queryKey_roundTripsViaResolve() {
+        // 核心 round-trip 不变量：resolve(base, endpoint) 必须完整还原原 url（含 query）。
+        // 回归背景：SDK 默认 endpoint=/mcp 对 baseUri 做绝对路径 resolve 会丢弃 query，
+        // Tavily 等把 key 放 query 的 url 变成无 key 请求 → 401 → initialize 失败。
+        String url = "https://mcp.tavily.com/mcp/?tavilyApiKey=tvly-secret-123";
+        String[] split = McpToolProvider.splitEndpointUrl(url);
+        assertEquals("https://mcp.tavily.com", split[0], "baseUri 应为 origin");
+        assertEquals("/mcp/?tavilyApiKey=tvly-secret-123", split[1], "endpoint 应为 路径?query");
+        assertEquals(url, java.net.URI.create(split[0]).resolve(java.net.URI.create(split[1])).toString(),
+                "baseUri.resolve(endpoint) 应完整还原原 url（含 query）");
+    }
+
+    @Test
+    void splitEndpointUrl_noPath_usesRootPath() {
+        // 仅 origin + query（无路径）→ endpoint 用 "/" 兜底
+        String url = "https://mcp.example.com?tavilyApiKey=abc";
+        String[] split = McpToolProvider.splitEndpointUrl(url);
+        assertEquals("https://mcp.example.com", split[0]);
+        assertEquals("/?tavilyApiKey=abc", split[1]);
+        // resolve 会把空路径规范化为 "/"，断言以规范化形态为准（关键是 query 完整保留）
+        assertEquals("https://mcp.example.com/?tavilyApiKey=abc",
+                java.net.URI.create(split[0]).resolve(java.net.URI.create(split[1])).toString());
+    }
+
     // ---- 连接事件结构化落库（mcp_server_log 观测）----
 
     @Test
